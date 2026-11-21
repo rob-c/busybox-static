@@ -16,27 +16,57 @@ static ELF, Darwin = Mach-O linked against libSystem (or libSystem only, for
 
 ---
 
-## 0. One-time repo setup
+## 0. Repo setup (done)
 
-The GitHub repo does not exist yet. From this directory:
+`https://github.com/rob-c/busybox-static` exists and is **PRIVATE**, created from
+this directory with `gh repo create --private --source=. --push`. 14 files, no
+artifacts:
 
-`.gitignore` and `LICENSE` (busybox's GPLv2 text) are already in the tree:
-
-```sh
-git init -b main
-git add -A            # src/ is ignored on purpose: it is upstream code, see §4
-git status --porcelain   # sanity: scripts, patches/, prune/, docs only
-git commit -m "busybox-static: build harness, patches, port for Darwin"
-gh repo create rob-c/busybox-static --public --source=. --push
+```
+.gitignore  LICENSE  README.md  RELEASING.md
+build.sh  build-all.sh  mklipo.sh  pack-release.sh  test.sh
+patches/*.patch  prune/*
 ```
 
-Verified the ignore rules do what they claim — `git check-ignore` reports
-`src build dist release` all IGNORED, so a 50 MB upstream clone cannot be
-committed by accident.
+To make it public (needed if anyone else is to download the release assets —
+private assets require authentication):
+
+```sh
+gh repo edit rob-c/busybox-static --visibility public
+```
+
+Recreating from scratch, if ever needed:
+
+```sh
+git init -b main && git add -A && git commit -m "..."
+gh repo create rob-c/busybox-static --private --source=. --push
+```
+
+### Artifacts are excluded from git but still uploadable
+
+These are different mechanisms and `gitignore` does **not** block uploads:
+
+* `build/`, `dist/`, `release/`, `src/` are git-ignored — they never enter
+  history, so the repo stays ~190 KB instead of ~195 MB (verified: `git
+  ls-files | grep -E '^(build|dist|release|src)/'` returns nothing).
+* Release assets live outside the git tree. `gh release create ... <paths>`
+  uploads whatever paths you name, ignored or not.
+
+Confirmed by attaching both a gitignored binary from `dist/` and the source
+tarball from `release/` to a draft release:
+
+```
+{"assets":[{"name":"busybox","size":1485968},
+           {"name":"busybox-static-1.39.0-aac079e-src.tar.gz","size":3348162}]}
+```
+
+The draft was then deleted. Note `gh release create` given a tag that does not
+yet exist makes an *untagged* draft; `--cleanup-tag` then reports
+`HTTP 422: Reference does not exist`. Harmless.
 
 `src/` is deliberately **not** committed — it is a clone of upstream. The GPL
 obligation to ship source is met by attaching the patched source tarball to each
-release (§4), which is the `§3(a)` route and simpler than tracking 50 MB of
+release (§4), which is the `§3(a)` route and simpler than tracking 24 MB of
 upstream history.
 
 Pin the toolchain you built with, because all three are load-bearing:
