@@ -18,28 +18,23 @@ static ELF, Darwin = Mach-O linked against libSystem (or libSystem only, for
 
 ## 0. Repo setup (done)
 
-`https://github.com/rob-c/busybox-static` exists and is **PRIVATE**, created from
-this directory with `gh repo create --private --source=. --push`. 14 files, no
-artifacts:
+`https://github.com/rob-c/busybox-static` is **PUBLIC**, created from this
+directory with `gh repo create --source=. --push` and later made public so the
+release assets are downloadable without credentials. It holds scripts, patches
+and docs only — no artifacts:
 
 ```
 .gitignore  LICENSE  README.md  RELEASING.md
 build.sh  build-all.sh  mklipo.sh  pack-release.sh  test.sh  stress.sh
-patches/*.patch  prune/*
-```
-
-To make it public (needed if anyone else is to download the release assets —
-private assets require authentication):
-
-```sh
-gh repo edit rob-c/busybox-static --visibility public
+patches/*.patch  prune/*  docs/*
 ```
 
 Recreating from scratch, if ever needed:
 
 ```sh
 git init -b main && git add -A && git commit -m "..."
-gh repo create rob-c/busybox-static --private --source=. --push
+gh repo create rob-c/busybox-static --source=. --push
+gh repo edit rob-c/busybox-static --visibility public
 ```
 
 ### Artifacts are excluded from git but still uploadable
