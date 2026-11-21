@@ -157,6 +157,13 @@ shasum -a 256 -c SHA256SUMS                 # everything you downloaded
 shasum -a 256 -c "${P}-linux-arm64.sha256"  # a single artifact
 ```
 
+GitHub does not preserve file modes on release assets, so the binaries arrive
+non-executable. Make yours executable first:
+
+```sh
+chmod +x ${P}-linux-arm64 ${P}-darwin-arm64
+```
+
 Expect one `OK` per file. A `FAILED` line means a corrupt or truncated
 download: re-download it rather than running it.
 
