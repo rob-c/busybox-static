@@ -1,0 +1,562 @@
+diff --git a/coreutils/df.c b/coreutils/df.c
+index fba2324..5e8655f 100644
+--- a/coreutils/df.c
++++ b/coreutils/df.c
+@@ -97,7 +97,9 @@
+ //usage:       "Filesystem          512-blocks      Used Available Capacity Mounted on\n"
+ //usage:       "/dev/sda3             17381728  17107080    274648      98% /\n"
+ 
+-#include <mntent.h>
++#ifdef HAVE_MNTENT_H
++# include <mntent.h>
++#endif
+ #include <sys/statvfs.h>
+ #include "libbb.h"
+ #include "unicode.h"
+diff --git a/coreutils/stat.c b/coreutils/stat.c
+index 377b425..50e2ee6 100644
+--- a/coreutils/stat.c
++++ b/coreutils/stat.c
+@@ -105,6 +105,19 @@
+ //usage:	)
+ 
+ #include "libbb.h"
++#if defined(__APPLE__)
++/* struct statfs and statfs(2) live in <sys/mount.h> on Darwin */
++# include <sys/mount.h>
++# include <sys/ucred.h>
++#endif
++#if defined(__APPLE__)
++/* Darwin's statfs.f_type is not a Linux magic number; the filesystem name is
++ * carried in f_fstypename instead of being looked up in a magic table.
++ */
++# define BB_STATFS_FSTYPE(sf) ((const char *)(sf)->f_fstypename)
++#else
++# define BB_STATFS_FSTYPE(sf) human_fstype((sf)->f_type)
++#endif
+ #include "common_bufsiz.h"
+ 
+ enum {
+@@ -306,11 +319,11 @@ static void FAST_FUNC print_statfs(char *pformat, const char m,
+ 	} else if (m == 'i') {
+ 		printf_llx(pformat, get_f_fsid(statfsbuf));
+ 	} else if (m == 'l') {
+-		printf_lu(pformat, statfsbuf->f_namelen);
++		printf_lu(pformat, BB_STATFS_NAMELEN(statfsbuf));
+ 	} else if (m == 't') {
+ 		printf_lx(pformat, statfsbuf->f_type); /* no equiv */
+ 	} else if (m == 'T') {
+-		printf_s(pformat, human_fstype(statfsbuf->f_type));
++		printf_s(pformat, BB_STATFS_FSTYPE(statfsbuf));
+ 	} else if (m == 'b') {
+ 		printf_llu(pformat, statfsbuf->f_blocks);
+ 	} else if (m == 'f') {
+@@ -544,12 +557,12 @@ static bool do_statfs(const char *filename, const char *format)
+ 	printf(format,
+ 	       filename,
+ 	       get_f_fsid(&statfsbuf),
+-	       statfsbuf.f_namelen);
++	       BB_STATFS_NAMELEN(&statfsbuf));
+ 
+ 	if (option_mask32 & OPT_TERSE)
+ 		printf("%lx ", (unsigned long) statfsbuf.f_type);
+ 	else
+-		printf("Type: %s\n", human_fstype(statfsbuf.f_type));
++		printf("Type: %s\n", BB_STATFS_FSTYPE(&statfsbuf));
+ 
+ # if !ENABLE_SELINUX
+ 	format = (option_mask32 & OPT_TERSE
+diff --git a/include/libbb.h b/include/libbb.h
+index 5348f6c..2394a4b 100644
+--- a/include/libbb.h
++++ b/include/libbb.h
+@@ -27,6 +27,19 @@
+ # define sigemptyset(s)   __sigemptyset(s)
+ # define sigisemptyset(s) __sigisemptyset(s)
+ #endif
++#if defined(__APPLE__)
++/* Darwin lacks glibc's sigisemptyset() */
++# undef sigisemptyset
++static ALWAYS_INLINE int bb_sigisemptyset(const sigset_t *set)
++{
++	int sig;
++	for (sig = 1; sig < NSIG; sig++)
++		if (sigismember(set, sig))
++			return 0;
++	return 1;
++}
++# define sigisemptyset(s) bb_sigisemptyset(s)
++#endif
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -69,10 +82,33 @@
+ #endif
+ #ifdef HAVE_MNTENT_H
+ # include <mntent.h>
++# define BB_HAVE_MNTENT 1
++#endif
++#if defined(__APPLE__)
++/* Darwin has no <mntent.h>. libbb/mntent.c implements this API on top of
++ * getmntinfo(3), which is where Darwin keeps its mount table.
++ */
++# define BB_HAVE_MNTENT 1
++struct mntent {
++	char *mnt_fsname;
++	char *mnt_dir;
++	char *mnt_type;
++	char *mnt_opts;
++	int mnt_freq;
++	int mnt_passno;
++};
++FILE *setmntent(const char *filename, const char *type);
++struct mntent *getmntent(FILE *stream);
++int endmntent(FILE *stream);
++char *hasmntopt(const struct mntent *m, const char *opt);
+ #endif
+ #ifdef HAVE_SYS_STATFS_H
+ # include <sys/statfs.h>
+ #endif
++/* NB: Darwin's <sys/mount.h> also drags in <bsm/audit.h>, which defines
++ * token_t and clashes with editors/diff.c. Do not include it globally here;
++ * the few files that need struct statfs include it themselves.
++ */
+ /* Don't do this here:
+  * #include <sys/sysinfo.h>
+  * Some linux/ includes pull in conflicting definition
+@@ -143,6 +179,9 @@
+ # include <arpa/inet.h>
+ #elif defined __APPLE__
+ # include <netinet/in.h>
++/* inet_aton()/inet_pton()/inet_ntop() live here on Darwin; without it we
++ * get "call to undeclared function 'inet_aton'" */
++# include <arpa/inet.h>
+ #else
+ # include <arpa/inet.h>
+ //This breaks on bionic:
+@@ -1763,7 +1802,7 @@ const struct hwtype *get_hwntype(int type) FAST_FUNC;
+ 
+ 
+ extern int fstype_matches(const char *fstype, const char *comma_list) FAST_FUNC;
+-#ifdef HAVE_MNTENT_H
++#ifdef BB_HAVE_MNTENT
+ extern struct mntent *find_mount_point(const char *name, int subdir_too) FAST_FUNC;
+ #endif
+ extern void erase_mtab(const char * name) FAST_FUNC;
+diff --git a/include/platform.h b/include/platform.h
+index 5662a4e..2bbb003 100644
+--- a/include/platform.h
++++ b/include/platform.h
+@@ -172,8 +172,14 @@
+ #include <limits.h>
+ #if defined(__digital__) && defined(__unix__)
+ # include <sex.h>
+-#elif defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) \
+-   || defined(__APPLE__)
++#elif defined(__APPLE__)
++# include <sys/resource.h>  /* rlimit */
++# include <machine/endian.h>
++/* Darwin has no glibc's __bswapNN; use compiler builtins */
++# define bswap_64 __builtin_bswap64
++# define bswap_32 __builtin_bswap32
++# define bswap_16 __builtin_bswap16
++#elif defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+ # include <sys/resource.h>  /* rlimit */
+ # include <machine/endian.h>
+ # define bswap_64 __bswap64
+@@ -517,6 +523,71 @@ typedef unsigned smalluint;
+ 
+ #if defined(__APPLE__)
+ # undef HAVE_STRCHRNUL
++/* not in Darwin's libc; fallbacks are in platform.h below / libbb/platform.c */
++# undef HAVE_MEMPCPY
++# undef HAVE_MEMRCHR
++
++/* Darwin's <sys/stat.h> spells the nanosecond timestamps st_*timespec */
++# define st_atim st_atimespec
++# define st_mtim st_mtimespec
++# define st_ctim st_ctimespec
++
++/* Darwin's <netinet/in.h> has no s6_addr32 */
++# ifndef s6_addr32
++#  define s6_addr32 __u6_addr.__u6_addr32
++# endif
++
++/* Darwin has ETHERTYPE_* but not the Linux-style ETH_P_* names.
++ * Values are from the IEEE ethertype registry / Linux if_ether.h.
++ */
++# ifndef ETH_P_LOOP
++#  define ETH_P_LOOP     0x0060
++# endif
++# ifndef ETH_P_PUP
++#  define ETH_P_PUP      0x0200
++# endif
++# ifndef ETH_P_PUPAT
++#  define ETH_P_PUPAT    0x0201
++# endif
++# ifndef ETH_P_IP
++#  define ETH_P_IP       0x0800
++# endif
++# ifndef ETH_P_ECONET
++#  define ETH_P_ECONET   0x0018
++# endif
++# ifndef ETH_P_ARP
++#  define ETH_P_ARP      0x0806
++# endif
++# ifndef ETH_P_ATMMPOA
++#  define ETH_P_ATMMPOA  0x884c
++# endif
++# ifndef ETH_P_8021Q
++#  define ETH_P_8021Q    0x8100
++# endif
++# ifndef ETH_P_8021AD
++#  define ETH_P_8021AD   0x88a8
++# endif
++# ifndef ETH_P_IPV6
++#  define ETH_P_IPV6     0x86DD
++# endif
++# ifndef ETH_P_PPP_DISC
++#  define ETH_P_PPP_DISC 0x8863
++# endif
++# ifndef ETH_P_PPP_SES
++#  define ETH_P_PPP_SES  0x8864
++# endif
++# ifndef ETH_P_ATMFATE
++#  define ETH_P_ATMFATE  0x8884
++# endif
++# ifndef ETH_P_IEEEPUP
++#  define ETH_P_IEEEPUP  0x0a00
++# endif
++# ifndef ETH_P_IEEEPUPAT
++#  define ETH_P_IEEEPUPAT 0x0a01
++# endif
++# ifndef ETH_P_ALL
++#  define ETH_P_ALL      0x0003
++# endif
+ #endif
+ 
+ #if defined(__FreeBSD__)
+@@ -633,6 +704,24 @@ extern char *strcasestr(const char *s, const char *pattern) FAST_FUNC;
+ extern char *strchrnul(const char *s, int c) FAST_FUNC;
+ #endif
+ 
++#if defined(__APPLE__)
++/* Darwin's struct statfs has f_iosize/f_type but no f_namelen */
++# include <sys/param.h>
++# include <stddef.h>
++# include <string.h>
++# define BB_STATFS_NAMELEN(sf) ((unsigned long)NAME_MAX)
++/* Darwin has neither explicit_bzero() nor memset_s() */
++# define explicit_bzero(p, n) bb_explicit_bzero((p), (n))
++static ALWAYS_INLINE void bb_explicit_bzero(void *p, size_t n)
++{
++	memset(p, 0, n);
++	/* keep the compiler from eliding the memset */
++	__asm__ __volatile__("" : : "r"(p) : "memory");
++}
++#else
++# define BB_STATFS_NAMELEN(sf) ((sf)->f_namelen)
++#endif
++
+ #ifndef HAVE_STRSEP
+ extern char *strsep(char **stringp, const char *delim) FAST_FUNC;
+ #endif
+diff --git a/libbb/Kbuild.src b/libbb/Kbuild.src
+index cb8d2c2..c44e26e 100644
+--- a/libbb/Kbuild.src
++++ b/libbb/Kbuild.src
+@@ -18,6 +18,8 @@ lib-y += bb_bswap_64.o
+ lib-y += bb_do_delay.o
+ lib-y += bb_pwd.o
+ lib-y += bb_qsort.o
++/* Darwin only: empty translation unit elsewhere (see mntent.c) */
++lib-y += mntent.o
+ #lib-y += bb_strtod.o
+ lib-y += bb_strtonum.o
+ lib-y += change_identity.o
+diff --git a/libbb/alloc_affinity.c b/libbb/alloc_affinity.c
+index b6d9f64..7e9984d 100644
+--- a/libbb/alloc_affinity.c
++++ b/libbb/alloc_affinity.c
+@@ -8,7 +8,40 @@
+  */
+ #include <sched.h>
+ #include "libbb.h"
++#if defined(__APPLE__)
++# include <sys/sysctl.h>
++#endif
+ 
++unsigned long* FAST_FUNC get_malloc_cpu_affinity(int pid, unsigned *sz);
++
++#if defined(__APPLE__)
++/* Darwin has no sched_getaffinity(). Report all online CPUs: that is what
++ * nproc(1) wants, and "affinity of another pid" does not exist here.
++ */
++unsigned long* FAST_FUNC get_malloc_cpu_affinity(int pid, unsigned *sz)
++{
++	unsigned long *mask;
++	unsigned sz_in_bytes, bits;
++	int ncpu = 1;
++	size_t len = sizeof(ncpu);
++
++	(void)pid;
++	if (sysctlbyname("hw.logicalcpu", &ncpu, &len, NULL, 0) != 0 || ncpu < 1)
++		ncpu = 1;
++	bits = (unsigned)ncpu;
++	sz_in_bytes = (bits + 8 * sizeof(unsigned long) - 1)
++			/ (8 * sizeof(unsigned long)) * sizeof(unsigned long);
++	if (sz_in_bytes < sizeof(unsigned long))
++		sz_in_bytes = sizeof(unsigned long);
++	mask = xzalloc(sz_in_bytes);
++	while (bits--) {
++		unsigned b = bits;
++		mask[b / (8 * sizeof(unsigned long))] |= 1UL << (b % (8 * sizeof(unsigned long)));
++	}
++	*sz = sz_in_bytes;
++	return mask;
++}
++#else
+ unsigned long* FAST_FUNC get_malloc_cpu_affinity(int pid, unsigned *sz)
+ {
+ 	unsigned long *mask = NULL;
+@@ -19,7 +52,7 @@ unsigned long* FAST_FUNC get_malloc_cpu_affinity(int pid, unsigned *sz)
+ 		if (sched_getaffinity(pid, sz_in_bytes, (void*)mask) == 0)
+ 			break; /* got it */
+ 		sz_in_bytes *= 2;
+-		if (errno == EINVAL && (int)sz_in_bytes > 0)
++		if (errno == EINVAL && (int) sz_in_bytes > 0)
+ 			continue;
+ 		bb_perror_msg_and_die("can't %cet pid %d's affinity", 'g', pid);
+ 	}
+@@ -27,3 +60,4 @@ unsigned long* FAST_FUNC get_malloc_cpu_affinity(int pid, unsigned *sz)
+ 	*sz = sz_in_bytes;
+ 	return mask;
+ }
++#endif
+diff --git a/libbb/find_mount_point.c b/libbb/find_mount_point.c
+index 0e1be38..7d5b281 100644
+--- a/libbb/find_mount_point.c
++++ b/libbb/find_mount_point.c
+@@ -7,7 +7,13 @@
+  * Licensed under GPLv2 or later, see file LICENSE in this source tree.
+  */
+ #include "libbb.h"
+-#include <mntent.h>
++#ifdef HAVE_MNTENT_H
++# include <mntent.h>
++#endif
++#if defined(__APPLE__)
++# include <sys/param.h>
++# include <sys/mount.h>
++#endif
+ 
+ /*
+  * Given a block device, find the mount table entry if that block device
+diff --git a/libbb/poll_with_signals.c b/libbb/poll_with_signals.c
+index 47419f2..38f4351 100644
+--- a/libbb/poll_with_signals.c
++++ b/libbb/poll_with_signals.c
+@@ -10,6 +10,52 @@
+ 
+ #include "libbb.h"
+ 
++#if defined(__APPLE__)
++/* Darwin has no ppoll(). Emulate it.
++ * The point of ppoll() here is atomicity: unblock the signals *and* start
++ * waiting in one syscall. Without that we can lose a signal that arrives
++ * in the unblock->poll() window and then sleep forever.
++ * Emulation: poll() in short slices and re-check bb_got_signal between them.
++ */
++static int darwin_ppoll(struct pollfd *pfd, nfds_t nfds,
++		const struct timespec *tsp, const sigset_t *sigmask)
++{
++	int n;
++	long left_ms = -1;
++	sigset_t saved;
++
++	if (tsp) {
++		left_ms = tsp->tv_sec * 1000 + (tsp->tv_nsec + 999999) / 1000000;
++		if (left_ms < 0)
++			left_ms = 0;
++	}
++	if (sigmask)
++		sigprocmask(SIG_SETMASK, sigmask, &saved);
++	for (;;) {
++		int slice = 100; /* ms */
++		if (left_ms >= 0 && left_ms < slice)
++			slice = (int)left_ms;
++		n = poll(pfd, nfds, slice);
++		if (n != 0) /* ready, or error (EINTR) */
++			break;
++		if (bb_got_signal) {
++			errno = EINTR;
++			n = -1;
++			break;
++		}
++		if (left_ms >= 0) {
++			left_ms -= slice;
++			if (left_ms <= 0) /* timed out */
++				break;
++		}
++	}
++	if (sigmask)
++		sigprocmask(SIG_SETMASK, &saved, NULL);
++	return n;
++}
++# define ppoll darwin_ppoll
++#endif
++
+ /* Shells, for example, need their line input and "read" builtin
+  * to be interruptible, and the naive handling of it a-la:
+  *	if (bb_got_signal) {
+diff --git a/networking/nslookup.c b/networking/nslookup.c
+index b14762b..e3b63ad 100644
+--- a/networking/nslookup.c
++++ b/networking/nslookup.c
+@@ -37,6 +37,10 @@
+ #if !ENABLE_FEATURE_NSLOOKUP_BIG
+ 
+ #include <resolv.h>
++#if defined(__APPLE__)
++/* Darwin ships BIND9 headers: HEADER/MAXDNAME/dname live here */
++# include <arpa/nameser_compat.h>
++#endif
+ //#include <arpa/inet.h>
+ //#include <netdb.h>
+ #include "libbb.h"
+@@ -278,6 +282,10 @@ int nslookup_main(int argc, char **argv)
+ #if USE_LIBC_RESOLV
+ 
+ #include <resolv.h>
++#if defined(__APPLE__)
++/* Darwin ships BIND9 headers: HEADER/MAXDNAME/dname live here */
++# include <arpa/nameser_compat.h>
++#endif
+ 
+ #else
+ 
+diff --git a/libbb/mntent.c b/libbb/mntent.c
+new file mode 100644
+index 0000000..bbbe774
+--- /dev/null
++++ b/libbb/mntent.c
+@@ -0,0 +1,119 @@
++/* vi: set sw=4 ts=4: */
++/*
++ * A <mntent.h> work-alike for systems that lack it (Darwin).
++ *
++ * Darwin exposes the mount table through getmntinfo(3) and <sys/mount.h>,
++ * not through /etc/mtab, so implement setmntent()/getmntent()/endmntent()
++ * on top of that. Callers (df, find_mount_point, ...) then work unchanged.
++ *
++ * Licensed under GPLv2, see file LICENSE in this source tree.
++ */
++#include "libbb.h"
++
++#if defined(__APPLE__) && !defined(HAVE_MNTENT_H)
++
++#include <sys/param.h>
++#include <sys/mount.h>
++#include <sys/ucred.h>
++
++/* Only one mount table is ever walked at a time by busybox, so a single
++ * static iteration state is enough. The FILE* handed out is just a token.
++ */
++static struct statfs *sf_tab;
++static int sf_count;
++static int sf_idx;
++static char *sf_opts;
++
++static char* FAST_FUNC make_opts(const struct statfs *sf)
++{
++	char *opts = xmalloc(512);
++	size_t len;
++
++	strcpy(opts, (sf->f_flags & MNT_RDONLY) ? "ro" : "rw");
++	if ((sf->f_flags & MNT_SYNCHRONOUS) || (sf->f_flags & MNT_ASYNC))
++		strcat(opts, (sf->f_flags & MNT_ASYNC) ? ",async" : ",sync");
++	if (sf->f_flags & MNT_NOEXEC)
++		strcat(opts, ",noexec");
++	if (sf->f_flags & MNT_NOSUID)
++		strcat(opts, ",nosuid");
++	if (sf->f_flags & MNT_NODEV)
++		strcat(opts, ",nodev");
++	if (sf->f_flags & MNT_DONTBROWSE)
++		strcat(opts, ",nobrowse");
++	if (sf->f_flags & MNT_UNION)
++		strcat(opts, ",union");
++	if (sf->f_flags & MNT_LOCAL)
++		strcat(opts, ",local");
++	len = strlen(opts);
++	(void)len;
++	return opts;
++}
++
++FILE* setmntent(const char *filename, const char *type)
++{
++	(void)filename;
++	/* "w"/"a+" (mtab rewriting) is meaningless on Darwin */
++	if (type && type[0] != 'r') {
++		errno = ENOSYS;
++		return NULL;
++	}
++	free(sf_opts);
++	sf_opts = NULL;
++	sf_idx = 0;
++	sf_count = getmntinfo(&sf_tab, MNT_NOWAIT);
++	if (sf_count <= 0) {
++		sf_count = 0;
++		return NULL;
++	}
++	/* any non-NULL value; callers only pass it back to us */
++	return (FILE *)sf_tab;
++}
++
++struct mntent* getmntent(FILE *stream)
++{
++	static struct mntent m;
++
++	(void)stream;
++	if (sf_idx >= sf_count)
++		return NULL;
++
++	free(sf_opts);
++	sf_opts = make_opts(&sf_tab[sf_idx]);
++
++	m.mnt_fsname = sf_tab[sf_idx].f_mntfromname;
++	m.mnt_dir    = sf_tab[sf_idx].f_mntonname;
++	m.mnt_type   = sf_tab[sf_idx].f_fstypename;
++	m.mnt_opts   = sf_opts;
++	m.mnt_freq   = 0;
++	m.mnt_passno = 0;
++	sf_idx++;
++	return &m;
++}
++
++int endmntent(FILE *stream)
++{
++	(void)stream;
++	free(sf_opts);
++	sf_opts = NULL;
++	sf_tab = NULL;
++	sf_count = 0;
++	sf_idx = 0;
++	return 1;
++}
++
++char* hasmntopt(const struct mntent *m, const char *opt)
++{
++	char *p = m->mnt_opts;
++	size_t l = strlen(opt);
++
++	while (p && *p) {
++		if (strncmp(p, opt, l) == 0 && (p[l] == '\0' || p[l] == ','))
++			return p;
++		p = strchr(p, ',');
++		if (p)
++			p++;
++	}
++	return NULL;
++}
++
++#endif /* __APPLE__ && !HAVE_MNTENT_H */

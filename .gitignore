@@ -1,0 +1,12 @@
+# Build products, never committed
+build/
+dist/
+release/
+
+# Upstream clone. Deliberately not tracked: it is busybox's own history
+# (~50 MB) and the GPL source obligation is met by attaching the patched
+# source tarball to each release. See RELEASING.md §4.
+src/
+
+# macOS noise
+.DS_Store
