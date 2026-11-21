@@ -79,7 +79,34 @@ codesign -s - --force "$OUT/${P}-darwin-arm64" "$OUT/${P}-darwin-arm64-pure" 2>/
 [[ -f "$OUT/${P}-darwin-universal" ]] && codesign -s - --force "$OUT/${P}-darwin-universal" 2>/dev/null || true
 
 # ---- checksums --------------------------------------------------------------
-(cd "$OUT" && shasum -a 256 ./* > SHA256SUMS)
+# Two forms on purpose:
+#   <artifact>.sha256  a sidecar beside each file, so someone who downloaded one
+#                      artifact can verify it without downloading anything else
+#   SHA256SUMS         the whole set, verifiable in one pass with -c
+# This is integrity, not authenticity: a checksum served from the same place as
+# the artifact catches corruption in transit, but cannot prove the artifact is
+# genuinely ours if the repository itself is compromised. That needs a signature
+# over SHA256SUMS -- produced below only if a signing key is actually present.
+cd "$OUT"
+: > SHA256SUMS
+for f in *; do
+	case "$f" in
+	*.sha256|SHA256SUMS|SHA256SUMS.asc|NOTES.md) continue ;;
+	esac
+	shasum -a 256 "$f" > "$f.sha256"
+	cat "$f.sha256" >> SHA256SUMS
+done
+
+SIGNED="no"
+if command -v gpg >/dev/null 2>&1 \
+	&& [[ -n "$(gpg --list-secret-keys --with-colons 2>/dev/null | awk -F: '/^sec/ {print $5; exit}')" ]]; then
+	if gpg --batch --yes --armor --detach-sign \
+		--output SHA256SUMS.asc SHA256SUMS 2>/dev/null; then
+		SIGNED="yes"
+	fi
+fi
+cd "$ROOT"
+echo "    checksums: $(grep -c . "$OUT/SHA256SUMS") entries, per-file .sha256 sidecars, gpg-signed: $SIGNED"
 
 # ---- release notes ---------------------------------------------------------
 {
@@ -119,9 +146,34 @@ Darwin binaries are dynamically linked against libSystem, because Apple ships no
 static libc; `-pure` builds drop `nslookup` and depend on libSystem alone.
 macOS minimums: arm64 11.0, x86_64 10.13.
 
-## Verify
+## Verify your download
 
-    shasum -a 256 -c SHA256SUMS
+Every artifact ships with a SHA-256 checksum in two forms: `<artifact>.sha256`
+beside each file, so one artifact can be verified alone, and `SHA256SUMS` for
+the whole set at once.
+
+```sh
+shasum -a 256 -c SHA256SUMS                 # everything you downloaded
+shasum -a 256 -c "${P}-linux-arm64.sha256"  # a single artifact
+```
+
+Expect one `OK` per file. A `FAILED` line means a corrupt or truncated
+download: re-download it rather than running it.
+
+### What this proves, and what it does not
+
+A SHA-256 checksum detects **corruption in transit**. It does **not** prove the
+artifact is genuinely ours, because whoever can serve you a tampered binary can
+serve a matching checksum too. Real authenticity needs a signature:
+
+* `SHA256SUMS.asc` is a GPG detached signature, present **only if** this
+  release was built on a machine holding a signing key. Verify with
+  `gpg --verify SHA256SUMS.asc SHA256SUMS`. If the asset is absent, it was not
+  signed, so treat the checksums as integrity only.
+* The arm64 Mach-O binaries also carry an Apple **ad-hoc** code signature
+  (`codesign -v` passes, `flags=adhoc`). That satisfies the kernel requirement
+  to run, but ad-hoc signing carries no developer identity and is not a
+  substitute for notarisation.
 EOF
 } > "$OUT/NOTES.md"
 
