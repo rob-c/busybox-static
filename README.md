@@ -305,6 +305,7 @@ the rest of coreutils/archival/findutils/editors work.
 ```
 README.md         what this is, the platform limits, the evidence
 RELEASING.md      runbook: bump upstream, re-apply patches, build, publish
+docs/             what this port learned — rules, runbook, gotchas, discoveries
 build.sh          build one target
 build-all.sh      build every target from clean dirs, then lipo
 test.sh           functional smoke test (66 checks Linux / 67 Darwin)
@@ -325,3 +326,8 @@ release/<tag>/    packaged artifacts, ready for gh release create
 ```
 
 Shipping a new build? Start at [RELEASING.md](RELEASING.md).
+
+Everything this port learned the hard way — why macOS can never be static, why
+Apple's `ar` breaks kbuild, why a watchdog `SIGKILL` makes interrupt tests pass
+vacuously — is written up in [docs/](docs/), indexed in
+[docs/README.md](docs/README.md).
