@@ -309,6 +309,7 @@ build.sh          build one target
 build-all.sh      build every target from clean dirs, then lipo
 test.sh           functional smoke test (66 checks Linux / 67 Darwin)
 stress.sh         adversarial harness: Mach-O validity, hangs, crashes, latency
+                  (stress.sh --selftest proves the failure detector works)
 mklipo.sh         combine the two Darwin slices into one universal2 binary
 pack-release.sh   assemble release/ (binaries + source + patches + configs)
 patches/          the two patches, as diffs against upstream

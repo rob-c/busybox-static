@@ -17,6 +17,8 @@
 set -uo pipefail
 ulimit -c 0 2>/dev/null
 
+SELFTEST=0
+if [[ "${1:-}" == "--selftest" ]]; then SELFTEST=1; fi
 BB="${1:?usage: stress.sh <busybox> [\"runner\"]  e.g. stress.sh bb \"arch -x86_64\"}"
 # The runner must be ONE argument. Passing `arch -x86_64` unquoted silently
 # becomes RUNNER=arch plus a stray arg, which yields an empty applet list.
@@ -27,8 +29,12 @@ if [[ $# -gt 2 ]]; then
 fi
 RUNNER="${2:-}"
 # absolute, so cases that cd still work
+if [[ "$SELFTEST" == 1 ]]; then
+	BB=/bin/true
+else
 BB="$(cd "$(dirname "$BB")" && pwd)/$(basename "$BB")"
 [[ -x "$BB" ]] || { echo "not executable: $BB" >&2; exit 1; }
+fi
 
 T="$(mktemp -d)"
 trap 'rm -rf "$T"' EXIT
@@ -153,9 +159,46 @@ expect_fast() {
 	pass=$((pass+1))
 }
 
+# --selftest: prove the failure detector itself works. A test harness that cannot
+# fail is worthless, so this asserts each classification branch directly.
+selftest() {
+	local rc=0
+	pass=0; fail=0; hangs=0; crashes=0; FAILED=()
+	echo "self-test: expect_fast classification"
+
+	local b
+	b=$pass;   expect_fast "fast"  2500 'sleep 0.05'
+	[[ $pass -eq $((b+1)) ]] && echo "  ok   fast command      -> pass" \
+		|| { echo "  FAIL fast command was not accepted"; rc=1; }
+
+	b=$fail;   expect_fast "slow"  500  'sleep 3'
+	[[ $fail -eq $((b+1)) ]] && echo "  ok   slow (3s/500ms)   -> SLOW" \
+		|| { echo "  FAIL slow command was not flagged"; rc=1; }
+
+	b=$crashes; expect_fast "crash" 5000 'sh -c "kill -SEGV \$\$"'
+	[[ $crashes -eq $((b+1)) ]] && echo "  ok   SIGSEGV           -> CRASH" \
+		|| { echo "  FAIL segfault was not detected"; rc=1; }
+
+	b=$hangs;  expect_fast "hang"  1000 'sleep 30'
+	[[ $hangs -eq $((b+1)) ]] && echo "  ok   hang (30s/1s)     -> HANG" \
+		|| { echo "  FAIL hang was not detected"; rc=1; }
+
+	# a runner passed as two words must be rejected outright
+	if ./stress.sh /bin/true arch -x86_64 >/dev/null 2>&1; then
+		echo "  FAIL unquoted runner was not rejected"; rc=1
+	else
+		echo "  ok   unquoted runner   -> rejected"
+	fi
+
+	[[ $rc -eq 0 ]] && echo "self-test OK" || echo "self-test FAILED"
+	return $rc
+}
+
 section() { printf '\n--- %s ---\n' "$1"; }
 
 # ===========================================================================
+if [[ "$SELFTEST" == 1 ]]; then selftest; exit $?; fi
+
 section "A. structural validity (Mach-O syntax)"
 # ===========================================================================
 ftype="$(file -b "$BB" | head -1)"
