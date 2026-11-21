@@ -21,6 +21,7 @@ so the summary is usually all you need.
 - **[Apple's ar fails on empty archives, breaking kbuild-style builds](gotchas/apple-s-ar-fails-on-empty-archives-breaking-kbuild-style-builds.md)** — Building busybox (or any kbuild-style project) on macOS fails with "ar: no archive members specified" — use llvm-ar instead of /usr/bin/ar.
 - **[GitHub release assets lose the executable bit on download](gotchas/github-release-assets-lose-the-executable-bit-on-download.md)** — GitHub release assets lose the executable bit (0644 on download), so published binaries need chmod +x — and any verification step that runs a downloaded asset must chmod first or report a false failure.
 - **[macOS binaries silently pin minos to the SDK version without -mmacosx-version-min](gotchas/macos-binaries-silently-pin-minos-to-the-sdk-version-without.md)** — macOS binaries need an explicit -mmacosx-version-min or clang pins minos to the SDK version and they refuse to launch anywhere older; use 11.0 arm64 / 10.13 x86_64.
+- **[Verifying a public release needs curl -L; gh can't prove it](gotchas/verifying-a-public-release-needs-curl-l-gh-can-t-prove-it.md)** — Prove public downloads with plain curl -L (gh is authenticated and proves nothing); without -L, release asset URLs 302 to a CDN and yield empty files.
 
 ## Discoveries — surprising behaviour, measured
 
@@ -29,6 +30,6 @@ so the summary is usually all you need.
 
 ## Nothing here is a substitute for the code
 
-Where a note and the source disagree, the source wins. Every claim in these
-notes was measured on the machine that wrote it — see `../README.md` for the
-evidence and `../stress.sh --selftest` to re-check the test harness itself.
+Where a note and the source disagree, the source wins. Every claim here was
+measured on the machine that wrote it — see `../README.md` for the evidence and
+run `../stress.sh --selftest` to re-check the test harness itself.
