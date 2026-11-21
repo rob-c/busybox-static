@@ -6,7 +6,7 @@ tags: [github, releases, artifacts, gitignore, gh-cli, busybox-static]
 created: "2026-11-21T00:39:11.667Z"
 updated: "2026-11-21T00:39:11.667Z"
 ---
-`rob-c/busybox-static` holds source, patches and scripts only — zero artifacts in git — yet build outputs are still publishable. The reason they coexist: git tracking and release assets are separate storage.
+`rob-c/busybox-static` holds source, patches, scripts and docs only — zero artifacts in git — yet build outputs are still publishable. The reason they coexist: git tracking and release assets are separate storage.
 
 ```mermaid
 flowchart LR
@@ -26,9 +26,10 @@ Start private (reversible) and flip when ready; assets carry over, no re-upload:
 
     gh repo edit rob-c/busybox-static --visibility public
 
-**Private repos require authentication to download release assets**, so a
-private repo cannot actually share binaries. The repo was created private and
-made public once the release was verified.
+**Private repos require authentication to download release assets**, so a private
+repo cannot actually share binaries. Created private, made public after the
+release was verified; confirmed by downloading all 11 assets with plain `curl`
+and checking `shasum -a 256 -c SHA256SUMS` (11/11 OK).
 
 ## Quirks
 
