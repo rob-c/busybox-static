@@ -274,6 +274,14 @@ the rest of coreutils/archival/findutils/editors work.
 * All four binaries: `./test.sh` — 66 checks (Linux) / 67 (Darwin, plus an APFS
   check) covering the shells, coreutils, grep/sed/awk, tar+gzip, diff, find,
   `df`, `stat`, `whoami`. All pass.
+* Adversarial: `./stress.sh` — 258–259 checks per build across six Darwin
+  artifact/slice combinations (thin arm64, thin x86_64 via Rosetta, the `-pure`
+  pair, and both universal2 slices): **0 failures, 0 hangs, 0 crashes**. It
+  covers Mach-O/signature validity, applet dispatch, shell grammar accepted vs
+  rejected, malformed gzip/bzip2/tar/zip, NUL and invalid UTF-8 corpora, 200 KB
+  single lines, symlink loops, FIFOs, `/dev/null` stdin, SIGPIPE, and interrupt
+  latency. Signal cases assert *promptness* (ms), not merely nonzero exit — see
+  `docs/gotchas/` for why a watchdog SIGKILL makes a naive assertion worthless.
 * Linux static-ness: both binaries run in `FROM scratch` containers (no libc, no
   filesystem) — `uname`, `awk`, `sha256sum`, `tar czf` all work, and
   `llvm-readelf -d` shows 0 `NEEDED` entries.
@@ -299,7 +307,8 @@ README.md         what this is, the platform limits, the evidence
 RELEASING.md      runbook: bump upstream, re-apply patches, build, publish
 build.sh          build one target
 build-all.sh      build every target from clean dirs, then lipo
-test.sh           smoke-test a binary (66 checks Linux / 67 Darwin)
+test.sh           functional smoke test (66 checks Linux / 67 Darwin)
+stress.sh         adversarial harness: Mach-O validity, hangs, crashes, latency
 mklipo.sh         combine the two Darwin slices into one universal2 binary
 pack-release.sh   assemble release/ (binaries + source + patches + configs)
 patches/          the two patches, as diffs against upstream

@@ -24,7 +24,7 @@ artifacts:
 
 ```
 .gitignore  LICENSE  README.md  RELEASING.md
-build.sh  build-all.sh  mklipo.sh  pack-release.sh  test.sh
+build.sh  build-all.sh  mklipo.sh  pack-release.sh  test.sh  stress.sh
 patches/*.patch  prune/*
 ```
 
@@ -203,7 +203,9 @@ driver change.
 Verify before packaging:
 
 ```sh
-./test.sh dist/darwin-arm64/bin/busybox                # expect 67 passed, 0 failed
+./test.sh   dist/darwin-arm64/bin/busybox   # 67 checks: functional
+./stress.sh dist/darwin-arm64/bin/busybox   # 259 checks: adversarial, expect OK
+./stress.sh dist/darwin-amd64/bin/busybox "arch -x86_64"   # Rosetta slice
 docker run --rm -v "$PWD:/w:ro" debian:stable-slim \
   bash -c 'cp /w/test.sh /tmp/; chmod +x /tmp/test.sh; /tmp/test.sh /w/dist/linux-arm64/bin/busybox'
 otool -L dist/darwin-arm64-pure/bin/busybox            # exactly one entry
