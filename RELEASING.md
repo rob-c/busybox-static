@@ -245,6 +245,38 @@ does not exist, `--fail-on-no-commits` to avoid a duplicate release.
 Assets are attached in order via separate API calls, so a failure mid-upload
 leaves a partial release — prefer `--draft`, verify, then publish.
 
+### Signing the checksums (authenticity)
+
+`pack-release.sh` emits `SHA256SUMS.asc` **only if** a GPG secret key is present,
+so nothing is ever signed by a key you did not choose. To enable it:
+
+```sh
+brew install gnupg                      # already installed on this machine
+gpg --quick-gen-key "Your Name <you@example.com>" default default never
+gpg --list-secret-keys --keyid-format=long     # confirm the key exists
+```
+
+Then just re-run `./pack-release.sh`; it prints `gpg-signed: yes` and the
+release gains a `SHA256SUMS.asc` asset. Users verify with:
+
+```sh
+gpg --verify SHA256SUMS.asc SHA256SUMS      # expect "Good signature"
+```
+
+Verified working: with a key in an isolated `GNUPGHOME`, the packager produced
+`SHA256SUMS.asc`, `gpg --verify` reported `Good signature`, and editing a byte
+of `SHA256SUMS` produced `BAD signature`.
+
+Publish the corresponding public key where downloaders can find it
+(`gpg --armor --export <keyid>`), otherwise the signature proves only that
+*some* key signed it. If you would rather not mint a PGP identity, an SSH key
+you already own can sign instead (`ssh-keygen -Y sign` / `-Y verify` with an
+`allowed_signers` file) — but that publishes your SSH public key with the
+release, so it is a deliberate choice rather than a default.
+
+**Never** sign with a throwaway key: a signature from an identity nobody can
+trace is worse than no signature, because it looks like verification.
+
 ### Licence obligations (non-negotiable)
 
 BusyBox is **GPLv2 only** — `src/LICENSE` states version 2 is the only version
