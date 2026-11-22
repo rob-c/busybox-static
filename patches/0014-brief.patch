@@ -1,9 +1,9 @@
 diff --git a/miscutils/brief.c b/miscutils/brief.c
 new file mode 100644
-index 0000000..29604b8
+index 0000000..46fa9ca
 --- /dev/null
 +++ b/miscutils/brief.c
-@@ -0,0 +1,644 @@
+@@ -0,0 +1,646 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * brief - structure-preserving reduction of line-oriented tool output.
@@ -105,6 +105,7 @@ index 0000000..29604b8
 +	unsigned nsmp;
 +	unsigned count;            /* occurrences in the input */
 +	int shown;                 /* selected for output */
++	int is_kept;               /* -k matched: printed verbatim, never merged */
 +};
 +
 +/* ---- byte-exact line reader -------------------------------------------- */
@@ -485,6 +486,7 @@ index 0000000..29604b8
 +				/* Kept lines are never merged: one record each. */
 +				if (nitems < max_recs) {
 +					it = item_new();
++					it->is_kept = 1;
 +					it->count = 1;
 +					it->smp[0].p = line;
 +					it->smp[0].n = len;
@@ -625,7 +627,7 @@ index 0000000..29604b8
 +					sb_add(&line, it->smp[k].p, it->smp[k].n);
 +				printf("%s{\"n\":%u,\"kept\":%s,\"line\":",
 +						first ? "" : ",", it->count,
-+						it->key ? "false" : "true");
++						it->is_kept ? "true" : "false");
 +				put_json_str(line.p, line.len);
 +				putchar('}');
 +				free(line.p);

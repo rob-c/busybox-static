@@ -1610,10 +1610,10 @@ index 0000000..ed6ae04
 +}
 diff --git a/miscutils/waitfor.c b/miscutils/waitfor.c
 new file mode 100644
-index 0000000..7e2ba7a
+index 0000000..9c16ba8
 --- /dev/null
 +++ b/miscutils/waitfor.c
-@@ -0,0 +1,433 @@
+@@ -0,0 +1,467 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * waitfor - bounded readiness polling.
@@ -1639,6 +1639,7 @@ index 0000000..7e2ba7a
 +//usage:     "\n	-u, --unix PATH		Wait for a unix socket to accept"
 +//usage:     "\n	-H, --http URL		Wait for an HTTP status (http:// only)"
 +//usage:     "\n	-G, --glob PATTERN	Wait for a path matching PATTERN to exist"
++//usage:     "\n	-x, --exec CMD		Wait until CMD exits 0"
 +//usage:     "\n	-e, --expect CODE	Expected HTTP status (default 200)"
 +//usage:     "\n	-T, --timeout SECS	Overall deadline (default 20)"
 +//usage:     "\n	-i, --interval MS	Initial poll interval (default 20)"
@@ -1650,6 +1651,7 @@ index 0000000..7e2ba7a
 +
 +#include <sys/un.h>
 +#include <glob.h>
++#include <sys/wait.h>
 +#include "libbb.h"
 +
 +enum {
@@ -1880,6 +1882,7 @@ index 0000000..7e2ba7a
 +	char *opt_unix = NULL;
 +	char *opt_http = NULL;
 +	char *opt_glob = NULL;
++	char *opt_exec = NULL;
 +	char *opt_expect = NULL;
 +	char *opt_timeout = NULL;
 +	char *opt_interval = NULL;
@@ -1896,6 +1899,7 @@ index 0000000..7e2ba7a
 +		"unix\0"     Required_argument "u"
 +		"http\0"     Required_argument "H"
 +		"glob\0"     Required_argument "G"
++		"exec\0"     Required_argument "x"
 +		"expect\0"   Required_argument "e"
 +		"timeout\0"  Required_argument "T"
 +		"interval\0" Required_argument "i"
@@ -1904,8 +1908,8 @@ index 0000000..7e2ba7a
 +
 +	xfunc_error_retval = 2;
 +
-+	opts = getopt32long(argv, "f:t:u:H:G:e:T:i:F:", waitfor_longopts,
-+			&opt_file, &opt_tcp, &opt_unix, &opt_http, &opt_glob, &opt_expect,
++	opts = getopt32long(argv, "f:t:u:H:G:x:e:T:i:F:", waitfor_longopts,
++			&opt_file, &opt_tcp, &opt_unix, &opt_http, &opt_glob, &opt_exec, &opt_expect,
 +			&opt_timeout, &opt_interval, &opt_fmt);
 +	(void)opts;
 +
@@ -1935,8 +1939,8 @@ index 0000000..7e2ba7a
 +	if (o.interval_ms > MAX_INTERVAL_MS)
 +		o.interval_ms = MAX_INTERVAL_MS;
 +
-+	if ((!!opt_file + !!opt_tcp + !!opt_unix + !!opt_http + !!opt_glob) != 1)
-+		bb_error_msg_and_die("exactly one of --file/--tcp/--unix/--http/--glob is required");
++	if ((!!opt_file + !!opt_tcp + !!opt_unix + !!opt_http + !!opt_glob + !!opt_exec) != 1)
++		bb_error_msg_and_die("exactly one of --file/--tcp/--unix/--http/--glob/--exec is required");
 +
 +	o.file = opt_file;
 +	o.unix_path = opt_unix;
@@ -1947,6 +1951,9 @@ index 0000000..7e2ba7a
 +	} else if (opt_glob) {
 +		o.kind = 4;
 +		o.target = opt_glob;
++	} else if (opt_exec) {
++		o.kind = 5;
++		o.target = opt_exec;
 +	} else if (opt_unix) {
 +		o.kind = 2;
 +		o.target = opt_unix;
@@ -1988,6 +1995,31 @@ index 0000000..7e2ba7a
 +		case 0: ready = wait_file(o.file); break;
 +		case 1: ready = wait_tcp(o.host, o.port, CONNECT_TIMEOUT_MS); break;
 +		case 2: ready = wait_unix(o.unix_path); break;
++		case 5: {
++			pid_t pid;
++			int st;
++
++			fflush_all();
++			pid = fork();
++			if (pid < 0) {
++				ready = 0;
++				break;
++			}
++			if (pid == 0) {
++				int nul = open("/dev/null", O_WRONLY);
++
++				if (nul >= 0) {
++					dup2(nul, 1);
++					dup2(nul, 2);
++					if (nul > 2)
++						close(nul);
++				}
++				execl("/bin/sh", "sh", "-c", o.target, (char *)NULL);
++				_exit(127);
++			}
++			ready = waitpid(pid, &st, 0) == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0;
++			break;
++		}
 +		case 4: {
 +			glob_t g;
 +
@@ -2023,7 +2055,8 @@ index 0000000..7e2ba7a
 +		printf("{\"schema\":1,\"ready\":%s,\"kind\":\"%s\",\"target\":",
 +				ready ? "true" : "false",
 +				o.kind == 0 ? "file" : o.kind == 1 ? "tcp" :
-+				o.kind == 2 ? "unix" : o.kind == 4 ? "glob" : "http");
++				o.kind == 2 ? "unix" : o.kind == 4 ? "glob" :
++				o.kind == 5 ? "exec" : "http");
 +		json_str(o.target);
 +		printf(",\"attempts\":%ld,\"elapsed_ms\":%ld", attempt, elapsed_ms);
 +		if (o.kind == 3)
@@ -2036,7 +2069,8 @@ index 0000000..7e2ba7a
 +		printf("ready=%s kind=%s target=%s attempts=%ld elapsed_ms=%ld",
 +				ready ? "true" : "false",
 +				o.kind == 0 ? "file" : o.kind == 1 ? "tcp" :
-+				o.kind == 2 ? "unix" : o.kind == 4 ? "glob" : "http",
++				o.kind == 2 ? "unix" : o.kind == 4 ? "glob" :
++				o.kind == 5 ? "exec" : "http",
 +				o.target, attempt, elapsed_ms);
 +		if (o.kind == 3)
 +			printf(" status=%d expect=%ld", last_status, o.expect);

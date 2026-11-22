@@ -615,9 +615,8 @@ sec "29. -k over binary records"
 printf 'A\000B\nplain\n' > "$T/fx"
 "$BB" brief -k A "$T/fx" > "$T/o" 2>/dev/null
 ck "-k matches across a NUL boundary" "1" "$(mfo kept < "$T/o")"
-body "$T/o" "$T/got"
 printf 'A\000B\nplain\n' > "$T/exp"
-byteck "-k keeps the NUL bytes" "$T/exp" "$T/got"
+byteck "-k keeps the NUL bytes" "$T/exp" "$T/o"
 printf '\377\376\nplain\n' > "$T/fx"
 "$BB" brief -k "$(printf '\377')" "$T/fx" > "$T/o" 2>/dev/null
 ck "-k matches a high byte" "1" "$(mfo kept < "$T/o")"
