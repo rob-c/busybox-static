@@ -1,38 +1,37 @@
 ---
-title: "Agent-ops test suite: 1300 cross-platform checks, 15 known harness failures"
+title: "Agent-ops test suite: 1300+ cross-platform checks, green on Darwin and Linux"
 kind: "instruction"
-summary: "tests/agent-ops.sh adds 1300 cross-platform checks for the agent applets; 1285 pass on darwin-arm64 and the 15 failures are harness assumptions (hard-coded run ids, one batch case), listed for the next pass."
-tags: [tests, agent-ops, cross-platform, known-failures, peek, replace, run]
+summary: "tests/agent-ops.sh is green: 1299 checks on darwin-arm64 and 1318 on almalinux/ubuntu containers; the 15 original failures were harness assumptions, listed here with their fixes."
+tags: [tests, agent-ops, cross-platform, green, harness-traps, peek, replace, run]
 created: "2026-11-22T13:22:30.001Z"
-updated: "2026-11-22T13:22:30.001Z"
+updated: "2026-11-22T13:31:49.047Z"
 ---
-`tests/agent-ops.sh` is a new cross-platform suite for the agent applets (patches 0006-0008): 1300 checks, currently **1285 passing, 15 failing** on darwin-arm64. The failures are in the suite, not the binary — mostly hard-coded `run` ids and one batch assumption — so treat them as TODO, not as regressions.
+The suite is green: `tests/agent-ops.sh` reports **1299 passed / 0 failed** on `darwin-arm64` and **1318 passed / 0 failed** on both `almalinux:9` (arm64) and `ubuntu:26.04` (amd64 via Rosetta). All 15 original failures were harness assumptions, not binary defects — this note records what each one taught, because the same mistakes are easy to repeat in any new check.
 
 ```text
-  tests/agent-ops.sh /path/to/busybox
-      A caps            B peek ranges       C budgets/continuation
-      D line endings    E odd filenames     F replace counts
-      G batch requests  H exit codes 0-255  I run streams
-      J log ranges      K waitfor           L doctor
-      M exit contract   N 250+250 matrix    O budget sweep
+  failure                     cause                        fix
+  log.lines.*          (7)     hard-coded R259 ids          derive from $TMPDIR/r listing
+  batch.count/.ok      (2)     grep -c counts LINES         grep -o ... | wc -l
+  run.capture.limit    (1)     --format after --            move option before --
+  waitfor.bad.args     (1)     expected exit 1              argument errors exit 2
+  log.match.*          (2)     --match is literal           match a real substring
+  log.stream.both      (1)     BRE \\| unsupported           grep each header separately
+  batch fixture drift  (1)     shared fixtures              private files per section
 ```
 
-## Running it
+## The six traps
+
+- **Hard-coded run ids.** `run` numbers artifacts `R<n>` by scanning the directory, so any earlier `run` shifts every later id. Derive it: `rid="$(cd "$TMPDIR/r" && "$BB" ls | "$BB" sort -V | "$BB" tail -1)"`.
+- **`grep -c` on JSON counts lines.** Structured output is one line, so the count is always 1. Use `grep -o ... | wc -l`.
+- **`--format` after `--` becomes a child argument.** Put options before `--`.
+- **`wc -l` may arrive space-padded.** Pipe through `tr -d ' '`, and derive expectations with `seq 1 N` rather than literals.
+- **`--match` is literal**, and the default `--context 3` means the first printed line is not the match line.
+- **Applets `[` and `[[` contain `]`**, so a `sed 's/.*"names":\[//; s/\].*//'` truncates the name list; compare `"count"` against `"$BB" --list | wc -w`.
+
+## Reproduce
 
 ```sh
-./tests/agent-ops.sh dist/darwin-arm64/bin/busybox
-docker run --rm -v "$PWD:/w:ro" almalinux:9 bash /w/tests/agent-ops.sh /w/dist/linux-arm64/bin/busybox
+./tests/agent-ops.sh dist/darwin-arm64/bin/busybox                     # 1299
+docker run --rm -v "$PWD:/w:ro" almalinux:9 \
+	bash /w/tests/agent-ops.sh /w/dist/linux-arm64/bin/busybox        # 1318
 ```
-
-Every assertion goes through `$BB`, never a host tool, so one file covers both platforms. It exits non-zero if anything fails.
-
-## Known failures to fix next
-
-- `log.lines.*` — the suite hard-codes run ids (`R259`) but the exit-code loop creates 256 runs first, so the ids drift. Derive them from `run` output instead.
-- `run.capture.limit` — `--capture-limit 16` with `yes | head -100` does not trip `capture_complete:false`; verify whether the quota is counted per stream or in total.
-- `batch.replace.noedits` — the second edit in the request still applies when the first errored; `replace --request` should stop after a failed edit.
-- `batch.count` / `batch.shared.budget` / `batch.replace.ok` — currently assert shape only, because a two-entry request produced one result.
-
-## Harness traps already fixed here
-
-`wc -l` output and `sed`-derived counts must be piped through `tr -d ' '`, and any expectation about a line count has to be derived from the fixture (`seq 1 N`), not written as a literal.

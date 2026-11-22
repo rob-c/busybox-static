@@ -496,3 +496,91 @@ this kind of claim.
                           │
      linux-arm64/amd64 (musl, static)   darwin-arm64/amd64 (libSystem)
 ```
+
+## 13. Dogfooding: tooling that would help busybox develop itself
+
+Using the applets above on this repository showed the remaining friction is almost
+entirely in the harness layer (1,741 lines of bash across `test.sh`, `stress.sh`,
+`adversarial.sh`, `tests/agent-ops.sh`), not in the binaries. Ranked by value:
+
+| # | gap observed while using the suite | tool | shape |
+|---|---|---|---|
+| 1 | 15 "failures" were harness bugs, one check could not be selected, results were incomparable across five targets | structured test runner: one JSON object per check `{name,status,expected,actual,duration_ms,target}`, plus `--only NAME` and `--list` | `test --format json` |
+| 2 | `grep -c '"status":"ok"'` returned 1 because JSON output is a single line | the deferred `json` reader as a selector/validator | `json get FILE PATH`, `json validate` |
+| 3 | patch series verified by hand with `git apply --check -R`, stats by `wc -l` | series check: applies in order, reverse-checks, reports `{file,hunks,+,-}` | `patchcheck patches/*.patch` |
+| 4 | `build-all.sh` prints a table; `--caps` says nothing about the artifact | `--caps --format json` gains a `build` object: size, `NEEDED` count, minos, config hash | flag on the existing applet |
+| 5 | "why is `udhcpc` missing on Darwin?" meant grepping `.config`, `prune/darwin-off.txt` and `build.sh` | explain an applet's absence with the CONFIG symbol and the file:line that set it | `why APPLET` |
+| 6 | `adversarial.sh` daemonized `inetd`/`fakeidentd`; six strays were hunted with `ps \| grep \| kill -9` | run-scoped cleanup: report the process group, kill the group on request | `run --pgid`, `reap R<n>` |
+| 7 | "did my change alter behaviour?" meant copying logs around | diff two runs' captured artifacts, bounded and numbered | `log --diff R3 R4` |
+| 8 | timings were eyeballed from `time` | n repetitions, min/median/p95 as JSON | `bench -n5 -- CMD` |
+| 9 | build failures were "no such file: llvm-ar", stale generated headers | toolchain, SDK/minos and generated-file freshness (`applets.h`, `usage.h`, `Kbuild`) | `doctor --build` |
+
+Read-only first (#1-#5 describe the build and cannot worsen a release), and note that
+#6 is the prerequisite for ever letting an agent run `adversarial.sh` unattended: its
+`SKIP_MATRIX` omits `reboot`/`poweroff`/`halt`/`init`, all four enabled in the Linux build.
+
+Not worth building: cgroup/namespace sandboxing (Linux-only, breaks §6), file watching
+(`inotify`/`kqueue` shim for little gain), CI orchestration, MCP, a full `jq` clone (§9).
+
+## 14. Suggested further developments
+
+Everything below is a proposal on top of the shipped set. The gate for any of it is
+§2 (contract) and §6 (portability); a proposal that cannot name its exit codes, its
+byte budget and its Darwin behaviour is not ready. Patch numbers continue at `0009`.
+
+### 14.1 Extending what shipped
+
+| area | suggestion | why | portable? |
+|---|---|---|---|
+| `peek` | `--lines 5:9,40:60` (multiple ranges in one request) | the merged-window code for `--around` already computes exactly this | yes |
+| `peek` | `--follow` with a byte cursor, for logs that grow | turns `peek` into a bounded `tail -f` alternative without inotify/kqueue | yes — poll `fstat` size |
+| `peek` | `--diff` against a stored `version=sha256:` snapshot | answers "did this file change since I read it" without re-reading | yes |
+| `replace` | several edits for one file in a single request (`edits[]`), rejecting overlaps | the all-or-nothing preflight already validates against the original buffer | yes |
+| `replace` | `--backup SUF` alongside `--follow` | recoverability without a VCS; `sed -i` already has the rename pattern | yes |
+| `run` | `--pgid` printed in metadata, plus `--prune` for old runs | makes cleanup possible from outside (see 14.3) | yes |
+| `run` | `--stdin FILE`, `--env NAME=VALUE` (repeatable, never inherited wholesale) | agents need deterministic child environments | yes |
+| `run` | `--pty` (opt-in) | real ordering for interactive tools; must keep the pipes path the default | `openpty(3)` is in libutil on both |
+| `log` | `--diff R3 R4` and `--json` for every mode | before/after evidence comparison is the core debugging loop | yes |
+| `waitfor` | `--exec CMD` predicate, `--glob PATH` | "ready" is often application-defined | yes |
+| `waitfor` | `--https` via the in-tree TLS (`CONFIG_TLS=y`) | today `https://` exits with "use wget --spider"; the status code stays unobservable | the TLS code already builds on both |
+| `doctor` | `--build`: toolchain paths, SDK/minos, generated-file freshness | build failures currently read as "no such file: llvm-ar" | yes |
+| `busybox --caps` | a `build` object (size, `NEEDED`, minos, config hash) | `--caps` is the only machine-readable build description | yes |
+
+### 14.2 New applets
+
+| applet | purpose | notes |
+|---|---|---|
+| `json` | validated reads and typed edits (`json get FILE /a/b`, `json set … --value`) | the `grep -c` assertion trap in the test suite is its motivating case; reject comments/trailing commas rather than pretending |
+| `patchcheck` | verify a series applies in order, reverse-check it, report `{file,hunks,+,-}` | replaces `git apply --check -R` loops and `wc -l` stats |
+| `snapshot` | paths + sha256 + mode + size as JSON, and `--diff` of two snapshots | reuses `peek`'s hashing; the primitive for "what did the build change" |
+| `bench` | n repetitions, min/median/p95 as JSON | `run` already records `duration_ms`; nothing reads it comparatively |
+| `why` | explain an applet's absence: CONFIG symbol + the file:line that disabled it | reads `.config` and `prune/darwin-off.txt`; replaces a three-file grep |
+| `check` | structured test runner emitting `{name,status,expected,actual,duration_ms}` | **name it `check`, not `test`** — `test`, `[` and `[[` are already applets |
+
+### 14.3 Cross-cutting conventions worth settling before more applets
+
+- **NDJSON streaming** for anything unbounded (`snapshot`, `check`): one object per line,
+  so `run` can capture it and `log --match` can select without a parser.
+- **A deprecation policy.** `schema:1` is frozen; a breaking change bumps it and the old
+  field stays for one release. `--caps` should report the highest schema each applet emits.
+- **Error parity.** Every applet names its codes from the §2 list; adding a code means
+  adding it there and to `--caps`.
+- **Never inherit the whole environment** in `run` once `--env` exists; a child that sees
+  `PATH` should see only what the caller passed plus a documented minimal set.
+
+### 14.4 Explicitly not doing
+
+Unchanged from §9 and §13: no daemon, no job queue, no AST/embedding index, no cgroup or
+namespace sandbox (Linux-only), no file watching, no MCP server, no `jq` clone, no exact
+token counts, no fuzzy edits, and nothing that needs `fork` of a *daemon* to work.
+
+### 14.5 Acceptance checklist for a new proposal
+
+1. Exit codes from the §2 table only; usage errors 2; nothing above 125.
+2. `--format json` with `"schema":1` and stable field names; text output still the default.
+3. Every output bounded, with `truncated` + a continuation (`next=--from-byte N` or a run id).
+4. No `#ifdef`-per-platform behaviour; a platform shim goes in a new file (§6.3).
+5. A `test.sh`/`tests/agent-ops.sh` check per rule, green on Darwin **and** in an
+   AlmaLinux container before the patch is considered done.
+6. Size measured, not guessed: report the before/after delta against the 5 % budget (§7).
+
