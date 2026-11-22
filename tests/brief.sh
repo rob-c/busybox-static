@@ -925,5 +925,66 @@ printf 'a\nb\nc\n' > "$T/fx"
 "$BB" brief -R a "$T/fx" > "$T/o" 2>/dev/null
 ck "a small -R record is one record" "1" "$(mfo records < "$T/o")"
 
+sec "41. -F json explains the view to a reader that cannot see the input"
+
+printf '%s\n' "a" "a" "b" > dj.txt
+"$BB" brief -d -F json dj.txt > "$T/j" 2>/dev/null
+ck "json is one line" "1" "$("$BB" wc -l < "$T/j" | cnt)"
+ck "json schema 1" "1" "$("$BB" grep -c '"schema":1' "$T/j")"
+ck "summary says complete" "1" "$("$BB" grep -c 'complete' "$T/j")"
+ck "summary is a sentence" "1" "$("$BB" grep -c '"summary":"3 lines in, 2 records, all shown' "$T/j")"
+ck "pct_of_input is a number" "1" "$("$BB" grep -c '"pct_of_input":[0-9]' "$T/j")"
+ck "hints is an array" "1" "$("$BB" grep -c '"hints":\[' "$T/j")"
+ck "truncated_by is null when nothing was cut" "1" "$("$BB" grep -c '"truncated_by":null' "$T/j")"
+# the count is a field, so the record itself carries no "Nx " and no newline
+ck "item line is the record, not the rendering" "1" "$("$BB" grep -c '"n":2,"lines":2,"kept":false,"line":"a"' "$T/j")"
+ck "one object per group" "2" "$("$BB" grep -c '"n":' "$T/j")"
+# merged lines are what -t would rank
+ck "hint names -t when lines were merged" "1" "$("$BB" grep -c '\-t 10 ranks' "$T/j")"
+
+"$BB" brief -t 1 -F json dj.txt > "$T/j" 2>/dev/null
+ck "truncated_by names the cap" "1" "$("$BB" grep -c '"truncated_by":"top"' "$T/j")"
+ck "hint names -t as the cap" "1" "$("$BB" grep -c 'kept the 1 highest-count groups' "$T/j")"
+ck "summary says incomplete" "1" "$("$BB" grep -c 'incomplete' "$T/j")"
+
+printf '%s\n' "one" "two" "three" > dj2.txt
+"$BB" brief -B 4 -F json dj2.txt > "$T/j" 2>/dev/null
+ck "truncated_by names the budget" "1" "$("$BB" grep -c '"truncated_by":"budget"' "$T/j")"
+ck "hint names -B" "1" "$("$BB" grep -c 'raise -B' "$T/j")"
+
+"$BB" brief -m 5 -F json dj2.txt > "$T/j" 2>/dev/null
+ck "truncated_by names -m" "1" "$("$BB" grep -c '"truncated_by":"min_count"' "$T/j")"
+
+"$BB" brief -o zzznomatch -F json dj2.txt > "$T/j" 2>/dev/null
+ck "truncated_by names selection" "1" "$("$BB" grep -c '"truncated_by":"selection"' "$T/j")"
+ck "hint warns that -o is not a regex" "1" "$("$BB" grep -c 'substrings, not regexes' "$T/j")"
+
+# projected fields come out as an array: nothing to re-split
+printf 'src/a.c:1: error: bad\nsrc/a.c:9: error: bad\n' > dj3.txt
+"$BB" brief -i : -c 1 -F json dj3.txt > "$T/j" 2>/dev/null
+ck "f is the projected field array" "1" "$("$BB" grep -c '"f":\["src/a.c"\]' "$T/j")"
+ck "f is absent without a projection" "1" \
+	"$("$BB" brief -F json dj2.txt 2>/dev/null | "$BB" grep -c '"f":')"
+
+# samples only when -a asked for more than one
+printf 'x1\nx2\n' > dj4.txt
+"$BB" brief -s -a 2 -F json dj4.txt > "$T/j" 2>/dev/null
+ck "samples appears with -a 2" "1" "$("$BB" grep -c '"samples":\["x1","x2"\]' "$T/j")"
+ck "line is the first sample" "1" "$("$BB" grep -c '"line":"x1"' "$T/j")"
+"$BB" brief -s -F json dj4.txt > "$T/j" 2>/dev/null
+ck "no samples key by default" "1" "$("$BB" grep -c -v '"samples":' "$T/j")"
+
+# a multi-line record keeps its lines, escaped once, not as \u000a
+{ printf 'commit aaa\nAuthor: X\n    one\n'; } > dj5.txt
+"$BB" brief -R commit -F json dj5.txt > "$T/j" 2>/dev/null
+ck "a section is one json string" "1" "$("$BB" grep -c 'commit aaa\\nAuthor: X\\n' "$T/j")"
+ck "no \\u000a escaping" "0" "$("$BB" grep -c 'u000a' "$T/j")"
+
+# the text marker names the same reason
+"$BB" brief -B 4 dj2.txt > "$T/o" 2>/dev/null
+ck "marker carries truncated_by" "budget" "$(mfo truncated_by < "$T/o")"
+"$BB" brief dj2.txt > "$T/o" 2>/dev/null
+ck "marker says - when nothing was cut" "-" "$(mfo truncated_by < "$T/o")"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

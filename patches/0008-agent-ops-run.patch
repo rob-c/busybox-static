@@ -1,9 +1,9 @@
 diff --git a/coreutils/run.c b/coreutils/run.c
 new file mode 100644
-index 0000000..f2b45d2
+index 0000000..c828994
 --- /dev/null
 +++ b/coreutils/run.c
-@@ -0,0 +1,1162 @@
+@@ -0,0 +1,1265 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * run - captured execution with retrievable evidence.
@@ -45,6 +45,8 @@ index 0000000..f2b45d2
 +//usage:     "\n	-P, --pgid		Print the child's process group id"
 +//usage:     "\n	-e, --env NAME=VALUE	Set NAME for the child (repeatable)"
 +//usage:     "\n	-r, --prune N		Keep only the newest N runs"
++//usage:     "\n	-b, --brief WHICH	Reduce the view through brief -d:"
++//usage:     "\n			stdout (default), stderr or both"
 +//usage:     "\n	-F, --format FMT	text (default) or json"
 +//usage:     "\n"
 +//usage:     "\nExit: the child's status when it exits on its own, 3 when this"
@@ -322,6 +324,69 @@ index 0000000..f2b45d2
 +	return out;
 +}
 +
++#if ENABLE_BRIEF
++int brief_main_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
++#endif
++
++/*
++ * Pipe an artifact through the brief applet (in a child, so getopt state is
++ * private) and return at most `budget` bytes of the reduced text.
++ * Returns NULL when brief is not built in or the artifact is empty.
++ */
++static char *brief_reduce(const char *path, size_t budget)
++{
++#if ENABLE_BRIEF
++	struct stat sb;
++	char *buf, *av[3];
++	size_t len = 0;
++	ssize_t n;
++	int p[2], fd, st;
++	pid_t pid;
++
++	fd = open(path, O_RDONLY);
++	if (fd < 0)
++		return NULL;
++	if (fstat(fd, &sb) != 0 || sb.st_size == 0) {
++		close(fd);
++		return NULL;
++	}
++	if (pipe(p) != 0) {
++		close(fd);
++		return NULL;
++	}
++	fflush_all();
++	pid = fork();
++	if (pid == 0) {
++		dup2(fd, 0);
++		dup2(p[1], 1);
++		if (fd > 2)
++			close(fd);
++		if (p[0] > 2)
++			close(p[0]);
++		if (p[1] > 2)
++			close(p[1]);
++		av[0] = (char *)"brief";
++		av[1] = (char *)"-d";
++		av[2] = NULL;
++		brief_main_main(2, av);
++		_exit(0);
++	}
++	close(fd);
++	close(p[1]);
++	buf = xzalloc(budget + 1);
++	while (len < budget && (n = safe_read(p[0], buf + len, budget - len)) > 0)
++		len += (size_t)n;
++	close(p[0]);
++	buf[len] = '\0';
++	waitpid(pid, &st, 0);
++	return buf;
++#else
++	(void)path;
++	(void)budget;
++	return NULL;
++#endif
++}
++
 +static size_t dump_bounded(const char *path, size_t budget, int json, const char *label)
 +{
 +	int fd = open(path, O_RDONLY);
@@ -440,6 +505,8 @@ index 0000000..f2b45d2
 +	char *opt_stdin = NULL;
 +	int opt_pgid = 0;
 +	char *opt_prune = NULL;
++	char *opt_brief = NULL;
++	int brief_out = 0, brief_err = 0;
 +	unsigned opts;
 +	long deadline_ms = 0, budget = DEFAULT_VIEW, capture_limit = DEFAULT_CAPTURE;
 +	int kill_after = 2000, json = 0, use_shell = 0;
@@ -465,6 +532,7 @@ index 0000000..f2b45d2
 +		"stdin\0"         Required_argument "i"
 +		"pgid\0"          No_argument       "P"
 +		"prune\0"         Required_argument "r"
++		"brief\0"         Required_argument "b"
 +		;
 +
 +	xfunc_error_retval = 2;
@@ -487,10 +555,20 @@ index 0000000..f2b45d2
 +		}
 +		argv[j] = NULL;
 +	}
-+	opts = getopt32long(argv, "T:k:B:C:D:d:sF:i:Pr:", run_longopts,
++	opts = getopt32long(argv, "T:k:B:C:D:d:sF:i:Pr:b:", run_longopts,
 +			&opt_timeout, &opt_kill, &opt_bytes, &opt_capture,
-+			&opt_dir, &opt_cwd, &opt_fmt, &opt_stdin, &opt_prune);
++			&opt_dir, &opt_cwd, &opt_fmt, &opt_stdin, &opt_prune, &opt_brief);
 +	use_shell = (opts & (1 << 6)) != 0;   /* s */
++	if (opt_brief) {
++		if (strcmp(opt_brief, "both") == 0)
++			brief_out = brief_err = 1;
++		else if (strcmp(opt_brief, "stdout") == 0)
++			brief_out = 1;
++		else if (strcmp(opt_brief, "stderr") == 0)
++			brief_err = 1;
++		else
++			bb_error_msg_and_die("--brief is stdout, stderr or both");
++	}
 +	{
 +		opt_pgid = (opts & (1 << 9)) != 0;   /* P */
 +	}
@@ -705,8 +783,13 @@ index 0000000..f2b45d2
 +					(m.out_bytes + m.err_bytes) > (unsigned long long)budget
 +						? "true" : "false");
 +			{
-+				char *vo = bounded_string(p1, (size_t)budget * 3 / 4);
-+				char *ve = bounded_string(p2, (size_t)budget / 4);
++				char *vo = (brief_out ? brief_reduce(p1, (size_t)budget * 3 / 4) : NULL);
++				char *ve = (brief_err ? brief_reduce(p2, (size_t)budget / 4) : NULL);
++
++				if (!vo)
++					vo = bounded_string(p1, (size_t)budget * 3 / 4);
++				if (!ve)
++					ve = bounded_string(p2, (size_t)budget / 4);
 +
 +				json_write_str(vo);
 +				fputs(",\"stderr_view\":", stdout);
@@ -730,11 +813,31 @@ index 0000000..f2b45d2
 +			if (opt_pgid)
 +				printf("pgid=%ld\n", child_pgid);
 +			fputs("--- stdout ---\n", stdout);
-+			shown = dump_bounded(p1, (size_t)budget, 0, "stdout");
++			if (brief_out) {
++				char *bv = brief_reduce(p1, (size_t)budget);
++
++				if (bv) {
++					fputs(bv, stdout);
++					shown = strlen(bv);
++					free(bv);
++				} else
++					shown = 0;
++			} else
++				shown = dump_bounded(p1, (size_t)budget, 0, "stdout");
 +			if (!shown)
 +				fputs("(empty)\n", stdout);
 +			fputs("--- stderr ---\n", stdout);
-+			shown = dump_bounded(p2, (size_t)budget / 4, 0, "stderr");
++			if (brief_err) {
++				char *bv = brief_reduce(p2, (size_t)budget / 4);
++
++				if (bv) {
++					fputs(bv, stdout);
++					shown = strlen(bv);
++					free(bv);
++				} else
++					shown = 0;
++			} else
++				shown = dump_bounded(p2, (size_t)budget / 4, 0, "stderr");
 +			if (!shown)
 +				fputs("(empty)\n", stdout);
 +			if ((m.out_bytes + m.err_bytes) > (unsigned long long)budget)
