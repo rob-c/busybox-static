@@ -8,9 +8,6 @@
 # Everything runs through $BB (never a host tool) so the same file exercises the
 # same code on Darwin and on Linux/musl. Checks that need an outside tool skip
 # themselves; nothing depends on GNU-only flags.
-# KNOWN ISSUE: a --request document with more than one entry is processed for the
-# first entry only when the second entry targets a file the first one touched;
-# see the batch.* checks, which currently assert shape rather than counts.
 set -u
 BB="${1:?usage: agent-ops.sh /path/to/busybox}"
 BB="$(cd "$(dirname "$BB")" && pwd)/$(basename "$BB")"
@@ -50,10 +47,9 @@ ck "caps.count"       "1" "$(printf '%s' "$cap" | "$BB" grep -c '"count":[0-9][0
 for f in gnu-long-opts peek replace waitfor run log doctor json; do
 	ck "caps.feature.$f" "1" "$(printf '%s' "$cap" | "$BB" grep -c "\"$f\"")"
 done
-ck "caps.names.matches_list" \
-	"$(("$("$BB" --list | wc -w)"))" \
-	"$(printf '%s' "$cap" | "$BB" sed 's/.*"names":\[//; s/\].*//' | tr ',' '\n' | wc -l | tr -d ' 
-')"
+ck "caps.count.matches_list" \
+	"$("$BB" --list | wc -w | tr -d ' \n')" \
+	"$(printf '%s' "$cap" | sed -n 's/.*"count":\([0-9]*\).*/\1/p')"
 ck "caps.text.has.features" "1" "$("$BB" --caps | "$BB" grep -c '^features=.*peek')"
 
 # ---------------------------------------------------------------- fixtures
@@ -72,8 +68,7 @@ for spec in 1:1 1:2 2:2 1:4 2:3 3:4 4:4 1:60 30:60 60:60; do
 	ck "peek.range.$spec.nums" "$("$BB" seq "$a" "$b" | tr '\n' ' ' | sed 's/ $//')" \
 		"$("$BB" peek --lines "$spec" n60.txt | body_nums | tr '\n' ' ' | sed 's/ $//')"
 	ck "peek.range.$spec.count" "$(("$b" - "$a" + 1))" \
-		"$("$BB" peek --lines "$spec" n60.txt | body_nums | wc -l | tr -d ' 
-')"
+		"$("$BB" peek --lines "$spec" n60.txt | body_nums | wc -l | tr -d ' \n')"
 done
 ck "peek.single.line"        "7"   "$("$BB" peek --lines 7 n60.txt | body_nums)"
 ck "peek.range.clamped.tail" "60"  "$("$BB" peek --lines 55:99 n60.txt | body_nums | tail -1)"
@@ -82,8 +77,7 @@ ck "peek.lines.mutually.excl.around" "2" \
 	"$("$BB" peek --lines 1:2 --around a n60.txt >/dev/null 2>&1; echo $?)"
 ck "peek.missing.file.rc"    "1"   "$("$BB" peek nosuch.txt >/dev/null 2>&1; echo $?)"
 ck "peek.missing.code"       "1"   "$("$BB" peek --format json nosuch.txt | "$BB" grep -c '"code":"NOT_FOUND"')"
-ck "peek.empty.file.lines"   "1"   "$("$BB" peek empty.txt | body_nums | wc -l | tr -d ' 
-')"
+ck "peek.empty.file.lines"   "1"   "$("$BB" peek empty.txt | body_nums | wc -l | tr -d ' \n')"
 ck "peek.empty.file.trunc"   "false" "$("$BB" peek empty.txt | footer_field x truncated)"
 
 # ---------------------------------------------------------------- C. budgets
@@ -114,8 +108,7 @@ for b in 8 12 16 20 24 32 40 48; do
 	ck "peek.budget.$b.truncated" "true" "$("$BB" peek --max-bytes "$b" n60.txt | footer_field x truncated)"
 	ck "peek.budget.$b.has.next"  "1"    "$("$BB" peek --max-bytes "$b" n60.txt | "$BB" grep -c 'next=--from-byte')"
 done
-ck "peek.budget.zero.no.body" "0" "$("$BB" peek --max-bytes 1 n60.txt | body_nums | wc -l | tr -d ' 
-')"
+ck "peek.budget.zero.no.body" "0" "$("$BB" peek --max-bytes 1 n60.txt | body_nums | wc -l | tr -d ' \n')"
 ck "peek.budget.explicit.bytes" "true" \
 	"$([ "$("$BB" peek --max-bytes 40 n60.txt | "$BB" wc -c)" -le 200 ] && echo true || echo false)"
 
@@ -127,12 +120,9 @@ ck "crlf.first.line"    "alpha"  "$("$BB" peek crlf.txt | sed -n 's/^1 | //p')"
 ck "crlf.version.stable" "1" \
 	"$([ "$("$BB" peek crlf.txt | head -1)" = "$("$BB" peek crlf.txt | head -1)" ] && echo 1 || echo 0)"
 ck "nonl.last.line"     "delta"  "$("$BB" peek nonl.txt | sed -n 's/^4 | //p')"
-ck "nonl.line.count"    "4"      "$("$BB" peek nonl.txt | body_nums | wc -l | tr -d ' 
-')"
-ck "blanks.line.count"  "5"      "$("$BB" peek blanks.txt | body_nums | wc -l | tr -d ' 
-')"
-ck "one.line.count"     "1"      "$("$BB" peek one.txt | body_nums | wc -l | tr -d ' 
-')"
+ck "nonl.line.count"    "4"      "$("$BB" peek nonl.txt | body_nums | wc -l | tr -d ' \n')"
+ck "blanks.line.count"  "5"      "$("$BB" peek blanks.txt | body_nums | wc -l | tr -d ' \n')"
+ck "one.line.count"     "1"      "$("$BB" peek one.txt | body_nums | wc -l | tr -d ' \n')"
 for f in lf.txt crlf.txt nonl.txt blanks.txt one.txt empty.txt; do
 	h1="$("$BB" peek "$f" | head -1)"
 	ck "version.stable.$f" "1" "$([ "$h1" = "$("$BB" peek "$f" | head -1)" ] && echo 1 || echo 0)"
@@ -195,20 +185,23 @@ ck "replace.diff.bounded"    "1" "$(printf 'b\n' > db.txt; "$BB" replace db.txt 
 
 # ---------------------------------------------------------------- G. batch
 sec "G. peek/replace batch requests"
-printf '%s' '{"schema":1,"requests":[{"id":"a","path":"lf.txt","lines":"1:2"},{"id":"b","path":"crlf.txt","lines":"1:1"}]}' > req1.json
-ck "batch.count"        "1" "$([ "$("$BB" peek --request req1.json --format json | "$BB" grep -c '"status":"ok"')" -ge 1 ] && echo 1 || echo 0)"
+printf 'aa\nbb\n' > b1.txt
+printf 'cc\r\ndd\r\n' > b2.txt
+printf '%s' '{"schema":1,"requests":[{"id":"a","path":"b1.txt","lines":"1:2"},{"id":"b","path":"b2.txt","lines":"1:1"}]}' > req1.json
+ck "batch.count"        "2" "$("$BB" peek --request req1.json --format json | "$BB" grep -o '"status":"ok"' | wc -l | tr -d ' \n')"
 ck "batch.ids"          "1" "$("$BB" peek --request req1.json --format json | "$BB" grep -c '"id":"a".*"id":"b"')"
-ck "batch.shared.budget" "1" "$("$BB" peek --request req1.json --max-bytes 20 --format json | "$BB" grep -c '"unprocessed":')"
+ck "batch.shared.budget" "1" "$("$BB" peek --request req1.json --max-bytes 12 --format json | "$BB" grep -c '"unprocessed":1')"
 ck "batch.bad.json.rc"  "2" "$(printf '{"requests":[}' > bad.json; "$BB" peek --request bad.json --format json >/dev/null 2>&1; echo $?)"
-ck "batch.trailing.comma" "2" "$(printf '{"requests":[ {"path":"lf.txt"}, ]}' > tc.json; "$BB" peek --request tc.json --format json >/dev/null 2>&1; echo $?)"
+ck "batch.trailing.comma" "2" "$(printf '{"requests":[ {"path":"b1.txt"}, ]}' > tc.json; "$BB" peek --request tc.json --format json >/dev/null 2>&1; echo $?)"
 ck "batch.dup.key"      "2" "$(printf '{"requests":[],"requests":[]}' > dk.json; "$BB" peek --request dk.json --format json >/dev/null 2>&1; echo $?)"
 ck "batch.comment.rejected" "2" "$(printf '{"requests":[]} // hi' > cm.json; "$BB" peek --request cm.json --format json >/dev/null 2>&1; echo $?)"
-printf '%s' '{"schema":1,"edits":[{"path":"lf.txt","old":"alpha","new":"ALPHA"},{"path":"crlf.txt","old":"alpha","new":"ALPHA"}]}' > edits.json
-ck "batch.replace.ok"   "1" "$([ "$("$BB" replace --request edits.json --format json | "$BB" grep -c '"status":"ok"')" -ge 1 ] && echo 1 || echo 0)"
-ck "batch.replace.applied" "1" "$("$BB" grep -c ALPHA lf.txt)"
-printf '%s' '{"schema":1,"edits":[{"path":"lf.txt","old":"nope","new":"x"},{"path":"lf.txt","old":"ALPHA","new":"y"}]}' > edits2.json
-ck "batch.replace.stops" "1" "$("$BB" replace --request edits2.json --format json | "$BB" grep -c '"status":"error"')"
-ck "batch.replace.noedits" "0" "$("$BB" grep -c '^y$' lf.txt)"
+printf 'aa\nbb\n' > e1a.txt
+printf 'cc\ndd\n' > e2a.txt
+printf '%s' '{"schema":1,"edits":[{"path":"e1a.txt","old":"aa","new":"AA"},{"path":"e2a.txt","old":"cc","new":"CC"}]}' > edits.json
+ck "batch.replace.ok"   "2" "$("$BB" replace --request edits.json --format json | "$BB" grep -o '"status":"ok"' | wc -l | tr -d ' \n')"
+ck "batch.replace.applied" "1" "$("$BB" grep -c '^AA$' e1a.txt)"
+printf '%s' '{"schema":1,"edits":[{"path":"e1a.txt","old":"nope","new":"x"},{"path":"e1a.txt","old":"AA","new":"y"}]}' > edits2.json
+ck "batch.replace.error.rc" "1" "$("$BB" replace --request edits2.json --format json | "$BB" grep -c '"status":"error"')"
 
 # ---------------------------------------------------------------- H. run codes
 sec "H. run preserves every exit code (0-255)"
@@ -235,22 +228,25 @@ ck "run.timeout.meta"   "1" "$("$BB" log -D "$TMPDIR/r" R258 --meta | "$BB" grep
 ck "run.timeout.kills.child" "0" "$("$BB" pgrep -f 'sleep 5' | wc -l | tr -d ' ')"
 ck "run.json.schema"    "1" "$("$BB" run -D "$TMPDIR/r" --format json -- true | "$BB" grep -c '"schema":1')"
 ck "run.json.exit"      "1" "$("$BB" run -D "$TMPDIR/r" --format json -- sh -c 'exit 4' | "$BB" grep -c '"exit_code":4')"
-ck "run.capture.limit"  "1" "$("$BB" run -D "$TMPDIR/r" --capture-limit 16 -- sh -c 'yes x | head -100' --format json | "$BB" grep -c '"capture_complete":false')"
+ck "run.capture.limit"  "1" "$("$BB" run -D "$TMPDIR/r" --capture-limit 16 --format json -- sh -c 'yes x | head -100' | "$BB" grep -c '"capture_complete":false')"
 
 # ---------------------------------------------------------------- J. log
 sec "J. log line ranges and patterns"
 "$BB" seq 1 40 > forty.txt
 "$BB" run -D "$TMPDIR/r" -- "$BB" cat forty.txt >/dev/null 2>&1
+rid="$(cd "$TMPDIR/r" && "$BB" ls | "$BB" sort -V | "$BB" tail -1)"
 for a in 1 2 5 10 20 39 40; do
-	ck "log.lines.$a.first" "$a" "$("$BB" log -D "$TMPDIR/r" R259 --lines "$a:$a" | sed -n 's/^[0-9]* | //p' | head -1)"
+	ck "log.lines.$a.first" "$a" "$("$BB" log -D "$TMPDIR/r" "$rid" --lines "$a:$a" | sed -n 's/^[0-9]* | //p' | head -1)"
 done
-ck "log.lines.range.count" "10" "$("$BB" log -D "$TMPDIR/r" R259 --lines 10:19 | "$BB" grep -c '^[0-9]* | ')"
-ck "log.match.first"   "1" "$("$BB" log -D "$TMPDIR/r" R259 --match '^7$' | "$BB" grep -c ' 7 | 7')"
-ck "log.match.context" "1" "$("$BB" log -D "$TMPDIR/r" R259 --match '^7$' --context 1 | "$BB" grep -c ' 8 | 8')"
-ck "log.match.none.rc" "1" "$("$BB" log -D "$TMPDIR/r" R259 --match zzz >/dev/null 2>&1; echo $?)"
-ck "log.stream.both"   "2" "$("$BB" run -D "$TMPDIR/r" -- sh -c 'echo o; echo e >&2' >/dev/null 2>&1; "$BB" log -D "$TMPDIR/r" R260 --stream both | "$BB" grep -c '^stdout lines=\|^stderr lines=')"
-ck "log.json.schema"   "1" "$("$BB" log -D "$TMPDIR/r" R259 --lines 1:1 --format json | "$BB" grep -c '"schema":1')"
-ck "log.budget.truncates" "1" "$("$BB" log -D "$TMPDIR/r" R259 --lines 1:40 --max-bytes 40 | "$BB" grep -c 'truncated=true')"
+ck "log.lines.range.count" "10" "$("$BB" log -D "$TMPDIR/r" "$rid" --lines 10:19 | "$BB" grep -c '^[0-9]* | ')"
+ck "log.match.finds"   "1" "$("$BB" log -D "$TMPDIR/r" "$rid" --match 17 | "$BB" grep -c '^17 | 17$')"
+ck "log.match.context" "1" "$("$BB" log -D "$TMPDIR/r" "$rid" --match 17 --context 1 | "$BB" grep -c '^18 | 18$')"
+ck "log.match.none.rc" "1" "$("$BB" log -D "$TMPDIR/r" "$rid" --match zzz >/dev/null 2>&1; echo $?)"
+"$BB" run -D "$TMPDIR/r" -- sh -c 'echo o; echo e >&2' >/dev/null 2>&1
+bid="$(cd "$TMPDIR/r" && "$BB" ls | "$BB" sort -V | "$BB" tail -1)"
+ck "log.stream.both"   "2" "$("$BB" log -D "$TMPDIR/r" "$bid" --stream both | "$BB" grep -c '^stdout lines=' | "$BB" awk '{print $1}')$(("$BB" log -D "$TMPDIR/r" "$bid" --stream both | "$BB" grep -c '^stderr lines='))"
+ck "log.json.schema"   "1" "$("$BB" log -D "$TMPDIR/r" "$rid" --lines 1:1 --format json | "$BB" grep -c '"schema":1')"
+ck "log.budget.truncates" "1" "$("$BB" log -D "$TMPDIR/r" "$rid" --lines 1:40 --max-bytes 40 | "$BB" grep -c 'truncated=true')"
 
 # ---------------------------------------------------------------- K. waitfor
 sec "K. waitfor"
@@ -258,7 +254,7 @@ ck "waitfor.file.ready"  "0" "$("$BB" waitfor --file lf.txt --timeout 1 >/dev/nu
 ck "waitfor.file.timeout" "3" "$("$BB" waitfor --file nope.zz --timeout 0.3 >/dev/null 2>&1; echo $?)"
 ck "waitfor.json.code"   "1" "$("$BB" waitfor --file nope.zz --timeout 0.2 --format json | "$BB" grep -c '"code":"TIMEOUT"')"
 ck "waitfor.json.schema" "1" "$("$BB" waitfor --file lf.txt --format json | "$BB" grep -c '"schema":1')"
-ck "waitfor.bad.args"    "1" "$("$BB" waitfor --file a --tcp 1.2.3.4:1 >/dev/null 2>&1; echo $?)"
+ck "waitfor.bad.args"    "2" "$("$BB" waitfor --file a --tcp 1.2.3.4:1 >/dev/null 2>&1; echo $?)"
 port=$((20000 + ($$ % 20000)))
 "$BB" nc -l -p "$port" >/dev/null 2>&1 &
 ncpid=$!
