@@ -1,9 +1,9 @@
 diff --git a/coreutils/run.c b/coreutils/run.c
 new file mode 100644
-index 0000000..02978f8
+index 0000000..c58dbaa
 --- /dev/null
 +++ b/coreutils/run.c
-@@ -0,0 +1,956 @@
+@@ -0,0 +1,967 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * run - captured execution with retrievable evidence.
@@ -41,6 +41,7 @@ index 0000000..02978f8
 +//usage:     "\n	-D, --dir PATH		Artifact root (default $TMPDIR/busybox-run)"
 +//usage:     "\n	-d, --cwd DIR		Working directory for the child"
 +//usage:     "\n	-s, --shell		Run the rest through sh -c"
++//usage:     "\n	-i, --stdin FILE	Feed FILE as the child's stdin"
 +//usage:     "\n	-F, --format FMT	text (default) or json"
 +//usage:     "\n"
 +//usage:     "\nExit: the child's status when it exits on its own, 3 when this"
@@ -381,6 +382,7 @@ index 0000000..02978f8
 +{
 +	char *opt_timeout = NULL, *opt_kill = NULL, *opt_bytes = NULL;
 +	char *opt_capture = NULL, *opt_dir = NULL, *opt_cwd = NULL, *opt_fmt = NULL;
++	char *opt_stdin = NULL;
 +	unsigned opts;
 +	long deadline_ms = 0, budget = DEFAULT_VIEW, capture_limit = DEFAULT_CAPTURE;
 +	int kill_after = 2000, json = 0, use_shell = 0;
@@ -403,13 +405,14 @@ index 0000000..02978f8
 +		"cwd\0"           Required_argument "d"
 +		"shell\0"         No_argument       "s"
 +		"format\0"        Required_argument "F"
++		"stdin\0"         Required_argument "i"
 +		;
 +
 +	xfunc_error_retval = 2;
 +
-+	opts = getopt32long(argv, "T:k:B:C:D:d:sF:", run_longopts,
++	opts = getopt32long(argv, "T:k:B:C:D:d:sF:i:", run_longopts,
 +			&opt_timeout, &opt_kill, &opt_bytes, &opt_capture,
-+			&opt_dir, &opt_cwd, &opt_fmt);
++			&opt_dir, &opt_cwd, &opt_fmt, &opt_stdin);
 +	use_shell = (opts & (1 << 6)) != 0;   /* s */
 +	argv += optind;
 +
@@ -516,6 +519,14 @@ index 0000000..02978f8
 +		close(errp[0]);
 +		xmove_fd(outp[1], 1);
 +		xmove_fd(errp[1], 2);
++		if (opt_stdin) {
++			int fd = open(opt_stdin, O_RDONLY);
++			if (fd < 0) {
++				bb_perror_msg("open %s", opt_stdin);
++				_exit(126);
++			}
++			xmove_fd(fd, 0);
++		}
 +		if (opt_cwd && chdir(opt_cwd) != 0) {
 +			bb_perror_msg("cd %s", opt_cwd);
 +			_exit(126);
