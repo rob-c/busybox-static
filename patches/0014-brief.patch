@@ -1,0 +1,650 @@
+diff --git a/miscutils/brief.c b/miscutils/brief.c
+new file mode 100644
+index 0000000..29604b8
+--- /dev/null
++++ b/miscutils/brief.c
+@@ -0,0 +1,644 @@
++/* vi: set sw=4 ts=4: */
++/*
++ * brief - structure-preserving reduction of line-oriented tool output.
++ *
++ * The rule this applet obeys: reduce the *number* of records, never edit a
++ * record. Lines keep their bytes - no whitespace squeezing, no word
++ * abbreviation, no truncation of a line's tail, no NUL-to-newline rewriting -
++ * and what is dropped is whole records, counted on one greppable marker line
++ * so a reader can never mistake a reduced view for the whole output.
++ *
++ * Input is treated as bytes, not as C strings: a NUL inside a line is data,
++ * it does not end the line, and it survives to the output. That matters
++ * because libbb's xmalloc_fgetline() splits on NUL - see
++ * docs/instructions/brief-a-generic-record-reducing-filter-that-never-edits-a-line.md
++ *
++ * Licensed under GPLv2, see file LICENSE in this source tree.
++ */
++//config:config BRIEF
++//config:	bool "brief (6 kb)"
++//config:	default n
++//config:	help
++//config:	  Reduce large line-oriented output to a bounded, readable view
++//config:	  without rewriting lines: identical (or digit-masked) lines are
++//config:	  grouped and counted, caller-declared salient lines are kept
++//config:	  verbatim, and every reduction is reported on a marker line.
++//config:	  Input is byte-exact: NULs inside a line are data, not separators.
++
++//applet:IF_BRIEF(APPLET_NOEXEC(brief, brief_main, BB_DIR_USR_BIN, BB_SUID_DROP, brief))
++
++//kbuild:lib-$(CONFIG_BRIEF) += brief.o
++
++//usage:#define brief_trivial_usage
++//usage:       "[-ds] [-k STR] [-f LIST] [-S SEP] [-B BYTES] [-n N] [-a N] [-F FMT] [FILE]..."
++//usage:#define brief_full_usage "\n\n"
++//usage:       "Reduce line-oriented output to a bounded view, preserving every byte shown"
++//usage:     "\n"
++//usage:     "\n	-d	Group identical lines and count them"
++//usage:     "\n	-s	Group lines equal after masking digits (implies -d)"
++//usage:     "\n	-k STR	Keep lines containing STR verbatim, never merged"
++//usage:     "\n	-f LIST	Show only these 1-based fields (1,3-4); input may be reformatted"
++//usage:     "\n	-S SEP	Join -f fields with SEP (default: one space)"
++//usage:     "\n	-B N	Output budget in bytes (default 8000)"
++//usage:     "\n	-n N	Maximum distinct records kept (default 2000)"
++//usage:     "\n	-a N	Sample lines shown per group, 1-8 (default 1)"
++//usage:     "\n	-F FMT	text (default) or json (schema 1)"
++//usage:     "\n"
++//usage:     "\nA group prints as \"Nx <first line>\"; further -a samples print"
++//usage:     "\nwith a \"+ \" prefix so they cannot be read as repeats."
++//usage:     "\n"
++//usage:     "\nGrouping is on the original line, so -f can never merge two"
++//usage:     "\nrecords that differ only outside the shown fields."
++//usage:     "\n"
++//usage:     "\nRecords are bytes: an embedded NUL is kept, not treated as a line"
++//usage:     "\nbreak, and the marker reports nul=<n> when any record held one."
++
++#include "libbb.h"
++
++#define BRIEF_MAX_SAMPLES 8
++#define BRIEF_MAX_FRANGES 32
++
++enum {
++	OPT_d = (1 << 0),
++	OPT_s = (1 << 1),
++	OPT_k = (1 << 2),
++	OPT_f = (1 << 3),
++	OPT_S = (1 << 4),
++	OPT_B = (1 << 5),
++	OPT_n = (1 << 6),
++	OPT_a = (1 << 7),
++	OPT_F = (1 << 8),
++};
++
++static const char brief_longopts[] ALIGN1 =
++	"dedupe\0"  No_argument       "d"
++	"skeleton\0" No_argument      "s"
++	"keep\0"    Required_argument "k"
++	"fields\0"  Required_argument "f"
++	"sep\0"     Required_argument "S"
++	"max-bytes\0" Required_argument "B"
++	"max-records\0" Required_argument "n"
++	"samples\0" Required_argument "a"
++	"format\0"  Required_argument "F"
++	;
++
++struct fw {
++	unsigned lo, hi;
++};
++
++/* One stored line: a pointer and a length, never a C string. */
++struct sample {
++	char *p;
++	size_t n;
++};
++
++struct item {
++	char *key;                 /* normalized key bytes; NULL for a kept line */
++	size_t keylen;
++	struct sample smp[BRIEF_MAX_SAMPLES];
++	unsigned nsmp;
++	unsigned count;            /* occurrences in the input */
++	int shown;                 /* selected for output */
++};
++
++/* ---- byte-exact line reader -------------------------------------------- */
++
++/* libbb's xmalloc_fgetline() stops at NUL, which both splits a line in two
++ * and loses the byte. This reader splits on '\n' only, so every other byte
++ * - including NUL, '\r' and 0x80-0xff - is preserved exactly. A trailing
++ * '\r' is deliberately NOT stripped: CRLF records then differ from LF ones,
++ * which is the truth about the input. */
++static char *brief_readline(FILE *fp, size_t *lenp)
++{
++	size_t cap = 0, n = 0;
++	char *buf = NULL;
++	int ch;
++
++	for (;;) {
++		ch = getc(fp);
++		if (ch == EOF)
++			break;
++		if (ch == '\n')
++			break;
++		if (n + 2 > cap) {
++			cap = cap ? cap * 2 : 128;
++			buf = xrealloc(buf, cap);
++		}
++		buf[n++] = (char)ch;
++	}
++	if (!buf) {
++		if (ch == EOF)
++			return NULL;      /* end of input, nothing pending */
++		cap = 2;
++		buf = xmalloc(cap);
++	}
++	buf[n] = '\0';
++	*lenp = n;
++	return buf;
++}
++
++/* ---- small growable string ---------------------------------------------- */
++
++struct sbuf {
++	char *p;
++	size_t len, cap;
++};
++
++static void sb_add(struct sbuf *b, const char *s, size_t n)
++{
++	if (b->len + n + 1 > b->cap) {
++		b->cap = (b->len + n + 1) * 2;
++		b->p = xrealloc(b->p, b->cap);
++	}
++	if (n)
++		memcpy(b->p + b->len, s, n);
++	b->len += n;
++	b->p[b->len] = '\0';
++}
++
++static void sb_addstr(struct sbuf *b, const char *s)
++{
++	sb_add(b, s, strlen(s));
++}
++
++static void sb_addch(struct sbuf *b, char c)
++{
++	sb_add(b, &c, 1);
++}
++
++/* ---- JSON string escaping ---------------------------------------------- */
++
++static void put_json_str(const char *s, size_t n)
++{
++	const char *end = s + n;
++
++	putchar('"');
++	for (; s < end; s++) {
++		if (*s == '"' || *s == '\\') {
++			printf("\\%c", *s);
++		} else if ((unsigned char)*s < 0x20) {
++			printf("\\u%04x", (unsigned char)*s);
++		} else {
++			putchar(*s);
++		}
++	}
++	putchar('"');
++}
++
++/* ---- field selection --------------------------------------------------- */
++
++static unsigned parse_fields(const char *spec, struct fw *out)
++{
++	unsigned n = 0;
++
++	for (;;) {
++		char *end;
++		unsigned long lo, hi;
++
++		lo = strtoul(spec, &end, 10);
++		if (end == spec || lo == 0 || lo > INT_MAX)
++			break;
++		hi = lo;
++		spec = end;
++		if (*spec == '-') {
++			spec++;
++			hi = strtoul(spec, &end, 10);
++			if (end == spec || hi < lo || hi > INT_MAX)
++				break;
++			spec = end;
++		}
++		if (n == BRIEF_MAX_FRANGES)
++			return 0;
++		out[n].lo = (unsigned)lo;
++		out[n].hi = (unsigned)hi;
++		n++;
++		if (*spec == ',') {
++			spec++;
++			continue;
++		}
++		if (*spec == '\0')
++			return n;
++		break;
++	}
++	bb_error_msg("bad field list");
++	xfunc_error_retval = 2;
++	return 0;
++}
++
++/* Rebuild the line from the selected fields. Out-of-range fields are simply
++ * absent; the caller reports that -f was used, so the reader knows the record
++ * was reformatted. Field bytes are copied as bytes. */
++static void project_into(struct sbuf *out, const char *line, size_t len,
++		const struct fw *fr, unsigned nfr, const char *sep)
++{
++	unsigned field = 0, printed = 0;
++	const char *p = line, *end = line + len;
++
++	while (p < end) {
++		const char *start;
++		unsigned i;
++		int want = 0;
++
++		while (p < end && (*p == ' ' || *p == '\t'))
++			p++;
++		if (p == end)
++			break;
++		start = p;
++		while (p < end && *p != ' ' && *p != '\t')
++			p++;
++		field++;
++		for (i = 0; i < nfr; i++) {
++			if (field >= fr[i].lo && field <= fr[i].hi) {
++				want = 1;
++				break;
++			}
++		}
++		if (!want)
++			continue;
++		if (printed)
++			sb_addstr(out, sep);
++		sb_add(out, start, (size_t)(p - start));
++		printed = 1;
++	}
++}
++
++/* ---- normalization ----------------------------------------------------- */
++
++/* -s: mask runs of digits. Digits are the one class that is almost always
++ * noise in a repeated message ("line 12", "port 8080", "pid 4711"), and they
++ * are masked only for the equality test: the stored sample stays verbatim.
++ * Only 0x30-0x39 is touched, so NUL and high bytes pass through as data. */
++static char *norm_key(const char *line, size_t len, int mask_digits, size_t *outlen)
++{
++	struct sbuf b = { 0 };
++	size_t i = 0;
++
++	if (!mask_digits) {
++		sb_add(&b, line, len);
++		*outlen = b.len;
++		return b.p;
++	}
++	while (i < len) {
++		if (line[i] >= '0' && line[i] <= '9') {
++			while (i < len && line[i] >= '0' && line[i] <= '9')
++				i++;
++			sb_addch(&b, '#');
++			continue;
++		}
++		sb_addch(&b, line[i++]);
++	}
++	if (!b.p) {
++		sb_add(&b, "", 0);
++	}
++	*outlen = b.len;
++	return b.p;
++}
++
++/* ---- record table ------------------------------------------------------ */
++
++static struct item *items;
++static unsigned nitems, citems;
++static unsigned *htab;          /* index+1, 0 = empty */
++static unsigned hsize;
++
++static unsigned hash_bytes(const char *s, size_t n)
++{
++	unsigned h = 2166136261u;
++	size_t i;
++
++	for (i = 0; i < n; i++) {
++		h ^= (unsigned char)s[i];
++		h *= 16777619u;
++	}
++	return h;
++}
++
++static void htab_grow(void)
++{
++	unsigned i, new_size = hsize ? hsize * 2 : 512;
++	unsigned *old = htab;
++	unsigned old_size = hsize;
++
++	htab = xzalloc(new_size * sizeof(htab[0]));
++	hsize = new_size;
++	for (i = 0; i < old_size; i++) {
++		unsigned idx, j;
++
++		if (!old[i])
++			continue;
++		idx = old[i] - 1;
++		j = hash_bytes(items[idx].key, items[idx].keylen) & (hsize - 1);
++		while (htab[j])
++			j = (j + 1) & (hsize - 1);
++		htab[j] = idx + 1;
++	}
++	free(old);
++}
++
++/* Returns the item for KEY, creating it when absent (or NULL when the record
++ * cap is reached and the caller must count it as dropped). Keys are compared
++ * as bytes: a NUL inside a key is not a terminator. */
++static struct item *item_find(const char *key, size_t keylen, int create)
++{
++	unsigned j;
++
++	if (create && (hsize == 0 || nitems * 2 >= hsize))
++		htab_grow();
++	if (hsize) {
++		j = hash_bytes(key, keylen) & (hsize - 1);
++		while (htab[j]) {
++			struct item *it = &items[htab[j] - 1];
++
++			if (it->keylen == keylen && memcmp(it->key, key, keylen) == 0)
++				return it;
++			j = (j + 1) & (hsize - 1);
++		}
++	}
++	if (!create)
++		return NULL;
++	if (nitems == citems) {
++		citems = citems ? citems * 2 : 256;
++		items = xrealloc(items, citems * sizeof(items[0]));
++	}
++	memset(&items[nitems], 0, sizeof(items[0]));
++	items[nitems].key = xmalloc(keylen + 1);
++	memcpy(items[nitems].key, key, keylen);
++	items[nitems].key[keylen] = '\0';
++	items[nitems].keylen = keylen;
++	j = hash_bytes(key, keylen) & (hsize - 1);
++	while (htab[j])
++		j = (j + 1) & (hsize - 1);
++	htab[j] = nitems + 1;
++	return &items[nitems++];
++}
++
++static struct item *item_new(void)
++{
++	struct item *it;
++
++	if (nitems == citems) {
++		citems = citems ? citems * 2 : 256;
++		items = xrealloc(items, citems * sizeof(items[0]));
++	}
++	memset(&items[nitems], 0, sizeof(items[0]));
++	it = &items[nitems++];
++	it->key = NULL;
++	it->keylen = 0;
++	return it;
++}
++
++static int mem_contains(const char *h, size_t hn, const char *n)
++{
++	size_t nn = strlen(n), i;
++
++	if (nn == 0)
++		return 1;
++	if (nn > hn)
++		return 0;
++	for (i = 0; i + nn <= hn; i++) {
++		if (h[i] == n[0] && memcmp(h + i, n, nn) == 0)
++			return 1;
++	}
++	return 0;
++}
++
++/* ---- main -------------------------------------------------------------- */
++
++int brief_main_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
++int brief_main_main(int argc UNUSED_PARAM, char **argv)
++{
++	const char *opt_keep = NULL, *opt_fields = NULL, *opt_sep = NULL;
++	const char *opt_bytes = NULL, *opt_recs = NULL, *opt_samples = NULL;
++	const char *opt_fmt = NULL;
++	struct fw fr[BRIEF_MAX_FRANGES];
++	unsigned nfr = 0, i;
++	unsigned budget = 8000, max_recs = 2000, max_samples = 1;
++	int dedupe, skeleton, json_out;
++	unsigned lines_in = 0, lines_shown = 0, lines_merged = 0;
++	unsigned kept = 0, dropped_records = 0, dropped_lines = 0;
++	unsigned nul_lines = 0;
++	char *body = NULL;
++	size_t body_len = 0;
++	int truncated = 0;
++	FILE *fp;
++	unsigned flags;
++
++	xfunc_error_retval = 2; /* usage errors, until input is opened */
++	flags = getopt32long(argv, "dsk:f:S:B:n:a:F:", brief_longopts,
++			&opt_keep, &opt_fields, &opt_sep,
++			&opt_bytes, &opt_recs, &opt_samples, &opt_fmt);
++	argv += optind;
++
++	if (opt_bytes)
++		budget = xatoul_range(opt_bytes, 0, INT_MAX);
++	if (opt_recs)
++		max_recs = xatoul_range(opt_recs, 1, INT_MAX);
++	if (opt_samples)
++		max_samples = xatoul_range(opt_samples, 1, BRIEF_MAX_SAMPLES);
++	if (!opt_sep)
++		opt_sep = " ";
++	if (opt_fields) {
++		nfr = parse_fields(opt_fields, fr);
++		if (!nfr)
++			return xfunc_error_retval;
++	}
++	json_out = opt_fmt && strcmp(opt_fmt, "json") == 0;
++	if (opt_fmt && !json_out && strcmp(opt_fmt, "text") != 0) {
++		bb_error_msg("unknown format %s", opt_fmt);
++		return 2;
++	}
++	skeleton = (flags & OPT_s) != 0;
++	dedupe = skeleton || (flags & OPT_d) != 0;
++
++	xfunc_error_retval = 1;
++
++	for (;;) {
++		int from_stdin = (!*argv || strcmp(*argv, "-") == 0);
++
++		/* fopen_or_warn_stdin() is not NULL-safe in this tree: it tests
++		 * filename[0] == '-' before it tests filename != NULL. */
++		fp = from_stdin ? stdin : fopen_or_warn(*argv, "r");
++		if (!fp) {
++			if (json_out) {
++				printf("{\"schema\":1,\"status\":\"error\",\"code\":\"NOT_FOUND\"}\n");
++				fflush_stdout_and_exit(1);
++			}
++			return 1;
++		}
++		for (;;) {
++			size_t len = 0;
++			char *line = brief_readline(fp, &len);
++			struct item *it;
++
++			if (!line)
++				break;
++			lines_in++;
++			if (memchr(line, 0, len))
++				nul_lines++;
++			if (opt_keep && mem_contains(line, len, opt_keep)) {
++				/* Kept lines are never merged: one record each. */
++				if (nitems < max_recs) {
++					it = item_new();
++					it->count = 1;
++					it->smp[0].p = line;
++					it->smp[0].n = len;
++					it->nsmp = 1;
++					kept++;
++				} else {
++					dropped_records++;
++					dropped_lines++;
++					free(line);
++				}
++				continue;
++			}
++			if (dedupe) {
++				size_t keylen = 0;
++				char *key = norm_key(line, len, skeleton, &keylen);
++
++				it = item_find(key, keylen, nitems < max_recs);
++				free(key);
++				if (!it) {
++					dropped_records++;
++					dropped_lines++;
++					free(line);
++					continue;
++				}
++			} else {
++				/* no grouping requested: every line is its own record */
++				if (nitems >= max_recs) {
++					dropped_records++;
++					dropped_lines++;
++					free(line);
++					continue;
++				}
++				it = item_new();
++			}
++			if (it->count == 0) {   /* fresh from item_find() */
++				it->count = 1;
++				it->smp[0].p = line;
++				it->smp[0].n = len;
++				it->nsmp = 1;
++			} else {
++				it->count++;
++				if (it->nsmp < max_samples) {
++					it->smp[it->nsmp].p = line;
++					it->smp[it->nsmp].n = len;
++					it->nsmp++;
++				} else {
++					free(line);
++				}
++			}
++		}
++		if (!from_stdin)
++			fclose(fp);
++		if (!*argv)
++			break;          /* nothing named: one pass over stdin */
++		argv++;
++		if (!*argv)
++			break;          /* last named file done */
++	}
++
++	for (i = 0; i < nitems; i++) {
++		struct item *it = &items[i];
++		unsigned k, emitted;
++
++		it->shown = 1;
++		emitted = 0;
++		for (k = 0; k < it->nsmp; k++) {
++			struct sbuf line = { 0 };
++			size_t shown_len;
++
++			if (it->count > 1 && k == 0) {
++				char num[32];
++
++				/* ASCII, so the output survives any locale: "3x line" */
++				sprintf(num, "%ux ", it->count);
++				sb_addstr(&line, num);
++			} else if (k > 0) {
++				/* another variant of the same group, not a repeat */
++				sb_addstr(&line, "+ ");
++			}
++			if (nfr)
++				project_into(&line, it->smp[k].p, it->smp[k].n, fr, nfr, opt_sep);
++			else
++				sb_add(&line, it->smp[k].p, it->smp[k].n);
++			shown_len = line.len + 1;
++			if (body_len + shown_len > (size_t)budget) {
++				it->shown = 0;
++				truncated = 1;
++				free(line.p);
++				break;
++			}
++			body = xrealloc(body, body_len + shown_len + 1);
++			if (line.len)
++				memcpy(body + body_len, line.p, line.len);
++			body_len += line.len;
++			body[body_len++] = '\n';
++			free(line.p);
++			lines_shown++;
++			emitted++;
++		}
++		/* Invariant: lines_in == lines_shown + lines_merged + dropped_lines.
++		 * A record counts as merged only for the occurrences it did not
++		 * display, so -a cannot double-count them. */
++		if (it->shown && it->count > emitted)
++			lines_merged += it->count - emitted;
++		if (!it->shown) {
++			/* this and every later record is unshown */
++			for (; i < nitems; i++)
++				dropped_lines += items[i].count;
++			dropped_records += nitems - i;
++			break;
++		}
++	}
++
++	if (json_out) {
++		int first = 1;
++
++		printf("{\"schema\":1,\"lines_in\":%u,\"records\":%u,\"kept\":%u,"
++				"\"lines_shown\":%u,\"lines_merged\":%u,"
++				"\"dropped_records\":%u,\"dropped_lines\":%u,"
++				"\"nul_lines\":%u,\"bytes\":%u,\"truncated\":%s,\"fields\":%s,"
++				"\"items\":[",
++				lines_in, nitems, kept, lines_shown, lines_merged,
++				dropped_records, dropped_lines, nul_lines, (unsigned)body_len,
++				truncated ? "true" : "false",
++				nfr ? "true" : "false");
++		for (i = 0; i < nitems; i++) {
++			struct item *it = &items[i];
++			unsigned k;
++
++			if (!it->shown)
++				continue;
++			for (k = 0; k < it->nsmp; k++) {
++				struct sbuf line = { 0 };
++
++				if (nfr)
++					project_into(&line, it->smp[k].p, it->smp[k].n, fr, nfr, opt_sep);
++				else
++					sb_add(&line, it->smp[k].p, it->smp[k].n);
++				printf("%s{\"n\":%u,\"kept\":%s,\"line\":",
++						first ? "" : ",", it->count,
++						it->key ? "false" : "true");
++				put_json_str(line.p, line.len);
++				putchar('}');
++				free(line.p);
++				first = 0;
++			}
++		}
++		fputs("]}\n", stdout);
++	} else {
++		/* The marker comes first: a reader knows the shape of what follows
++		 * before reading it, and can never mistake a reduced view for the
++		 * whole output. */
++		printf("[brief] lines_in=%u records=%u kept=%u shown_lines=%u"
++				" merged=%u dropped_records=%u dropped_lines=%u"
++				" nul=%u bytes=%u truncated=%d\n",
++				lines_in, nitems, kept, lines_shown,
++				lines_merged, dropped_records, dropped_lines,
++				nul_lines, (unsigned)body_len, truncated);
++		if (body && body_len)
++			fwrite(body, 1, body_len, stdout);
++	}
++	fflush_stdout_and_exit(0);
++}
