@@ -1,0 +1,819 @@
+diff --git a/editors/replace.c b/editors/replace.c
+new file mode 100644
+index 0000000..726f35c
+--- /dev/null
++++ b/editors/replace.c
+@@ -0,0 +1,813 @@
++/* vi: set sw=4 ts=4: */
++/*
++ * replace - guarded, all-or-nothing literal file editing.
++ *
++ * Licensed under GPLv2, see file LICENSE in this source tree.
++ */
++//config:config REPLACE
++//config:	bool "replace (8 kb)"
++//config:	default y
++//config:	select AGENT_JSON
++//config:	help
++//config:	Replace exact strings in a file, refusing stale, ambiguous or
++//config:	conflicting edits, and writing atomically.
++
++//applet:IF_REPLACE(APPLET(replace, BB_DIR_USR_BIN, BB_SUID_DROP))
++
++//kbuild:lib-$(CONFIG_REPLACE) += replace.o
++
++//usage:#define replace_trivial_usage
++//usage:       "[OPTIONS] FILE --old STR --new STR"
++//usage:#define replace_full_usage "\n\n"
++//usage:       "Replace exact occurrences and write atomically, or change nothing"
++//usage:     "\n	-o, --old STR		Text to replace (literal unless -r)"
++//usage:     "\n	-n, --new STR		Replacement text"
++//usage:     "\n	-x, --expect N		Required match count (default 1)"
++//usage:     "\n	-S, --sha256 HEX	Require this content version first"
++//usage:     "\n	-r, --regex		Treat --old as a POSIX extended regex"
++//usage:     "\n	-L, --follow		Allow editing through a symlink"
++//usage:     "\n	-N, --dry-run		Print the diff, change nothing"
++//usage:     "\n	-B, --max-diff-bytes N	Cap the printed diff (default 4096)"
++//usage:     "\n	-R, --request FILE	Batch edits (JSON)"
++//usage:     "\n	-F, --format FMT	text (default) or json"
++//usage:     "\n"
++//usage:     "\nExit: 0 changed or dry-run ok, 1 refused (not found, ambiguous,"
++//usage:     "\nstale or conflicting), 2 usage error, 3 timeout"
++//usage:     "\nThe file is never modified unless every edit validates. flock()"
++//usage:     "\ncoordinates cooperating writers only - not an external editor."
++
++#include <regex.h>
++#include <sys/file.h>
++#include "libbb.h"
++#include "json_read.h"
++
++enum {
++	DEFAULT_MAX_DIFF = 4096,
++	MAX_FILE = 64 * 1024 * 1024,
++};
++
++struct edit {
++	const char *path;
++	const char *old;
++	const char *new;
++	long expect;
++	const char *sha256;   /* hex, no prefix */
++	int has_sha;
++	int regex;
++	int follow;
++	int dry_run;
++	size_t max_diff;
++	int json;
++};
++
++struct match {
++	size_t start;
++	size_t end;
++};
++
++struct sb {                 /* bounded string buffer for the diff */
++	char *p;
++	size_t len;
++	size_t cap;
++	size_t limit;
++	int truncated;
++};
++
++struct outcome {            /* everything the reporters need */
++	char *code;
++	char *msg;
++	unsigned changes;
++	unsigned cand[8];
++	unsigned ncand;
++	char old_ver[65];
++	char new_ver[65];
++	int changed;
++	struct sb diff;
++};
++
++/* ---------- small helpers ---------- */
++
++static const char *find_bytes(const char *hay, size_t hlen,
++		const char *needle, size_t nlen, size_t start)
++{
++	size_t i, last;
++
++	if (nlen == 0 || nlen > hlen || start > hlen - nlen)
++		return NULL;
++	last = hlen - nlen;
++	for (i = start; i <= last; i++)
++		if (hay[i] == needle[0] && memcmp(hay + i, needle, nlen) == 0)
++			return hay + i;
++	return NULL;
++}
++
++static void sha256_hex(const char *d, size_t len, char *out65)
++{
++	sha256_ctx_t ctx;
++	uint8_t raw[32];
++	unsigned i;
++
++	sha256_begin(&ctx);
++	sha256_hash(&ctx, d, len);
++	sha256_end(&ctx, raw);
++	for (i = 0; i < 32; i++)
++		sprintf(out65 + i * 2, "%02x", raw[i]);
++	out65[64] = '\0';
++}
++
++static unsigned line_of_off(const char *d, size_t off)
++{
++	unsigned n = 1;
++	size_t i;
++
++	for (i = 0; i < off; i++)
++		if (d[i] == '\n')
++			n++;
++	return n;
++}
++
++static void json_write_str(const char *s, size_t n)
++{
++	size_t i;
++
++	putchar('"');
++	for (i = 0; i < n; i++) {
++		unsigned char c = (unsigned char)s[i];
++		switch (c) {
++		case '"':  fputs("\\\"", stdout); break;
++		case '\\': fputs("\\\\", stdout); break;
++		case '\n': fputs("\\n", stdout); break;
++		case '\r': fputs("\\r", stdout); break;
++		case '\t': fputs("\\t", stdout); break;
++		default:
++			if (c < 0x20)
++				printf("\\u%04x", c);
++			else
++				putchar(c);
++		}
++	}
++	putchar('"');
++}
++
++static void sb_add(struct sb *b, const char *s, size_t n)
++{
++	if (b->limit && b->len + n > b->limit) {
++		n = b->limit > b->len ? b->limit - b->len : 0;
++		b->truncated = 1;
++	}
++	if (n == 0)
++		return;
++	if (b->len + n + 1 > b->cap) {
++		b->cap = (b->len + n + 1) * 2;
++		b->p = xrealloc(b->p, b->cap);
++	}
++	memcpy(b->p + b->len, s, n);
++	b->len += n;
++	b->p[b->len] = '\0';
++}
++
++static void sb_line(struct sb *b, const char *prefix, const char *s, size_t n)
++{
++	sb_add(b, prefix, strlen(prefix));
++	sb_add(b, s, n);
++	sb_add(b, "\n", 1);
++}
++
++/* ---------- file I/O ---------- */
++
++/*
++ * Open, lock and read. The fd comes back locked (LOCK_EX) so the caller can
++ * validate and rename under the same lock. Returns -1 with errno set.
++ */
++static int read_locked(const char *path, char **pdata, size_t *plen, struct stat *pst)
++{
++	int fd;
++	struct stat st;
++	char *data;
++	size_t len = 0, cap;
++
++	fd = open(path, O_RDONLY);
++	if (fd < 0)
++		return -1;
++	if (flock(fd, LOCK_EX) != 0) {
++		/* advisory only; keep going but do not claim the lock */
++	}
++	if (fstat(fd, &st) != 0) {
++		close(fd);
++		return -1;
++	}
++	if (S_ISDIR(st.st_mode)) {
++		close(fd);
++		errno = EISDIR;
++		return -1;
++	}
++	if ((unsigned long long)st.st_size > (unsigned long long)MAX_FILE) {
++		close(fd);
++		errno = EFBIG;
++		return -1;
++	}
++	cap = st.st_size > 0 ? (size_t)st.st_size + 1 : 4096;
++	data = xmalloc(cap);
++	for (;;) {
++		ssize_t r;
++
++		if (len == cap - 1) {
++			cap *= 2;
++			data = xrealloc(data, cap);
++		}
++		r = safe_read(fd, data + len, cap - 1 - len);
++		if (r < 0) {
++			if (errno == EINTR)
++				continue;
++			free(data);
++			close(fd);
++			return -1;
++		}
++		if (r == 0)
++			break;
++		len += (size_t)r;
++	}
++	data[len] = '\0';
++	*pdata = data;
++	*plen = len;
++	if (pst)
++		*pst = st;
++	return fd;
++}
++
++/* ---------- matching ---------- */
++
++static struct match *collect_matches(const struct edit *e, const char *data,
++		size_t len, unsigned *pn, struct outcome *o)
++{
++	struct match *m = NULL;
++	unsigned n = 0, cap = 0;
++	size_t off = 0;
++
++	if (e->regex) {
++		regex_t re;
++
++		if (regcomp(&re, e->old, REG_EXTENDED) != 0) {
++			o->code = (char *)"INVALID_ARGUMENT";
++			o->msg = xasprintf("bad regex: %s", e->old);
++			return NULL;
++		}
++		while (off <= len) {
++			regmatch_t rm;
++
++			if (regexec(&re, data + off, 1, &rm, 0) != 0)
++				break;
++			if (rm.rm_eo <= rm.rm_so) {
++				off += (size_t)rm.rm_so + 1;
++				continue;
++			}
++			if (n == cap) {
++				cap = cap ? cap * 2 : 8;
++				m = xrealloc(m, cap * sizeof(*m));
++			}
++			m[n].start = off + (size_t)rm.rm_so;
++			m[n].end = off + (size_t)rm.rm_eo;
++			n++;
++			off = m[n - 1].end;
++		}
++		regfree(&re);
++	} else {
++		size_t nlen = strlen(e->old);
++
++		if (nlen == 0) {
++			o->code = (char *)"INVALID_ARGUMENT";
++			o->msg = xstrdup("--old must not be empty");
++			return NULL;
++		}
++		while (off <= len) {
++			const char *hit = find_bytes(data, len, e->old, nlen, off);
++
++			if (!hit)
++				break;
++			if (n == cap) {
++				cap = cap ? cap * 2 : 8;
++				m = xrealloc(m, cap * sizeof(*m));
++			}
++			m[n].start = (size_t)(hit - data);
++			m[n].end = m[n].start + nlen;
++			n++;
++			off = m[n - 1].end;
++		}
++	}
++	*pn = n;
++	return m;
++}
++
++/* ---------- diff ---------- */
++
++static void emit_diff(struct sb *b, const char *data, size_t len,
++		const struct match *m, unsigned nm, const char *newtext)
++{
++	unsigned i;
++
++	for (i = 0; i < nm && !b->truncated; i++) {
++		unsigned first = line_of_off(data, m[i].start);
++		size_t as = m[i].start, ae = m[i].end;
++		size_t ctxs, ctxe, cur;
++		unsigned oldcount, newcount, li;
++		char hdr[80];
++
++		if (ae > as && data[ae - 1] == '\n')
++			ae--;
++		if (as == ae) {
++			ctxs = as;
++			ctxe = ae;
++		} else {
++			ctxs = as;
++			ctxe = ae;
++		}
++		oldcount = line_of_off(data, ae > as ? ae - 1 : as)
++				- first + 1;
++		newcount = strlen(newtext) ? line_of_off(newtext, strlen(newtext)) : 0;
++		snprintf(hdr, sizeof(hdr), "@@ -%u,%u +%u,%u @@",
++				first, oldcount, first, newcount);
++		sb_add(b, hdr, strlen(hdr));
++		sb_add(b, "\n", 1);
++
++		/* one context line before */
++		if (ctxs > 0) {
++			size_t p = ctxs;
++			while (p > 0 && data[p - 1] != '\n')
++				p--;
++			if (p > 0 && p < ctxs) {
++				size_t e = ctxs;
++				if (e > 0 && data[e - 1] == '\n')
++					e--;
++				sb_line(b, " ", data + p, e - p);
++			}
++		}
++		/* removed lines */
++		cur = ctxs;
++		for (li = 0; li < oldcount && cur < ctxe; li++) {
++			size_t e = cur;
++			while (e < ctxe && data[e] != '\n')
++				e++;
++			sb_line(b, "-", data + cur, e - cur);
++			cur = e + 1;
++		}
++		/* added lines */
++		if (strlen(newtext)) {
++			const char *n = newtext;
++			size_t nl = strlen(n), off = 0;
++			while (off < nl) {
++				size_t e = off;
++				while (e < nl && n[e] != '\n')
++					e++;
++				sb_line(b, "+", n + off, e - off);
++				off = e + 1;
++			}
++		}
++		/* one context line after, when it has content */
++		if (ctxe < len) {
++			size_t e = ctxe;
++			while (e < len && data[e] != '\n')
++				e++;
++			if (e > ctxe)
++				sb_line(b, " ", data + ctxe, e - ctxe);
++		}
++	}
++}
++
++/* ---------- one edit ---------- */
++
++static int do_edit(const struct edit *e, struct outcome *o)
++{
++	struct stat st, lst;
++	const char *target;
++	char *resolved = NULL;
++	char *data = NULL;
++	size_t len = 0;
++	struct match *m = NULL;
++	unsigned nm = 0, i;
++	int fd = -1;
++	char *out = NULL;
++	size_t outlen = 0;
++
++	memset(o, 0, sizeof(*o));
++	/* o->diff.cap is set up by the caller; limit survives */
++
++	if (lstat(e->path, &lst) != 0) {
++		o->code = (char *)"NOT_FOUND";
++		o->msg = xasprintf("%s", strerror(errno));
++		return 1;
++	}
++	if (S_ISLNK(lst.st_mode) && !e->follow) {
++		o->code = (char *)"INVALID_ARGUMENT";
++		o->msg = xstrdup("is a symlink; pass --follow to edit the target");
++		return 1;
++	}
++	target = e->path;
++	if (S_ISLNK(lst.st_mode)) {
++		/* --follow: edit the target in place, never replace the link */
++		resolved = realpath(e->path, NULL);
++		if (!resolved) {
++			o->code = (char *)"NOT_FOUND";
++			o->msg = xasprintf("cannot resolve symlink: %s", strerror(errno));
++			return 1;
++		}
++		target = resolved;
++	}
++	if (stat(target, &st) != 0) {
++		o->code = (char *)"NOT_FOUND";
++		o->msg = xasprintf("%s", strerror(errno));
++		return 1;
++	}
++	fd = read_locked(target, &data, &len, &st);
++	if (fd < 0) {
++		int err = errno;
++		o->code = (char *)((err == ENOENT) ? "NOT_FOUND" : "INVALID_ARGUMENT");
++		o->msg = xasprintf("%s", strerror(err));
++		return 1;
++	}
++	sha256_hex(data, len, o->old_ver);
++
++	if (e->has_sha && strcasecmp(e->sha256, o->old_ver) != 0) {
++		o->code = (char *)"STALE_INPUT";
++		o->msg = xasprintf("content version is sha256:%s", o->old_ver);
++		goto fail;
++	}
++
++	m = collect_matches(e, data, len, &nm, o);
++	if (!m)
++		goto fail;
++
++	o->changes = nm;
++	if ((long)nm != e->expect) {
++		if (nm == 0) {
++			o->code = (char *)"NOT_FOUND";
++			o->msg = xasprintf("expected %ld occurrence(s), found none",
++					e->expect);
++		} else {
++			char cand[128];
++			unsigned ci;
++
++			cand[0] = '\0';
++			for (ci = 0; ci < nm && ci < 8; ci++) {
++				char one[16];
++				o->cand[ci] = line_of_off(data, m[ci].start);
++				snprintf(one, sizeof(one), "%s%u", ci ? "," : "",
++						o->cand[ci]);
++				strncat(cand, one, sizeof(cand) - strlen(cand) - 1);
++			}
++			o->ncand = ci;
++			o->code = (char *)"AMBIGUOUS_MATCH";
++			o->msg = xasprintf("expected %ld occurrence(s), found %u; candidate lines: %s",
++					e->expect, nm, cand);
++		}
++		goto fail;
++	}
++
++	{
++		size_t nlen = strlen(e->new);
++		size_t need = len + nm * (nlen ? nlen : 1) + 1;
++		size_t pos = 0, w = 0;
++
++		out = xmalloc(need);
++		for (i = 0; i < nm; i++) {
++			if (m[i].start < pos) {
++				o->code = (char *)"INVALID_ARGUMENT";
++				o->msg = xstrdup("overlapping edits");
++				goto fail;
++			}
++			memcpy(out + w, data + pos, m[i].start - pos);
++			w += m[i].start - pos;
++			memcpy(out + w, e->new, nlen);
++			w += nlen;
++			pos = m[i].end;
++		}
++		memcpy(out + w, data + pos, len - pos);
++		w += len - pos;
++		out[w] = '\0';
++		outlen = w;
++	}
++	sha256_hex(out, outlen, o->new_ver);
++
++	emit_diff(&o->diff, data, len, m, nm, e->new);
++
++	if (e->dry_run) {
++		o->changed = 0;
++		close(fd);
++		free(m);
++		free(data);
++		free(out);
++		free(resolved);
++		return 0;
++	}
++
++	{
++		char *tmp = xasprintf("%sXXXXXX", target);
++		int tfd = xmkstemp(tmp);
++		size_t off = 0;
++		int r;
++
++		if (tfd < 0) {
++			free(tmp);
++			o->code = (char *)"INVALID_ARGUMENT";
++			o->msg = xasprintf("cannot create temp file: %s", strerror(errno));
++			goto fail;
++		}
++		while (off < outlen) {
++			ssize_t w = safe_write(tfd, out + off, outlen - off);
++			if (w < 0) {
++				if (errno == EINTR)
++					continue;
++				close(tfd);
++				unlink(tmp);
++				free(tmp);
++				o->code = (char *)"INVALID_ARGUMENT";
++				o->msg = xasprintf("write failed: %s", strerror(errno));
++				goto fail;
++			}
++			off += (size_t)w;
++		}
++		fchmod(tfd, st.st_mode);
++		fchown(tfd, st.st_uid, st.st_gid);
++		if (fsync(tfd) != 0) { /* best effort */ }
++#ifdef F_FULLFSYNC
++		fcntl(tfd, F_FULLFSYNC);   /* macOS: fsync() does not flush to media */
++#endif
++		if (close(tfd) != 0) {
++			unlink(tmp);
++			free(tmp);
++			o->code = (char *)"INVALID_ARGUMENT";
++			o->msg = xasprintf("close failed: %s", strerror(errno));
++			goto fail;
++		}
++		r = rename(tmp, target);
++		if (r != 0) {
++			int err = errno;
++			unlink(tmp);
++			free(tmp);
++			o->code = (char *)"INVALID_ARGUMENT";
++			o->msg = xasprintf("rename failed: %s", strerror(err));
++			goto fail;
++		}
++		free(tmp);
++	}
++	close(fd);
++	free(m);
++	free(data);
++	free(out);
++	free(resolved);
++	o->changed = 1;
++	return 0;
++ fail:
++	free(resolved);
++	if (fd >= 0)
++		close(fd);
++	free(m);
++	free(data);
++	free(out);
++	return 1;
++}
++
++/* ---------- reporting ---------- */
++
++static void report_text(const struct edit *e, const struct outcome *o, int failed)
++{
++	if (failed) {
++		fprintf(stderr, "%s: %s: %s\nNo files changed.\n",
++				e->path, o->code, o->msg ? o->msg : "failed");
++		return;
++	}
++	printf("%s changes=%u old_version=sha256:%s new_version=sha256:%s dry_run=%s changed=%s\n",
++			e->path, o->changes, o->old_ver, o->new_ver,
++			e->dry_run ? "true" : "false", o->changed ? "true" : "false");
++	if (o->diff.len)
++		fwrite(o->diff.p, 1, o->diff.len, stdout);
++	printf("diff_bytes=%u diff_truncated=%s\n",
++			(unsigned)o->diff.len, o->diff.truncated ? "true" : "false");
++}
++
++static void report_json(const struct edit *e, const struct outcome *o, int failed,
++		int open_brace)
++{
++	char v[80];
++
++	if (open_brace)
++		putchar('{');
++	fputs("\"path\":", stdout);
++	json_write_str(e->path ? e->path : "", e->path ? strlen(e->path) : 0);
++	putchar(',');
++	if (failed) {
++		printf("\"status\":\"error\",\"code\":\"%s\",\"message\":",
++				o->code ? o->code : "INVALID_ARGUMENT");
++		json_write_str(o->msg ? o->msg : "", o->msg ? strlen(o->msg) : 0);
++		if (o->ncand) {
++			unsigned i;
++			fputs(",\"candidates\":[", stdout);
++			for (i = 0; i < o->ncand; i++)
++				printf("%s%u", i ? "," : "", o->cand[i]);
++			putchar(']');
++		}
++		if (open_brace)
++			putchar('}');
++		return;
++	}
++	printf("\"status\":\"ok\",\"dry_run\":%s,\"changes\":%u",
++			e->dry_run ? "true" : "false", o->changes);
++	snprintf(v, sizeof(v), "sha256:%s", o->old_ver);
++	fputs(",\"old_version\":", stdout);
++	json_write_str(v, strlen(v));
++	snprintf(v, sizeof(v), "sha256:%s", o->new_ver);
++	fputs(",\"new_version\":", stdout);
++	json_write_str(v, strlen(v));
++	fputs(",\"changed\":", stdout);
++	fputs(o->changed ? "true" : "false", stdout);
++	fputs(",\"diff\":", stdout);
++	json_write_str(o->diff.p ? o->diff.p : "", o->diff.len);
++	printf(",\"diff_truncated\":%s%s",
++			o->diff.truncated ? "true" : "false",
++			open_brace ? "}" : "");
++}
++
++int replace_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
++int replace_main(int argc UNUSED_PARAM, char **argv)
++{
++	char *opt_old = NULL, *opt_new = NULL, *opt_expect = NULL;
++	char *opt_sha = NULL, *opt_diff_bytes = NULL, *opt_req = NULL, *opt_fmt = NULL;
++	unsigned opts;
++	struct edit e;
++	int exitcode = 0;
++
++	static const char replace_longopts[] ALIGN1 =
++		"old\0"            Required_argument "o"
++		"new\0"            Required_argument "n"
++		"expect\0"         Required_argument "x"
++		"sha256\0"         Required_argument "S"
++		"regex\0"          No_argument       "r"
++		"follow\0"         No_argument       "L"
++		"dry-run\0"        No_argument       "N"
++		"max-diff-bytes\0" Required_argument "B"
++		"request\0"        Required_argument "R"
++		"format\0"         Required_argument "F"
++		;
++
++	xfunc_error_retval = 2;
++
++	opts = getopt32long(argv, "o:n:x:S:rLNB:R:F:", replace_longopts,
++			&opt_old, &opt_new, &opt_expect, &opt_sha,
++			&opt_diff_bytes, &opt_req, &opt_fmt);
++	argv += optind;
++	(void)opts;
++
++	memset(&e, 0, sizeof(e));
++	e.expect = 1;
++	e.max_diff = DEFAULT_MAX_DIFF;
++	e.regex = (opts & (1 << 4)) != 0;    /* r: o n x S r L N B R F */
++	e.follow = (opts & (1 << 5)) != 0;   /* L */
++	e.dry_run = (opts & (1 << 6)) != 0;  /* N */
++
++	if (opt_fmt) {
++		if (strcmp(opt_fmt, "json") == 0)
++			e.json = 1;
++		else if (strcmp(opt_fmt, "text") != 0)
++			bb_error_msg_and_die("unknown format \"%s\"", opt_fmt);
++	}
++	if (opt_expect)
++		e.expect = strtol(opt_expect, NULL, 10);
++	if (opt_diff_bytes) {
++		long v = strtol(opt_diff_bytes, NULL, 10);
++		if (v > 0)
++			e.max_diff = (size_t)v;
++	}
++	if (opt_sha) {
++		if (is_prefixed_with(opt_sha, "sha256:"))
++			opt_sha += 7;
++		e.sha256 = opt_sha;
++		e.has_sha = 1;
++	}
++
++	if (opt_req) {
++		char *data = NULL, *err = NULL;
++		size_t len = 0;
++		struct stat st;
++		int fd;
++		json_value_t *doc;
++		const json_value_t *edits;
++		unsigned n, i;
++
++		fd = read_locked(opt_req, &data, &len, &st);
++		if (fd < 0) {
++			if (e.json) {
++				printf("{\"schema\":1,\"error\":{\"code\":\"NOT_FOUND\","
++						"\"message\":");
++				json_write_str(strerror(errno), strlen(strerror(errno)));
++				fputs("}}\n", stdout);
++				return 1;
++			}
++			bb_perror_msg_and_die("%s", opt_req);
++		}
++		close(fd);
++		doc = json_parse(data, len, &err);
++		if (!doc) {
++			if (e.json) {
++				printf("{\"schema\":1,\"error\":{\"code\":\"INVALID_ARGUMENT\","
++						"\"message\":");
++				json_write_str(err ? err : "bad json",
++						strlen(err ? err : "bad json"));
++				fputs("}}\n", stdout);
++				free(err);
++				free(data);
++				return 2;
++			}
++			bb_error_msg_and_die("%s: %s", opt_req, err ? err : "bad json");
++		}
++		free(err);
++		edits = json_get(doc, "edits");
++		n = json_len(edits);
++		if (e.json)
++			fputs("{\"schema\":1,\"results\":[", stdout);
++		for (i = 0; i < n; i++) {
++			const json_value_t *r = json_at(edits, i);
++			struct edit sub = e;
++			struct outcome o;
++			const char *sh;
++			int failed;
++
++			memset(&o, 0, sizeof(o));
++			o.diff.limit = e.max_diff;
++
++			sub.path = json_str(json_get(r, "path"), NULL);
++			sub.old = json_str(json_get(r, "old"), NULL);
++			sub.new = json_str(json_get(r, "new"), "");
++			sub.expect = json_int(json_get(r, "expect"), e.expect);
++			sub.regex = json_bool(json_get(r, "regex"), e.regex);
++			sub.follow = json_bool(json_get(r, "follow"), e.follow);
++			sub.dry_run = json_bool(json_get(r, "dry_run"), e.dry_run);
++			sh = json_str(json_get(r, "sha256"), NULL);
++			if (sh) {
++				if (is_prefixed_with(sh, "sha256:"))
++					sh += 7;
++				sub.sha256 = sh;
++				sub.has_sha = 1;
++			}
++
++			if (!sub.path || !sub.old) {
++				o.code = (char *)"INVALID_ARGUMENT";
++				o.msg = xstrdup("edit needs \"path\" and \"old\"");
++				failed = 1;
++			} else {
++				failed = do_edit(&sub, &o);
++			}
++			if (i > 0 && e.json)
++				putchar(',');
++			if (e.json)
++				report_json(&sub, &o, failed, 1);
++			else
++				report_text(&sub, &o, failed);
++			if (failed) {
++				exitcode = 1;
++				if (o.code && (strcmp(o.code, "STALE_INPUT") == 0
++						|| strcmp(o.code, "NOT_FOUND") == 0)) {
++					free(o.msg);
++					free(o.diff.p);
++					break;   /* later edits would build on a bad state */
++				}
++			}
++			free(o.msg);
++			free(o.diff.p);
++		}
++		if (e.json)
++			fputs("]}\n", stdout);
++		json_free(doc);
++		free(data);
++		fflush(stdout);
++		return exitcode;
++	}
++
++	if (!argv[0] || !opt_old)
++		bb_show_usage();
++	if (argv[1])
++		bb_error_msg_and_die("one file at a time; use --request for a batch");
++
++	e.path = argv[0];
++	e.old = opt_old;
++	e.new = opt_new ? opt_new : (char *)"";
++
++	{
++		struct outcome o;
++		int failed;
++
++		memset(&o, 0, sizeof(o));
++		o.diff.limit = e.max_diff;
++		failed = do_edit(&e, &o);
++		if (e.json) {
++			fputs("{\"schema\":1,", stdout);
++			report_json(&e, &o, failed, 0);
++			fputs("}\n", stdout);
++		} else {
++			report_text(&e, &o, failed);
++		}
++		fflush(stdout);
++		exitcode = failed ? 1 : 0;
++		free(o.msg);
++		free(o.diff.p);
++	}
++	return exitcode;
++}

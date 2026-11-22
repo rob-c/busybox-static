@@ -1,0 +1,5101 @@
+diff --git a/archival/unzip.c b/archival/unzip.c
+index 8a9a90f..e2db50c 100644
+--- a/archival/unzip.c
++++ b/archival/unzip.c
+@@ -212,6 +212,73 @@ struct BUG {
+ 
+ enum { zip_fd = 3 };
+ 
++/*
++ * Zip64: when a size does not fit in 32 bits, the central directory stores
++ * 0xffffffff there and the real value in an extra field with ID 0x0001.
++ * Only the sizes are taken from it; fields that fit stay untouched.
++ * NEXT_CDF_OFF is the offset read_next_cdf() computed for the entry *after*
++ * this one, from which the extra field can be located exactly.
++ */
++static void zip64_fix_sizes(uint32_t next_cdf_off, cdf_header_t *cdf, zip_header_t *zip)
++{
++	uint16_t extra_len = cdf->fmt.extra_len;
++	uint32_t pos;
++	unsigned char *extra;
++	unsigned i;
++
++	if (extra_len < 4)
++		return;
++	if (cdf->fmt.ucmpsize != 0xffffffff && cdf->fmt.cmpsize != 0xffffffff)
++		return;
++	pos = next_cdf_off - extra_len - cdf->fmt.file_comment_length;
++	extra = xmalloc(extra_len);
++	xlseek(zip_fd, pos, SEEK_SET);
++	xread(zip_fd, extra, extra_len);
++
++	for (i = 0; i + 4 <= extra_len; ) {
++		unsigned id = extra[i] | (extra[i + 1] << 8);
++		unsigned sz = extra[i + 2] | (extra[i + 3] << 8);
++		unsigned j = i + 4;
++		unsigned char *v = extra + j;
++		unsigned avail = (j + sz <= extra_len) ? sz : 0;
++
++		if (id == 0x0001) {
++			uint64_t u, c;
++			if (cdf->fmt.ucmpsize == 0xffffffff) {
++				unsigned n;
++				if (avail < 8)
++					break;
++				u = 0;
++				for (n = 0; n < 8; n++)
++					u |= (uint64_t)v[n] << (8 * n);
++				v += 8;
++				avail -= 8;
++				if (u <= 0xffffffff)
++					zip->fmt.ucmpsize = (uint32_t)u;
++				cdf->fmt.ucmpsize = (uint32_t)u;
++			}
++			if (cdf->fmt.cmpsize == 0xffffffff) {
++				if (avail < 8)
++					break;
++				{
++					unsigned n;
++					c = 0;
++					for (n = 0; n < 8; n++)
++						c |= (uint64_t)v[n] << (8 * n);
++				}
++				if (c <= 0xffffffff) {
++					zip->fmt.cmpsize = (uint32_t)c;
++					cdf->fmt.cmpsize = (uint32_t)c;
++				}
++			}
++			break;
++		}
++		i = j + sz;
++	}
++	free(extra);
++}
++
++
+ 
+ /* This value means that we failed to find CDF */
+ #define BAD_CDF_OFFSET ((uint32_t)0xffffffff)
+@@ -804,6 +871,15 @@ int unzip_main(int argc, char **argv)
+ 				zip.fmt.cmpsize  = cdf.fmt.cmpsize;
+ 				zip.fmt.ucmpsize = cdf.fmt.ucmpsize;
+ 			}
++			/* Zip64: a local header may carry 0xffffffff where the
++			 * central directory has the real size (or an extra field) */
++			if (zip.fmt.ucmpsize == 0xffffffff || zip.fmt.cmpsize == 0xffffffff) {
++				zip64_fix_sizes(cdf_offset, &cdf, &zip);
++				if (zip.fmt.ucmpsize == 0xffffffff && cdf.fmt.ucmpsize != 0xffffffff)
++					zip.fmt.ucmpsize = cdf.fmt.ucmpsize;
++				if (zip.fmt.cmpsize == 0xffffffff && cdf.fmt.cmpsize != 0xffffffff)
++					zip.fmt.cmpsize = cdf.fmt.cmpsize;
++			}
+ // Seen in some zipfiles: central directory 9 byte extra field contains
+ // a subfield with ID 0x5455 and 5 data bytes, which is a Unix-style UTC mtime.
+ // Local header version:
+diff --git a/coreutils/env.c b/coreutils/env.c
+index e9d3e88..65ff73a 100644
+--- a/coreutils/env.c
++++ b/coreutils/env.c
+@@ -48,6 +48,7 @@
+ //usage:     "\n	-, -i	Start with empty environment"
+ //usage:     "\n	-0	NUL terminated output"
+ //usage:     "\n	-u NAME	Remove variable from environment"
++//usage:     "\n	-C DIR	Change to DIR before running PROG"
+ 
+ #include "libbb.h"
+ 
+@@ -56,12 +57,14 @@ int env_main(int argc UNUSED_PARAM, char **argv)
+ {
+ 	unsigned opts;
+ 	llist_t *unset_env = NULL;
++	char *chdir_to = NULL;
+ 
+-	opts = getopt32long(argv, "+i0u:*",
++	opts = getopt32long(argv, "+i0u:*C:",
+ 			"ignore-environment\0" No_argument       "i"
+ 			"null\0"               No_argument       "0"
+ 			"unset\0"              Required_argument "u"
+-			, &unset_env
++			"chdir\0"              Required_argument "C"
++			, &unset_env, &chdir_to
+ 	);
+ 	argv += optind;
+ 	if (argv[0] && LONE_DASH(argv[0])) {
+@@ -88,6 +91,9 @@ int env_main(int argc UNUSED_PARAM, char **argv)
+ 		++argv;
+ 	}
+ 
++	if (opts & 8) /* -C DIR */
++		xchdir(chdir_to);
++
+ 	if (argv[0]) {
+ 		BB_EXECVP_or_die(argv);
+ 	}
+diff --git a/coreutils/mktemp.c b/coreutils/mktemp.c
+index 91b2be6..65b7dd1 100644
+--- a/coreutils/mktemp.c
++++ b/coreutils/mktemp.c
+@@ -49,6 +49,7 @@
+ //usage:     "\n	-t	Prepend base directory name to TEMPLATE"
+ //usage:     "\n	-p DIR	Use DIR as a base directory (implies -t)"
+ //usage:     "\n	-u	Do not create anything; print a name"
++//usage:     "\n	--suffix=SUF	Append SUF to the name"
+ //usage:     "\n"
+ //usage:     "\nBase directory is: -p DIR, else $TMPDIR, else /tmp"
+ //usage:
+@@ -66,6 +67,9 @@ int mktemp_main(int argc UNUSED_PARAM, char **argv)
+ 	const char *path;
+ 	char *chp;
+ 	unsigned opts;
++#if ENABLE_LONG_OPTS
++	const char *suffix = NULL;
++#endif
+ 	enum {
+ 		OPT_d = 1 << 0,
+ 		OPT_q = 1 << 1,
+@@ -87,8 +91,9 @@ int mktemp_main(int argc UNUSED_PARAM, char **argv)
+ 		"directory\0" No_argument       "d"
+ 		"quiet\0"     No_argument       "q"
+ 		"dry-run\0"   No_argument       "u"
++		"suffix\0"    Required_argument "\xfe"
+ 		"tmpdir\0"    Optional_argument "\xff"
+-		, &path, &path
++		, &path, &suffix, &path
+ 	);
+ #else
+ 	opts = getopt32(argv, "^" "dqtp:u" "\0" "?1"/*1 arg max*/, &path);
+@@ -123,6 +128,14 @@ int mktemp_main(int argc UNUSED_PARAM, char **argv)
+ 		if (mkstemp(chp) < 0)
+ 			goto error;
+ 	}
++#if ENABLE_LONG_OPTS
++	if (suffix && suffix[0]) {
++		char *final_name = xasprintf("%s%s", chp, suffix);
++		if (!(opts & OPT_u))
++			xrename(chp, final_name);
++		chp = final_name;
++	}
++#endif
+ 	puts(chp);
+ 	return EXIT_SUCCESS;
+  error:
+diff --git a/coreutils/printf.c b/coreutils/printf.c
+index 341f509..622b4c8 100644
+--- a/coreutils/printf.c
++++ b/coreutils/printf.c
+@@ -230,6 +230,30 @@ static void print_direc(char *format, unsigned fmt_length,
+ 		llv = my_xstrtoull(skip_whitespace(argument));
+ 		/* cheat: unsigned long and long have same width, so... */
+ 		goto print_long;
++	case 'q': {
++		/* Shell-quote ARG so the result can be reused in a command line:
++		 * leave "safe" words bare, single-quote the rest and escape
++		 * embedded single quotes (GNU printf %q behaviour). */
++		const char *p = argument;
++		smallint need = (*p == '\0');
++
++		for (; *p && !need; p++)
++			if (!isalnum((unsigned char)*p) && !strchr("_./:=@%+,^-", *p))
++				need = 1;
++		if (!need) {
++			fputs(argument, stdout);
++			break;
++		}
++		bb_putchar('\'');
++		for (p = argument; *p; p++) {
++			if (*p == '\'')
++				fputs("'\\''", stdout);
++			else
++				bb_putchar(*p);
++		}
++		bb_putchar('\'');
++		break;
++	}
+ 	case 's':
+ 		/* Are char* and long long the same? */
+ 		if (sizeof(argument) == sizeof(llv)) {
+@@ -353,7 +377,7 @@ static char **print_formatted(char *f, char **argv, int *conv_err)
+ 			}
+ 			/* Add "ll" if integer modifier, then print */
+ 			{
+-				static const char format_chars[] ALIGN1 = "diouxXfeEgGcs";
++				static const char format_chars[] ALIGN1 = "diouxXfeEgGcsq";
+ 				char *p = (char*)strchr(format_chars, *f);
+ 				const char *arg = "0";
+ 				/* needed - try "printf %" without it */
+diff --git a/coreutils/realpath.c b/coreutils/realpath.c
+index 22820a7..958618f 100644
+--- a/coreutils/realpath.c
++++ b/coreutils/realpath.c
+@@ -21,26 +21,184 @@
+ /* BB_AUDIT SUSv3 N/A -- Apparently a busybox extension. */
+ 
+ //usage:#define realpath_trivial_usage
+-//usage:       "FILE..."
++//usage:       "[-em] [--relative-to=DIR] FILE..."
+ //usage:#define realpath_full_usage "\n\n"
+ //usage:       "Print absolute pathnames of FILEs"
++//usage:     "\n	-e	All path components must exist"
++//usage:     "\n	-m	Resolve as far as possible, missing components allowed"
++//usage:     "\n	--relative-to=DIR	Print paths relative to DIR"
+ 
+ #include "libbb.h"
+ 
++#if ENABLE_FEATURE_GNU_LONG_OPTS
++/*
++ * "realpath -m": resolve the longest existing prefix, then re-attach the
++ * missing components.  Recursing on the directory part handles paths whose
++ * last few components do not exist yet, which is what agents need when they
++ * canonicalize a file they are about to create.
++ */
++static char *pop_last_component(const char *abs)
++{
++	char *s = xstrdup(abs);
++	char *p = strrchr(s, '/');
++	if (!p || p == s) {
++		free(s);
++		return xstrdup("/");
++	}
++	*p = '\0';
++	return s;
++}
++
++static char *canon_missing(const char *path)
++{
++	char *res;
++	const char *base;
++	char *dir, *dirres, *out;
++	unsigned len;
++
++	res = xmalloc_realpath_coreutils((char *)path);
++	if (res)
++		return res;
++
++	base = bb_basename(path);
++	if (base == path) {
++		/* single relative component: anchor at the current directory */
++		char *cwd = getcwd(NULL, 0);
++		if (!cwd)
++			bb_perror_msg_and_die("getcwd");
++		char *full = concat_path_file(cwd, path);
++		free(cwd);
++		res = canon_missing(full);
++		free(full);
++		return res;
++	}
++
++	len = (unsigned)(base - path); /* includes the '/' before base */
++	dir = xasprintf("%.*s", (int)(len - 1), path);
++	if (!dir[0]) {
++		free(dir);
++		dir = xstrdup("/");
++	}
++	dirres = canon_missing(dir);
++	free(dir);
++
++	if (strcmp(base, ".") == 0)
++		return dirres;
++	if (strcmp(base, "..") == 0) {
++		out = pop_last_component(dirres);
++		free(dirres);
++		return out;
++	}
++	out = concat_path_file(dirres, base);
++	free(dirres);
++	return out;
++}
++
++/* Print TO relative to FROM. Both are absolute paths. */
++static char *rel_path(const char *from, const char *to)
++{
++	char *fbuf = xstrdup(from);
++	char *tbuf = xstrdup(to);
++	char *fp[128], *tp[128];
++	unsigned nf = 0, nt = 0, i;
++	char *tok, *next, *out;
++
++	for (tok = fbuf; tok && *tok && nf < ARRAY_SIZE(fp); tok = next) {
++		next = strchr(tok, '/');
++		if (next)
++			*next++ = '\0';
++		if (*tok)
++			fp[nf++] = tok;
++	}
++	for (tok = tbuf; tok && *tok && nt < ARRAY_SIZE(tp); tok = next) {
++		next = strchr(tok, '/');
++		if (next)
++			*next++ = '\0';
++		if (*tok)
++			tp[nt++] = tok;
++	}
++	for (i = 0; i < nf && i < nt && strcmp(fp[i], tp[i]) == 0; i++)
++		continue;
++
++	{
++		unsigned len = 0;
++		out = xzalloc(1);
++		for (unsigned j = i; j < nf; j++) {
++			out = xrealloc(out, len + 3 + 1);
++			memcpy(out + len, "../", 3);
++			len += 3;
++			out[len] = '\0';
++		}
++		for (unsigned j = i; j < nt; j++) {
++			unsigned l = strlen(tp[j]);
++			out = xrealloc(out, len + l + 2);
++			memcpy(out + len, tp[j], l);
++			len += l;
++			if (j + 1 < nt)
++				out[len++] = '/';
++			out[len] = '\0';
++		}
++		/* "a/../" et al collapse to "." when nothing is left */
++		while (len > 2 && strcmp(out + len - 3, "../") == 0)
++			len -= 3;
++		if (len >= 3 && strcmp(out + len - 3, "/..") == 0)
++			len -= 3;
++		out[len] = '\0';
++		if (len == 0) {
++			free(out);
++			out = xstrdup(".");
++		}
++	}
++	free(fbuf);
++	free(tbuf);
++	return out;
++}
++#endif /* FEATURE_GNU_LONG_OPTS */
++
+ int realpath_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
+ int realpath_main(int argc UNUSED_PARAM, char **argv)
+ {
+ 	int retval = EXIT_SUCCESS;
++#if ENABLE_FEATURE_GNU_LONG_OPTS
++	const char *relative_to = NULL;
++	int opts;
++	char *rel_base = NULL;
++
++	opts = getopt32long(argv, "em",
++		"canonicalize-existing\0" No_argument       "e"
++		"canonicalize-missing\0"  No_argument       "m"
++		"relative-to\0"           Required_argument "\xfe"
++		, &relative_to
++	);
++	if (relative_to) {
++		rel_base = xmalloc_realpath_coreutils((char *)relative_to);
++		if (!rel_base)
++			rel_base = xstrdup(relative_to);
++	}
++#endif
+ 
+-	if (!*++argv) {
++	argv += optind;
++	if (!*argv) {
+ 		bb_show_usage();
+ 	}
+ 
+ 	do {
+-		/* NOFORK: only one alloc is allowed; must free */
+-		char *resolved_path = xmalloc_realpath_coreutils(*argv);
++		char *resolved_path =
++#if ENABLE_FEATURE_GNU_LONG_OPTS
++			(opts & 2) ? canon_missing(*argv) : /* -m */
++#endif
++			xmalloc_realpath_coreutils(*argv);
+ 		if (resolved_path != NULL) {
+-			puts(resolved_path);
++#if ENABLE_FEATURE_GNU_LONG_OPTS
++			if (rel_base) {
++				char *rel = rel_path(rel_base, resolved_path);
++				puts(rel);
++				free(rel);
++			} else
++#endif
++			{
++				puts(resolved_path);
++			}
+ 			free(resolved_path);
+ 		} else {
+ 			retval = EXIT_FAILURE;
+@@ -48,5 +206,8 @@ int realpath_main(int argc UNUSED_PARAM, char **argv)
+ 		}
+ 	} while (*++argv);
+ 
++#if ENABLE_FEATURE_GNU_LONG_OPTS
++	free(rel_base);
++#endif
+ 	fflush_stdout_and_exit(retval);
+ }
+diff --git a/coreutils/split.c b/coreutils/split.c
+index b6d1b9a..5a7ba6f 100644
+--- a/coreutils/split.c
++++ b/coreutils/split.c
+@@ -35,6 +35,7 @@
+ //usage:       "	-b N[k|m]	Split by N (kilo|mega)bytes"
+ //usage:     "\n	-l N		Split by N lines"
+ //usage:     "\n	-a N		Use N letters as suffix"
++//usage:     "\n	-d  		Use numeric, not alphabetic, suffixes"
+ //usage:
+ //usage:#define split_example_usage
+ //usage:       "$ split TODO foo\n"
+@@ -53,6 +54,8 @@ static const struct suffix_mult split_suffixes[] ALIGN_SUFFIX = {
+ };
+ #endif
+ 
++static smallint split_numeric;
++
+ /* Increment the suffix part of the filename.
+  * Returns NULL if we are out of filenames.
+  */
+@@ -60,11 +63,13 @@ static char *next_file(char *old, unsigned suffix_len)
+ {
+ 	size_t end = strlen(old);
+ 	unsigned i = 1;
++	char top = split_numeric ? '9' : 'z';
++	char first = split_numeric ? '0' : 'a';
+ 	char *curr;
+ 
+ 	while (1) {
+ 		curr = old + end - i;
+-		if (*curr < 'z') {
++		if (*curr < top) {
+ 			*curr += 1;
+ 			break;
+ 		}
+@@ -72,7 +77,7 @@ static char *next_file(char *old, unsigned suffix_len)
+ 		if (i > suffix_len) {
+ 			return NULL;
+ 		}
+-		*curr = 'a';
++		*curr = first;
+ 	}
+ 
+ 	return old;
+@@ -84,6 +89,7 @@ enum { READ_BUFFER_SIZE = COMMON_BUFSIZE - 1 };
+ #define SPLIT_OPT_l (1<<0)
+ #define SPLIT_OPT_b (1<<1)
+ #define SPLIT_OPT_a (1<<2)
++#define SPLIT_OPT_d (1<<3)
+ 
+ int split_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
+ int split_main(int argc UNUSED_PARAM, char **argv)
+@@ -101,10 +107,11 @@ int split_main(int argc UNUSED_PARAM, char **argv)
+ 	setup_common_bufsiz();
+ 
+ 	opt = getopt32(argv, "^"
+-			"l:b:a:+" /* -a N */
++			"l:b:a:+d" /* -a N */
+ 			"\0" "?2"/*max 2 args*/,
+ 			&count_p, &count_p, &suffix_len
+ 	);
++	split_numeric = (opt & SPLIT_OPT_d) != 0;
+ 
+ 	if (opt & SPLIT_OPT_l)
+ 		cnt = XATOOFF(count_p);
+@@ -131,7 +138,7 @@ int split_main(int argc UNUSED_PARAM, char **argv)
+ 
+ 	{
+ 		char *char_p = xzalloc(suffix_len + 1);
+-		memset(char_p, 'a', suffix_len);
++		memset(char_p, split_numeric ? '0' : 'a', suffix_len);
+ 		pfx = xasprintf("%s%s", sfx, char_p);
+ 		if (ENABLE_FEATURE_CLEAN_UP)
+ 			free(char_p);
+diff --git a/findutils/find.c b/findutils/find.c
+index b876fec..c95dc06 100644
+--- a/findutils/find.c
++++ b/findutils/find.c
+@@ -457,6 +457,9 @@ typedef struct {
+ IF_FEATURE_FIND_PATH(   ACTS(path,  const char *pattern; bool ipath;))
+ IF_FEATURE_FIND_REGEX(  ACTS(regex, regex_t compiled_pattern;))
+ IF_FEATURE_FIND_PRINT0( ACTS(print0))
++#if ENABLE_DESKTOP
++                        ACTS(printf, const char *fmt;)
++#endif
+ IF_FEATURE_FIND_TYPE(   ACTS(type,  int type_mask;))
+ IF_FEATURE_FIND_EXECUTABLE(ACTS(executable))
+ IF_FEATURE_FIND_PERM(   ACTS(perm,  char perm_char; mode_t perm_mask;))
+@@ -900,6 +903,153 @@ ACTF(print0)
+ 	return TRUE;
+ }
+ #endif
++#if ENABLE_DESKTOP
++/*
++ * -printf: one line per file with the fields a script needs.  This is the
++ * find feature that turns "list files with size and mtime" from N+1
++ * processes into one, so agent workflows reach for it constantly.
++ * Supported: %% %p %P %f %h %y %s %m %M %i %n %u %g %U %G %l %T@ %TY %Tm
++ * %Td %TH %TM %TS, plus \n \t \0 and \\.
++ */
++static const char *printf_mode_string(char *buf, mode_t mode)
++{
++	static const char rwx[] = "rwx";
++	int i;
++
++	switch (mode & S_IFMT) {
++	case S_IFDIR:  buf[0] = 'd'; break;
++	case S_IFLNK:  buf[0] = 'l'; break;
++	case S_IFCHR:  buf[0] = 'c'; break;
++	case S_IFBLK:  buf[0] = 'b'; break;
++	case S_IFIFO:  buf[0] = 'p'; break;
++	case S_IFSOCK: buf[0] = 's'; break;
++	default:       buf[0] = '-'; break;
++	}
++	for (i = 0; i < 9; i++)
++		buf[1 + i] = (mode & (1 << (8 - i))) ? rwx[i % 3] : '-';
++	buf[10] = '\0';
++	if (mode & S_ISUID) buf[3] = (buf[3] == 'x') ? 's' : 'S';
++	if (mode & S_ISGID) buf[6] = (buf[6] == 'x') ? 's' : 'S';
++	if (mode & S_ISVTX) buf[9] = (buf[9] == 'x') ? 't' : 'T';
++	return buf;
++}
++
++ACTF(printf)
++{
++	const char *f = ap->fmt;
++	const char *base = bb_basename(fileName);
++	const char *rel = fileName;
++	struct tm tm;
++	char modebuf[12];
++
++	if (rel[0] == '.' && rel[1] == '/')
++		rel += 2;
++	localtime_r(&statbuf->st_mtime, &tm);
++
++	while (*f) {
++		if (*f != '%') {
++			if (*f == '\\') {
++				f++;
++				if (*f == 'n') { bb_putchar('\n'); f++; continue; }
++				if (*f == 't') { bb_putchar('\t'); f++; continue; }
++				if (*f == '0') { bb_putchar('\0'); f++; continue; }
++				if (*f == '\0') { bb_putchar('\\'); break; }
++				bb_putchar('\\');
++				continue;
++			}
++			bb_putchar(*f++);
++			continue;
++		}
++		f++;
++		switch (*f) {
++		case '%': bb_putchar('%'); break;
++		case 'p': fputs(fileName, stdout); break;
++		case 'P': fputs(rel, stdout); break;
++		case 'f': fputs(base, stdout); break;
++		case 'h': {
++			char *dir = xstrdup(fileName);
++			char *slash = strrchr(dir, '/');
++			if (!slash)
++				fputs(".", stdout);
++			else if (slash == dir)
++				fputs("/", stdout);
++			else {
++				*slash = '\0';
++				fputs(dir, stdout);
++			}
++			free(dir);
++			break;
++		}
++		case 'y':
++			bb_putchar(S_ISREG(statbuf->st_mode) ? 'f' :
++				S_ISDIR(statbuf->st_mode) ? 'd' :
++				S_ISLNK(statbuf->st_mode) ? 'l' :
++				S_ISCHR(statbuf->st_mode) ? 'c' :
++				S_ISBLK(statbuf->st_mode) ? 'b' :
++				S_ISFIFO(statbuf->st_mode) ? 'p' :
++				S_ISSOCK(statbuf->st_mode) ? 's' : '?');
++			break;
++		case 's': printf("%llu", (unsigned long long)statbuf->st_size); break;
++		case 'm': printf("%o", (unsigned)(statbuf->st_mode & 07777)); break;
++		case 'M': fputs(printf_mode_string(modebuf, statbuf->st_mode), stdout); break;
++		case 'i': printf("%llu", (unsigned long long)statbuf->st_ino); break;
++		case 'n': printf("%lu", (unsigned long)statbuf->st_nlink); break;
++		case 'u': {
++			struct passwd *pw = getpwuid(statbuf->st_uid);
++			if (pw)
++				fputs(pw->pw_name, stdout);
++			else
++				printf("%u", (unsigned)statbuf->st_uid);
++			break;
++		}
++		case 'g': {
++			struct group *gr = getgrgid(statbuf->st_gid);
++			if (gr)
++				fputs(gr->gr_name, stdout);
++			else
++				printf("%u", (unsigned)statbuf->st_gid);
++			break;
++		}
++		case 'U': printf("%u", (unsigned)statbuf->st_uid); break;
++		case 'G': printf("%u", (unsigned)statbuf->st_gid); break;
++		case 'l': {
++			char *target = xmalloc_readlink(fileName);
++			fputs(target ? target : "", stdout);
++			free(target);
++			break;
++		}
++		case 'T':
++			f++;
++			switch (*f) {
++			case '@':
++				printf("%llu.%09u",
++					(unsigned long long)statbuf->st_mtime,
++					(unsigned)statbuf->st_mtim.tv_nsec);
++				break;
++			case 'Y': printf("%04d", tm.tm_year + 1900); break;
++			case 'm': printf("%02d", tm.tm_mon + 1); break;
++			case 'd': printf("%02d", tm.tm_mday); break;
++			case 'H': printf("%02d", tm.tm_hour); break;
++			case 'M': printf("%02d", tm.tm_min); break;
++			case 'S': printf("%02d", tm.tm_sec); break;
++			default: bb_putchar('T'); bb_putchar(*f); break;
++			}
++			break;
++		default:
++			bb_putchar('%');
++			if (*f)
++				bb_putchar(*f);
++			else
++				f--;
++			break;
++		}
++		if (*f)
++			f++;
++	}
++	return TRUE;
++}
++#endif /* ENABLE_DESKTOP */
++
+ ACTF(print)
+ {
+ 	puts(fileName);
+@@ -1152,6 +1302,9 @@ static action*** parse_params(char **argv)
+ 	IF_FEATURE_FIND_PAREN(  PARM_char_brace,)
+ 	/* All options/actions starting from here require argument */
+ 	                        PARM_name      ,
++#if ENABLE_DESKTOP
++	                        PARM_printf    ,
++#endif
+ 	                        PARM_iname     ,
+ 	IF_FEATURE_FIND_PATH(   PARM_path      ,)
+ #if ENABLE_DESKTOP
+@@ -1204,6 +1357,9 @@ static action*** parse_params(char **argv)
+ 	IF_FEATURE_FIND_PAREN(  "(\0"       )
+ 	/* All options/actions starting from here require argument */
+ 	                        "-name\0"
++#if ENABLE_DESKTOP
++	                        "-printf\0"
++#endif
+ 	                        "-iname\0"
+ 	IF_FEATURE_FIND_PATH(   "-path\0"   )
+ #if ENABLE_DESKTOP
+@@ -1452,6 +1608,15 @@ static action*** parse_params(char **argv)
+ 			*endarg = (char*) ")"; /* restore NULLed parameter */
+ 			argv = endarg;
+ 		}
++#endif
++#if ENABLE_DESKTOP
++		else if (parm == PARM_printf) {
++			action_printf *ap;
++			dbg("%d", __LINE__);
++			G.need_print = 0;
++			ap = ALLOC_ACTION(printf);
++			ap->fmt = arg1;
++		}
+ #endif
+ 		else if (parm == PARM_name || parm == PARM_iname) {
+ 			action_name *ap;
+diff --git a/findutils/grep.c b/findutils/grep.c
+index 99220f6..26170c7 100644
+--- a/findutils/grep.c
++++ b/findutils/grep.c
+@@ -56,6 +56,7 @@
+ #include "libbb.h"
+ #include "common_bufsiz.h"
+ #include "xregex.h"
++#include <fnmatch.h>
+ 
+ //usage:#define grep_trivial_usage
+ //usage:       "[-HhnlLoqvsrRiwFE"
+@@ -225,6 +226,9 @@ enum {
+ #define NUL_DELIMITED               (option_mask32 & OPT_z)
+ 
+ struct globals {
++	llist_t *include_pats;  /* --include=GLOB */
++	llist_t *exclude_pats;  /* --exclude=GLOB */
++	llist_t *exclude_dirs;  /* --exclude-dir=GLOB */
+ 	int max_matches;
+ #if !ENABLE_EXTRA_COMPAT
+ 	int reflags;
+@@ -706,12 +710,117 @@ static void load_pattern_list(llist_t **lst, char *pattern)
+ 		llist_add_to(lst, new_grep_list_data(p, 0));
+ }
+ 
++/*
++ * --include / --exclude / --exclude-dir / --exclude-from are collected here
++ * rather than through getopt32long: they may be repeated, and a long-only
++ * getopt32 option can only capture its last value.  The options are removed
++ * from argv, so the rest of the applet is untouched.
++ */
++#if ENABLE_FEATURE_GNU_LONG_OPTS
++static void collect_name_filters(char **argv)
++{
++	int i, j = 0;
++
++	for (i = 0; argv[i]; i++) {
++		char *a = argv[i];
++		llist_t **list = NULL;
++		const char *val = NULL;
++
++		if (strncmp(a, "--include=", 10) == 0) {
++			list = &G.include_pats; val = a + 10;
++		} else if (strncmp(a, "--exclude=", 10) == 0) {
++			list = &G.exclude_pats; val = a + 10;
++		} else if (strncmp(a, "--exclude-dir=", 14) == 0) {
++			list = &G.exclude_dirs; val = a + 14;
++		} else if (strncmp(a, "--exclude-from=", 15) == 0) {
++			FILE *fp = fopen_for_read(a + 15);
++			char *line;
++			if (!fp)
++				bb_perror_msg_and_die("%s", a + 15);
++			while ((line = xmalloc_fgetline(fp)) != NULL) {
++				if (line[0] && line[0] != '#')
++					llist_add_to_end(&G.exclude_pats, line);
++				else
++					free(line);
++			}
++			fclose(fp);
++			continue;
++		}
++		if (list) {
++			llist_add_to_end(list, xstrdup(val));
++			continue;
++		}
++		argv[j++] = a;
++	}
++	argv[j] = NULL;
++}
++
++static smallint name_matches(const llist_t *list, const char *name)
++{
++	while (list) {
++		if (fnmatch(list->data, name, 0) == 0)
++			return 1;
++		list = list->link;
++	}
++	return 0;
++}
++
++static smallint file_is_wanted(const char *filename)
++{
++	const char *base = bb_basename(filename);
++
++	if (G.include_pats && !name_matches(G.include_pats, base))
++		return 0;
++	if (G.exclude_pats && name_matches(G.exclude_pats, base))
++		return 0;
++	if (G.exclude_dirs) {
++		/* also test every directory component: --exclude-dir must hold
++		 * even if the traversal does not honour SKIP */
++		const char *p = filename;
++		char *copy = xstrdup(filename);
++		char *tok, *next;
++
++		for (tok = copy; tok && *tok; tok = next) {
++			next = strchr(tok, '/');
++			if (next)
++				*next++ = '\0';
++			if (*tok && strcmp(tok, base) != 0
++			 && name_matches(G.exclude_dirs, tok)
++			) {
++				free(copy);
++				return 0;
++			}
++		}
++		free(copy);
++		(void)p;
++	}
++	return 1;
++}
++
++/* dirAction: SKIP keeps recursion out of an --exclude-dir directory */
++static int FAST_FUNC dir_action_grep(struct recursive_state *state UNUSED_PARAM,
++		const char *filename,
++		struct stat *statbuf UNUSED_PARAM)
++{
++	if (G.exclude_dirs && name_matches(G.exclude_dirs, bb_basename(filename)))
++		return SKIP;
++	return TRUE;
++}
++#else
++# define collect_name_filters(argv) ((void)0)
++# define file_is_wanted(filename) 1
++# define dir_action_grep NULL
++#endif
++
+ static int FAST_FUNC file_action_grep(struct recursive_state *state UNUSED_PARAM,
+ 		const char *filename,
+ 		struct stat *statbuf)
+ {
+ 	FILE *file;
+ 
++	if (!file_is_wanted(filename))
++		return 1;
++
+ 	/* If we are given a link to a directory, we should bail out now, rather
+ 	 * than trying to open the "file" and hoping getline gives us nothing,
+ 	 * since that is not portable across operating systems (FreeBSD for
+@@ -750,7 +859,7 @@ static int grep_dir(const char *dir)
+ 		| ACTION_DEPTHFIRST
+ 		| 0,
+ 		/* fileAction= */ file_action_grep,
+-		/* dirAction= */ NULL,
++		/* dirAction= */ dir_action_grep,
+ 		/* userData= */ &matched
+ 	);
+ 	return matched;
+@@ -779,6 +888,8 @@ int grep_main(int argc UNUSED_PARAM, char **argv)
+ 	/* For grep, exitcode of 1 is "not found". Other errors are 2: */
+ 	xfunc_error_retval = 2;
+ 
++	collect_name_filters(argv);
++
+ #if ENABLE_FEATURE_GREP_CONTEXT
+ 	/* -H unsets -h; -C unsets -A,-B */
+ 	opts = GETOPT32(argv, "^"
+diff --git a/findutils/xargs.c b/findutils/xargs.c
+index 890c375..61b5bd2 100644
+--- a/findutils/xargs.c
++++ b/findutils/xargs.c
+@@ -110,6 +110,7 @@ struct globals {
+ 	char eol_ch;
+ #endif
+ 	const char *eof_str;
++	char delim;      /* -d CHAR: one delimiter, quotes are not special */
+ 	int idx;
+ 	int fd_tty;
+ 	int fd_stdin;
+@@ -130,6 +131,7 @@ struct globals {
+ #define G (*(struct globals*)bb_common_bufsiz1)
+ #define INIT_G() do { \
+ 	setup_common_bufsiz(); \
++	G.delim = 0; \
+ 	IF_FEATURE_XARGS_SUPPORT_REPL_STR(G.repl_str = "{}";) \
+ 	IF_FEATURE_XARGS_SUPPORT_REPL_STR(G.eol_ch = '\n';) \
+ 	/* Even zero values are set because we are NOEXEC applet */ \
+@@ -156,6 +158,7 @@ enum {
+ 	IF_FEATURE_XARGS_SUPPORT_ZERO_TERM(   OPTBIT_ZEROTERM   ,)
+ 	IF_FEATURE_XARGS_SUPPORT_REPL_STR(    OPTBIT_REPLSTR    ,)
+ 	IF_FEATURE_XARGS_SUPPORT_REPL_STR(    OPTBIT_REPLSTR1   ,)
++	OPTBIT_DELIM, /* must stay last: "d:" is last in OPTION_STR */
+ 
+ 	OPT_VERBOSE     = 1 << OPTBIT_VERBOSE    ,
+ 	OPT_NO_EMPTY    = 1 << OPTBIT_NO_EMPTY   ,
+@@ -169,6 +172,7 @@ enum {
+ 	OPT_ZEROTERM    = IF_FEATURE_XARGS_SUPPORT_ZERO_TERM(   (1 << OPTBIT_ZEROTERM   )) + 0,
+ 	OPT_REPLSTR     = IF_FEATURE_XARGS_SUPPORT_REPL_STR(    (1 << OPTBIT_REPLSTR    )) + 0,
+ 	OPT_REPLSTR1    = IF_FEATURE_XARGS_SUPPORT_REPL_STR(    (1 << OPTBIT_REPLSTR1   )) + 0,
++	OPT_DELIM       = 1 << OPTBIT_DELIM,
+ };
+ #define OPTION_STR "+trn:s:e::E:o" \
+ 	IF_FEATURE_XARGS_SUPPORT_CONFIRMATION("p") \
+@@ -176,7 +180,8 @@ enum {
+ 	IF_FEATURE_XARGS_SUPPORT_ZERO_TERM(   "0") \
+ 	IF_FEATURE_XARGS_SUPPORT_REPL_STR(    "I:i::") \
+ 	IF_FEATURE_XARGS_SUPPORT_PARALLEL(    "P:+") \
+-	IF_FEATURE_XARGS_SUPPORT_ARGS_FILE(   "a:")
++	IF_FEATURE_XARGS_SUPPORT_ARGS_FILE(   "a:") \
++	"d:"
+ 
+ 
+ /*
+@@ -287,6 +292,8 @@ static int xargs_exec(void)
+  * "\t\n\v\f\r" happen to have ASCII codes 9,10,11,12,13.
+  */
+ #define ISSPACE(a) ({ unsigned char xargs__isspace = (a) - 9; xargs__isspace == (' ' - 9) || xargs__isspace <= (13 - 9); })
++/* -d CHAR replaces the whole whitespace class with one character */
++#define IS_SEP(c) (G.delim ? ((unsigned char)(c) == (unsigned char)G.delim) : ISSPACE(c))
+ 
+ static void store_param(char *s)
+ {
+@@ -340,7 +347,7 @@ static char* FAST_FUNC process_stdin(int n_max_chars, int n_max_arg, char *buf)
+ 			q = '\0';
+ 			state = NORM;
+ 		} else { /* if (state == NORM) */
+-			if (ISSPACE(c)) {
++			if (IS_SEP(c)) {
+ 				if (p != s) {
+  close_word:
+ 					state = SPACE;
+@@ -348,6 +355,10 @@ static char* FAST_FUNC process_stdin(int n_max_chars, int n_max_arg, char *buf)
+ 					goto set;
+ 				}
+ 			} else {
++				if (G.delim) {
++					/* -d: characters are verbatim, quotes are not special */
++					goto set;
++				}
+ 				if (c == '\\') {
+ 					state = BACKSLASH;
+ 				} else if (c == '\'' || c == '"') {
+@@ -409,7 +420,7 @@ static char* FAST_FUNC process_stdin(int n_max_chars, int n_max_arg, char *buf)
+ 			if (p == s)
+ 				goto ret;
+ 		}
+-		if (c == EOF || ISSPACE(c)) {
++		if (c == EOF || IS_SEP(c)) {
+ 			if (p == s)
+ 				continue;
+ 			c = EOF;
+@@ -519,7 +530,7 @@ static char* FAST_FUNC process_stdin_with_replace(int n_max_chars, int n_max_arg
+ 			/* Skip leading whitespace of each line: try
+ 			 * echo -e ' \t\v1 2 3 ' | xargs -I% echo '[%]'
+ 			 */
+-			if (ISSPACE(c))
++			if (IS_SEP(c))
+ 				continue;
+ 		}
+ 		if (c == EOF || c == G.eol_ch) {
+@@ -625,6 +636,7 @@ int xargs_main(int argc UNUSED_PARAM, char **argv)
+ #define read_args process_stdin
+ #endif
+ 	IF_FEATURE_XARGS_SUPPORT_ARGS_FILE(char *opt_a = NULL;)
++	char *opt_d = NULL;
+ 
+ 	INIT_G();
+ 
+@@ -634,7 +646,13 @@ int xargs_main(int argc UNUSED_PARAM, char **argv)
+ 		IF_FEATURE_XARGS_SUPPORT_REPL_STR(, &G.repl_str, &G.repl_str)
+ 		IF_FEATURE_XARGS_SUPPORT_PARALLEL(, &G.max_procs)
+ 		IF_FEATURE_XARGS_SUPPORT_ARGS_FILE(, &opt_a)
++		, &opt_d
+ 	);
++	if (opt_d) {
++		if (!opt_d[0])
++			bb_error_msg_and_die("empty delimiter");
++		G.delim = opt_d[0];
++	}
+ 
+ #if ENABLE_FEATURE_XARGS_SUPPORT_PARALLEL
+ 	if (G.max_procs <= 0) /* -P0 means "run lots of them" */
+diff --git a/libbb/find_pid_by_name.c b/libbb/find_pid_by_name.c
+index fe13f72..1731bea 100644
+--- a/libbb/find_pid_by_name.c
++++ b/libbb/find_pid_by_name.c
+@@ -37,6 +37,61 @@ execXXX("/proc/self/exe", applet_name, params....)
+ and therefore comm field contains "exe".
+ */
+ 
++#if defined(__APPLE__)
++/*
++ * Name matching on Darwin, where `sh script` reports the interpreter in p_comm.
++ *
++ * Match:
++ *   - p_comm (the normal case, and what killall means on Linux), or
++ *   - basename(argv[0]), or
++ *   - basename(argv[1]) when argv[0] is a shell/interpreter, i.e. the script
++ *     that is really running (macOS puts "/bin/sh" in p_comm for those).
++ *
++ * Deliberately NOT any other argv element: matching an argument would let
++ * `killall foo` kill `grep foo`.  Agents that want argument matching use
++ * `pkill -f`, which busybox already provides.
++ * See docs/decisions/darwin-process-matching-argv-not-comm.md.
++ */
++static int darwin_is_interpreter(const char *name)
++{
++	static const char *const interps[] ALIGN_PTR = {
++		"sh", "bash", "zsh", "dash", "ksh", "csh", "tcsh",
++		"python", "python2", "python3", "perl", "ruby", "node", "php",
++	};
++	unsigned i;
++
++	for (i = 0; i < ARRAY_SIZE(interps); i++)
++		if (strcmp(name, interps[i]) == 0)
++			return 1;
++	return 0;
++}
++
++static int comm_match(procps_status_t *p, const char *procName)
++{
++	const char *a0, *a1 = NULL;
++	int left;
++
++	if (strncmp(p->comm, procName, 15) == 0)
++		return 1;
++	if (!p->argv0 || !p->argv0[0])
++		return 0;
++	left = p->argv_len;
++	a0 = p->argv0;
++	if (strcmp(bb_basename(a0), procName) == 0)
++		return 1;
++	{
++		int l0 = strlen(a0);
++		if (l0 + 1 < left)
++			a1 = a0 + l0 + 1;
++	}
++	if (a1 && a1[0] && darwin_is_interpreter(bb_basename(a0))
++	 && strcmp(bb_basename(a1), procName) == 0
++	) {
++		return 1;
++	}
++	return 0;
++}
++#else
+ static int comm_match(procps_status_t *p, const char *procName)
+ {
+ 	int argv1idx;
+@@ -68,6 +123,7 @@ static int comm_match(procps_status_t *p, const char *procName)
+ 
+ 	return 1;
+ }
++#endif /* __APPLE__ */
+ 
+ /* This finds the pid of the specified process.
+  * Currently, it's implemented by rummaging through
+diff --git a/libbb/get_cpu_count.c b/libbb/get_cpu_count.c
+index ab468af..7e7321f 100644
+--- a/libbb/get_cpu_count.c
++++ b/libbb/get_cpu_count.c
+@@ -7,6 +7,9 @@
+  * Licensed under GPLv2, see file LICENSE in this source tree.
+  */
+ #include "libbb.h"
++#if defined(__APPLE__)
++# include <sys/sysctl.h>
++#endif
+ 
+ /* Does str start with "cpu"? */
+ int FAST_FUNC starts_with_cpu(const char *str)
+@@ -21,6 +24,13 @@ int FAST_FUNC starts_with_cpu(const char *str)
+  */
+ unsigned FAST_FUNC get_cpu_count(void)
+ {
++#if defined(__APPLE__)
++	int ncpu = 0;
++	size_t len = sizeof(ncpu);
++	if (sysctlbyname("hw.ncpu", &ncpu, &len, NULL, 0) == 0 && ncpu > 0)
++		return (unsigned)ncpu;
++	return 1;
++#else
+ 	FILE *fp;
+ 	char line[256];
+ 	int proc_nr = -1;
+@@ -44,4 +54,5 @@ unsigned FAST_FUNC get_cpu_count(void)
+ 
+ 	fclose(fp);
+ 	return proc_nr + 1;
++#endif
+ }
+diff --git a/libbb/in_ether.c b/libbb/in_ether.c
+index c9cf6a9..52ec807 100644
+--- a/libbb/in_ether.c
++++ b/libbb/in_ether.c
+@@ -10,6 +10,11 @@
+ #include <net/if_arp.h>
+ #include <net/ethernet.h>
+ 
++#if defined(__APPLE__) && !defined(ETH_ALEN)
++/* macOS has no <net/ethernet.h> ETH_ALEN; a MAC address is 6 bytes */
++# define ETH_ALEN 6
++#endif
++
+ /* Convert Ethernet address from "XX[:]XX[:]XX[:]XX[:]XX[:]XX" to sockaddr.
+  * Return nonzero on error.
+  */
+diff --git a/libbb/procps.c b/libbb/procps.c
+index de640d2..ef23ce4 100644
+--- a/libbb/procps.c
++++ b/libbb/procps.c
+@@ -81,6 +81,7 @@ static int read_to_buf(const char *filename, void *buf)
+ 	return ret;
+ }
+ 
++#if !defined(__APPLE__)
+ static procps_status_t* FAST_FUNC alloc_procps_scan(void)
+ {
+ 	procps_status_t* sp = xzalloc(sizeof(procps_status_t));
+@@ -173,6 +174,8 @@ static long fast_strtol_10(char **endptr)
+ }
+ # endif
+ 
++#endif /* !__APPLE__ */
++
+ char* FAST_FUNC skip_fields(char *str, int count)
+ {
+ 	do {
+@@ -267,6 +270,7 @@ if (memcmp(buf+4, S, sizeof(S)-1) == 0) { \
+ }
+ #endif
+ 
++#if !defined(__APPLE__)
+ procps_status_t* FAST_FUNC procps_scan(procps_status_t* sp, int flags)
+ {
+ 	if (!sp)
+@@ -654,3 +658,258 @@ int FAST_FUNC read_cmdline(char *buf, int col, unsigned pid, const char *comm)
+ 		eip,
+ the rest is some obsolete cruft
+ */
++
++#endif /* !__APPLE__ */
++
++#if defined(__APPLE__)
++/*
++ * Darwin has no /proc.  KERN_PROC_ALL gives one struct kinfo_proc per pid;
++ * KERN_PROCARGS2 gives "int argc, exec path, argv[0..argc-1], environment".
++ *
++ * Three rules learned the hard way (docs/gotchas/darwin-procps-*):
++ *  1. the iteration cursor cannot live in procps_status_t - callers memset it
++ *     per process, so the snapshot lives in a file-static iterator;
++ *  2. the argv walk must be bounded by argc AND by a byte cap AND must stop at
++ *     a "KEY=value" string, because for some processes the reported argc
++ *     overruns into the environment, which then shows up as PATH=... in ps and
++ *     makes killall match the wrong pids;
++ *  3. macOS puts the interpreter in p_comm for scripts, with the script path in
++ *     argv[1], so name matching has to look at the argv list.
++ */
++#include <sys/sysctl.h>
++#include <sys/proc.h>
++#include <libproc.h>	/* proc_pidinfo for CPU time and memory */
++
++#define DARWIN_ARGV_MAX_ARGS 24
++#define DARWIN_ARGV_MAX_BYTES 1024
++
++static struct {
++	struct kinfo_proc *procs;
++	int count;
++	int idx;
++} darwin_it;
++
++static void darwin_stop_iter(void)
++{
++	free(darwin_it.procs);
++	darwin_it.procs = NULL;
++	darwin_it.count = 0;
++	darwin_it.idx = 0;
++}
++
++static int darwin_start_iter(void)
++{
++	int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
++	size_t size = 0;
++
++	darwin_stop_iter();
++	if (sysctl(mib, 4, NULL, &size, NULL, 0) != 0 || size == 0)
++		return 0;
++	size += 64 * sizeof(struct kinfo_proc);
++	darwin_it.procs = xmalloc(size);
++	if (sysctl(mib, 4, darwin_it.procs, &size, NULL, 0) != 0) {
++		darwin_stop_iter();
++		return 0;
++	}
++	darwin_it.count = (int)(size / sizeof(struct kinfo_proc));
++	darwin_it.idx = 0;
++	return darwin_it.count > 0;
++}
++
++/* Copy argv[0..] into a fresh buffer, never reaching the environment. */
++static void darwin_fill_argv(procps_status_t *sp, unsigned pid)
++{
++	int mib[3] = { CTL_KERN, KERN_PROCARGS2, (int)pid };
++	size_t size = 0;
++	char *buf, *q, *end, *argv0, *walk;
++	int argc, n;
++	size_t len;
++
++	if (sp->argv0) {
++		free(sp->argv0);
++		sp->argv0 = NULL;
++		sp->argv_len = 0;
++	}
++	if (sysctl(mib, 3, NULL, &size, NULL, 0) != 0 || size < sizeof(int) + 4)
++		return;
++	buf = xmalloc(size);
++	if (sysctl(mib, 3, buf, &size, NULL, 0) != 0) {
++		free(buf);
++		return;
++	}
++	memcpy(&argc, buf, sizeof(int));
++	if (argc <= 0) {
++		free(buf);
++		return;
++	}
++	q = buf + sizeof(int);
++	end = buf + size;
++	while (q < end && *q)        /* exec path */
++		q++;
++	while (q < end && !*q)       /* padding to argv[0] */
++		q++;
++	if (q >= end) {
++		free(buf);
++		return;
++	}
++
++	argv0 = q;
++	walk = q;
++	n = 0;
++	while (walk < end && n < argc && n < DARWIN_ARGV_MAX_ARGS
++	    && (size_t)(walk - argv0) < DARWIN_ARGV_MAX_BYTES
++	) {
++		char *str = walk;
++		size_t slen;
++
++		while (walk < end && *walk)
++			walk++;
++		if (walk >= end)
++			break;              /* unterminated: stop here */
++		slen = (size_t)(walk - str);
++		/* environment entries look like KEY=value; argv entries do not. Rewind
++		 * before breaking: that string belongs to the environment. */
++		if (n > 0 && memchr(str, '=', slen) != NULL
++		 && !(slen > 1 && (str[0] == '-' || str[0] == '/' || str[0] == '.'))
++		) {
++			walk = str;
++			break;
++		}
++		n++;
++		walk++;                     /* past this string's NUL */
++		while (walk < end && !*walk) /* NUL padding between args */
++			walk++;
++	}
++	len = (size_t)(walk - argv0);
++	if (len == 0) {
++		free(buf);
++		return;
++	}
++	/* do not keep the padding that follows the last argument */
++	while (len > 1 && argv0[len - 1] == '\0')
++		len--;
++	if (len > 0xfffe)
++		len = 0xfffe;
++	memmove(buf, argv0, len);
++	buf[len] = '\0';
++	sp->argv0 = buf;
++	sp->argv_len = (uint16_t)len;
++}
++
++static procps_status_t* FAST_FUNC alloc_procps_scan(void)
++{
++	return xzalloc(sizeof(procps_status_t));
++}
++
++void FAST_FUNC free_procps_scan(procps_status_t* sp)
++{
++	if (!sp)
++		return;
++	free(sp->argv0);
++	free(sp->exe);
++	free(sp);
++	darwin_stop_iter();
++}
++
++procps_status_t* FAST_FUNC procps_scan(procps_status_t* sp, int flags)
++{
++	const struct kinfo_proc *kp;
++
++	if (!sp)
++		sp = alloc_procps_scan();
++	if (!darwin_it.procs && !darwin_start_iter()) {
++		free_procps_scan(sp);
++		return NULL;
++	}
++	if (darwin_it.idx >= darwin_it.count) {
++		free_procps_scan(sp);
++		return NULL;
++	}
++	kp = &darwin_it.procs[darwin_it.idx++];
++
++	sp->pid = kp->kp_proc.p_pid;
++	sp->ppid = kp->kp_eproc.e_ppid;
++	sp->pgid = kp->kp_eproc.e_pgid;
++	sp->sid = (unsigned)(uintptr_t)kp->kp_eproc.e_sess;
++	sp->uid = kp->kp_eproc.e_ucred.cr_uid;
++	sp->gid = kp->kp_eproc.e_ucred.cr_gid;
++	/* Same caveat as the PROC_PIDTBSDINFO branch below: p_stat==2 covers both
++	 * running and sleeping processes on macOS, and /bin/ps renders those as S.
++	 * This path is used when proc_pidinfo() is refused (other users' pids). */
++	switch (kp->kp_proc.p_stat) {
++	case 1: case 2: sp->state[0] = 'S'; break;
++	case 3: sp->state[0] = 'S'; break;
++	case 4: sp->state[0] = 'T'; break;
++	case 5: sp->state[0] = 'Z'; break;
++	default: sp->state[0] = '?'; break;
++	}
++	sp->state[1] = '\0';
++	safe_strncpy(sp->comm, kp->kp_proc.p_comm, COMM_LEN);
++	sp->exe = NULL;
++	/* CPU time and memory: kinfo_proc carries neither, but libproc does.
++	 * pti_total_* is nanoseconds, so convert to the clock-tick units that
++	 * top/ps expect (bb_clk_tck() is 100 on macOS); rss/vsz come in bytes
++	 * and are reported in KB, matching what Linux ps/top print. */
++	{
++		struct proc_taskinfo pti;
++		struct proc_bsdinfo pbi;
++		if (proc_pidinfo(sp->pid, PROC_PIDTASKINFO, 0, &pti, sizeof(pti)) == sizeof(pti)) {
++			unsigned hz = bb_clk_tck();
++			unsigned long long tick_ns = 1000000000ULL / (hz ? hz : 100);
++			sp->utime = (unsigned long)(pti.pti_total_user / tick_ns);
++			sp->stime = (unsigned long)(pti.pti_total_system / tick_ns);
++			sp->rss = (unsigned long)(pti.pti_resident_size >> 10);
++			sp->vsz = (unsigned long)(pti.pti_virtual_size >> 10);
++		}
++		/* kinfo_proc.p_stat reports SRUN for almost every process on modern
++		 * macOS, so top showed every process as "R".  PROC_PIDTBSDINFO
++		 * carries the real state. */
++		if (proc_pidinfo(sp->pid, PROC_PIDTBSDINFO, 0, &pbi, sizeof(pbi)) == sizeof(pbi)) {
++			/* macOS reports SRUN (2) for a sleeping process AND for one burning a
++			 * core, so the field cannot distinguish them (measured: p_stat==2
++			 * and pbi_status==2 for both).  /bin/ps prints S for those, so
++			 * follow the platform instead of calling every process running. */
++			switch (pbi.pbi_status) {
++			case 1: sp->state[0] = 'I'; break; /* SIDL  */
++			case 2: sp->state[0] = 'S'; break; /* SRUN (indistinguishable) */
++			case 3: sp->state[0] = 'S'; break; /* SSLEEP*/
++			case 4: sp->state[0] = 'T'; break; /* SSTOP */
++			case 5: sp->state[0] = 'Z'; break; /* SZOMB */
++			default: sp->state[0] = '?'; break;
++			}
++		}
++	}
++	/* always: ps needs it for COMMAND, pgrep -f for matching, and
++	 * killall/pidof ask with PSSCAN_ARGVN (a separate 1<<16 bit) */
++	(void)flags;
++	darwin_fill_argv(sp, sp->pid);
++	/* ps -o exe and lsof want the executable path; argv[0] is the closest
++	 * Darwin offers without proc_pidpath() per process */
++	if (sp->argv0 && sp->argv0[0])
++		sp->exe = xstrdup(sp->argv0);
++	return sp;
++}
++
++int FAST_FUNC read_cmdline(char *buf, int col, unsigned pid, const char *comm)
++{
++	procps_status_t sp;
++	int len;
++
++	memset(&sp, 0, sizeof(sp));
++	(void)comm;
++	darwin_fill_argv(&sp, pid);
++	if (!sp.argv0)
++		return -1;
++	len = (int)sp.argv_len;
++	if (len > col - 1)
++		len = col - 1;
++	memcpy(buf, sp.argv0, len);
++	buf[len] = '\0';
++	while (--len > 0)             /* argv strings are NUL separated */
++		if (buf[len] == '\0')
++			buf[len] = ' ';
++	free(sp.argv0);
++	return 0;
++}
++#endif /* __APPLE__ */
++
+diff --git a/miscutils/readahead.c b/miscutils/readahead.c
+index a9e6726..803c973 100644
+--- a/miscutils/readahead.c
++++ b/miscutils/readahead.c
+@@ -37,6 +37,22 @@
+ 
+ #include "libbb.h"
+ 
++
++#if defined(__APPLE__)
++/* No readahead(2) on Darwin: F_RDADVISE asks for the same thing (read into the
++ * cache without copying to user space). */
++#include <sys/fcntl.h>
++static int bb_readahead(int fd, off_t offset, off_t count)
++{
++	struct radvisory ra;
++
++	ra.ra_offset = offset;
++	ra.ra_count = (int)count;
++	return fcntl(fd, F_RDADVISE, &ra);
++}
++#define readahead(fd, off, len) bb_readahead(fd, off, len)
++#endif
++
+ int readahead_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
+ int readahead_main(int argc UNUSED_PARAM, char **argv)
+ {
+diff --git a/networking/ifconfig.c b/networking/ifconfig.c
+index 32638e2..591298b 100644
+--- a/networking/ifconfig.c
++++ b/networking/ifconfig.c
+@@ -96,6 +96,310 @@
+ //usage:       "	[up|down] ..."
+ 
+ #include "libbb.h"
++
++#if defined(__APPLE__)
++/*
++ * Darwin port.  Everything after the #else is the Linux rtnetlink/ioctl
++ * implementation, which cannot compile here (no ifr_netmask / ifr_ifindex /
++ * ifr_hwaddr, no SIOCGIFINDEX).
++ *
++ * Listing lives in display_interfaces() (networking/interface.c, getifaddrs).
++ * Setting uses the BSD ioctl family, all of which the SDK provides:
++ *
++ *   up/down        SIOCSIFFLAGS      (read-modify-write of ifr_flags)
++ *   mtu N          SIOCSIFMTU
++ *   addr[/pfx]     SIOCSIFADDR + SIOCSIFNETMASK   (in place)
++ *   alias addr     SIOCAIFADDR                    (add secondary)
++ *   -alias addr    SIOCDIFADDR                    (remove secondary)
++ *   netmask M      SIOCSIFNETMASK
++ *   broadcast B    SIOCSIFBRDADDR
++ *   pointopoint P  SIOCSIFDSTADDR
++ *   hw ether MAC   SIOCSIFLLADDR     (sockaddr_dl in ifr_addr)
++ *
++ * All of it needs root; unprivileged calls fail with EPERM, exactly as the
++ * Linux build does.
++ */
++#include <sys/sockio.h>
++#include <net/if_dl.h>
++#include <netinet/in.h>
++#include <arpa/inet.h>
++
++static int darwin_ifreq_sock(void)
++{
++	int s = socket(AF_INET, SOCK_DGRAM, 0);
++	if (s < 0)
++		bb_simple_perror_msg_and_die("socket");
++	return s;
++}
++
++/* Fill ifr_name on a fresh ifreq */
++static void darwin_ifr_init(struct ifreq *ifr, const char *name)
++{
++	memset(ifr, 0, sizeof(*ifr));
++	strncpy(ifr->ifr_name, name, IFNAMSIZ - 1);
++}
++
++static void darwin_ifr_addr(struct ifreq *ifr, const char *addr, int *prefix)
++{
++	struct sockaddr_in *sin = (struct sockaddr_in *)&ifr->ifr_addr;
++	char *slash;
++	char buf[64];
++	int plen = -1;
++
++	safe_strncpy(buf, addr, sizeof(buf));
++	slash = strchr(buf, '/');
++	if (slash) {
++		*slash = '\0';
++		plen = xatoi_positive(slash + 1);
++	}
++	memset(sin, 0, sizeof(*sin));
++	sin->sin_len = sizeof(*sin);
++	sin->sin_family = AF_INET;
++	if (inet_pton(AF_INET, buf, &sin->sin_addr) != 1)
++		bb_error_msg_and_die("invalid address: %s", buf);
++	if (prefix)
++		*prefix = plen;
++}
++
++static void darwin_ifr_mask(struct ifreq *ifr, int prefix)
++{
++	struct sockaddr_in *sin = (struct sockaddr_in *)&ifr->ifr_addr;
++	uint32_t m = prefix <= 0 ? 0 : (prefix >= 32 ? 0xffffffffU : (0xffffffffU << (32 - prefix)));
++
++	memset(sin, 0, sizeof(*sin));
++	sin->sin_len = sizeof(*sin);
++	sin->sin_family = AF_INET;
++	sin->sin_addr.s_addr = htonl(m);
++}
++
++/* An alias needs struct ifaliasreq (address + netmask + broadcast together) */
++static void darwin_alias(int s, const char *name, const char *addr, int add)
++{
++	struct ifaliasreq ifra;
++	struct sockaddr_in *sin;
++	char buf[64];
++	int prefix = -1;
++
++	memset(&ifra, 0, sizeof(ifra));
++	strncpy(ifra.ifra_name, name, IFNAMSIZ - 1);
++
++	safe_strncpy(buf, addr, sizeof(buf));
++	{
++		char *slash = strchr(buf, '/');
++		if (slash) {
++			*slash = '\0';
++			prefix = xatoi_positive(slash + 1);
++		}
++	}
++
++	sin = (struct sockaddr_in *)&ifra.ifra_addr;
++	sin->sin_len = sizeof(*sin);
++	sin->sin_family = AF_INET;
++	if (inet_pton(AF_INET, buf, &sin->sin_addr) != 1)
++		bb_error_msg_and_die("invalid address: %s", buf);
++
++	sin = (struct sockaddr_in *)&ifra.ifra_mask;
++	{
++		uint32_t m = prefix <= 0 ? 0xffffffffU
++			: (prefix >= 32 ? 0xffffffffU : (0xffffffffU << (32 - prefix)));
++		sin->sin_len = sizeof(*sin);
++		sin->sin_family = AF_INET;
++		sin->sin_addr.s_addr = htonl(m);
++	}
++
++	if (ioctl(s, add ? SIOCAIFADDR : SIOCDIFADDR, &ifra) < 0)
++		bb_perror_msg_and_die("%s %s on %s", add ? "can't add" : "can't delete",
++				buf, name);
++}
++
++static void darwin_set_hwaddr(int s, const char *name, const char *mac)
++{
++	struct ifreq ifr;
++	struct sockaddr_dl *sdl;
++	unsigned b[6];
++	int i;
++
++	darwin_ifr_init(&ifr, name);
++	/* ifr_addr is only 16 bytes (SOCKADDR size); sizeof(sockaddr_dl) is 20,
++	 * so size the structure to just the MAC bytes or the write overruns. */
++	sdl = (struct sockaddr_dl *)&ifr.ifr_addr;
++	memset(&ifr.ifr_addr, 0, sizeof(ifr.ifr_addr));
++	sdl->sdl_len = offsetof(struct sockaddr_dl, sdl_data) + 6;
++	sdl->sdl_family = AF_LINK;
++	sdl->sdl_alen = 6;
++	if (sscanf(mac, "%x:%x:%x:%x:%x:%x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6)
++		bb_error_msg_and_die("invalid MAC address: %s", mac);
++	for (i = 0; i < 6; i++)
++		sdl->sdl_data[i] = (unsigned char)b[i];
++	if (ioctl(s, SIOCSIFLLADDR, &ifr) < 0)
++		bb_perror_msg_and_die("can't set MAC address on %s", name);
++}
++
++int ifconfig_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
++int ifconfig_main(int argc UNUSED_PARAM, char **argv)
++{
++	const char *name;
++	int s;
++	int do_up = -1;         /* -1 unset, 1 up, 0 down */
++	const char *set_addr = NULL;
++	const char *set_alias = NULL;
++	const char *del_alias = NULL;
++	const char *set_mask = NULL;
++	const char *set_bcast = NULL;
++	const char *set_dst = NULL;
++	const char *set_mac = NULL;
++	int set_mtu = -1;
++	int prefix = -1;
++
++	++argv;
++	if (argv[0] && argv[0][0] == '-' && argv[0][1] == 'a' && !argv[0][2])
++		++argv;
++	if (!argv[0])
++		return display_interfaces(IFNAME_SHOW_DOWNED_TOO);
++
++	name = argv[0];
++	if (!argv[1])
++		return display_interfaces((char *)name);
++
++	/* ---- parse the rest ---- */
++	argv++;
++	while (*argv) {
++		const char *kw = *argv++;
++
++		if (strcmp(kw, "up") == 0) {
++			do_up = 1;
++		} else if (strcmp(kw, "down") == 0) {
++			do_up = 0;
++		} else if (strcmp(kw, "mtu") == 0) {
++			if (!*argv) bb_show_usage();
++			set_mtu = xatoi_positive(*argv++);
++		} else if (strcmp(kw, "netmask") == 0) {
++			if (!*argv) bb_show_usage();
++			set_mask = *argv++;
++		} else if (strcmp(kw, "broadcast") == 0) {
++			if (!*argv) bb_show_usage();
++			set_bcast = *argv++;
++		} else if (strcmp(kw, "pointopoint") == 0) {
++			if (!*argv) bb_show_usage();
++			set_dst = *argv++;
++		} else if (strcmp(kw, "alias") == 0) {
++			if (!*argv) bb_show_usage();
++			set_alias = *argv++;
++		} else if (strcmp(kw, "-alias") == 0) {
++			if (!*argv) bb_show_usage();
++			del_alias = *argv++;
++		} else if (strcmp(kw, "hw") == 0) {
++			if (!*argv) bb_show_usage();
++			if (strcmp(*argv, "ether") != 0)
++				bb_error_msg_and_die("only 'hw ether' is supported on Darwin");
++			argv++;
++			if (!*argv) bb_show_usage();
++			set_mac = *argv++;
++		} else if (strcmp(kw, "media") == 0) {
++			/* accepted but not applied; SIOCSIFMEDIA needs media words */
++			while (*argv && strcmp(*argv, "up") && strcmp(*argv, "down"))
++				argv++;
++		} else if (isdigit((unsigned char)kw[0])) {
++			set_addr = kw;
++		} else {
++			bb_error_msg_and_die("unsupported option on Darwin: %s", kw);
++		}
++	}
++
++	s = darwin_ifreq_sock();
++
++	if (set_mac)
++		darwin_set_hwaddr(s, name, set_mac);
++	if (set_alias)
++		darwin_alias(s, name, set_alias, 1);
++	if (del_alias)
++		darwin_alias(s, name, del_alias, 0);
++
++	if (set_addr) {
++		struct ifreq ifr;
++
++		darwin_ifr_init(&ifr, name);
++		darwin_ifr_addr(&ifr, set_addr, &prefix);
++		if (ioctl(s, SIOCSIFADDR, &ifr) < 0)
++			bb_perror_msg_and_die("can't set address on %s", name);
++	}
++
++	if (set_mask || prefix >= 0) {
++		struct ifreq ifr;
++
++		darwin_ifr_init(&ifr, name);
++		{
++			darwin_ifr_init(&ifr, name);
++			if (set_mask) {
++				struct sockaddr_in *sin = (struct sockaddr_in *)&ifr.ifr_addr;
++				sin->sin_len = sizeof(*sin);
++				sin->sin_family = AF_INET;
++				if (inet_pton(AF_INET, set_mask, &sin->sin_addr) != 1)
++					bb_error_msg_and_die("invalid netmask: %s", set_mask);
++			} else {
++				darwin_ifr_mask(&ifr, prefix);
++			}
++			if (ioctl(s, SIOCSIFNETMASK, &ifr) < 0)
++				bb_perror_msg_and_die("can't set netmask on %s", name);
++		}
++	}
++
++	if (set_bcast) {
++		struct ifreq ifr;
++		struct sockaddr_in *sin;
++
++		darwin_ifr_init(&ifr, name);
++		sin = (struct sockaddr_in *)&ifr.ifr_addr;
++		sin->sin_len = sizeof(*sin);
++		sin->sin_family = AF_INET;
++		if (inet_pton(AF_INET, set_bcast, &sin->sin_addr) != 1)
++			bb_error_msg_and_die("invalid broadcast: %s", set_bcast);
++		if (ioctl(s, SIOCSIFBRDADDR, &ifr) < 0)
++			bb_perror_msg_and_die("can't set broadcast on %s", name);
++	}
++
++	if (set_dst) {
++		struct ifreq ifr;
++		struct sockaddr_in *sin;
++
++		darwin_ifr_init(&ifr, name);
++		sin = (struct sockaddr_in *)&ifr.ifr_addr;
++		sin->sin_len = sizeof(*sin);
++		sin->sin_family = AF_INET;
++		if (inet_pton(AF_INET, set_dst, &sin->sin_addr) != 1)
++			bb_error_msg_and_die("invalid peer address: %s", set_dst);
++		if (ioctl(s, SIOCSIFDSTADDR, &ifr) < 0)
++			bb_perror_msg_and_die("can't set pointopoint on %s", name);
++	}
++
++	if (set_mtu > 0) {
++		struct ifreq ifr;
++
++		darwin_ifr_init(&ifr, name);
++		ifr.ifr_mtu = set_mtu;
++		if (ioctl(s, SIOCSIFMTU, &ifr) < 0)
++			bb_perror_msg_and_die("can't set mtu on %s", name);
++	}
++
++	if (do_up >= 0) {
++		struct ifreq ifr;
++
++		darwin_ifr_init(&ifr, name);
++		if (ioctl(s, SIOCGIFFLAGS, &ifr) < 0)
++			bb_perror_msg_and_die("can't read flags of %s", name);
++		if (do_up)
++			ifr.ifr_flags |= IFF_UP;
++		else
++			ifr.ifr_flags &= ~IFF_UP;
++		if (ioctl(s, SIOCSIFFLAGS, &ifr) < 0)
++			bb_perror_msg_and_die("can't change flags of %s", name);
++	}
++
++	close(s);
++	return EXIT_SUCCESS;
++}
++#else /* !__APPLE__ */
++
+ #include "inet_common.h"
+ #include <net/if.h>
+ #include <net/if_arp.h>
+@@ -364,6 +668,13 @@ int ifconfig_main(int argc UNUSED_PARAM, char **argv)
+ #endif
+ 	}
+ 
++#if defined(__APPLE__)
++	/* Darwin port is read-only: the setting path below is rtnetlink-based */
++	bb_error_msg_and_die("only listing is supported on Darwin; use "
++			"networksetup(8) or the system ifconfig(8) to change an "
++			"interface");
++#endif
++
+ 	/* Create a channel to the NET kernel. */
+ 	sockfd = xsocket(AF_INET, SOCK_DGRAM, 0);
+ 
+@@ -553,3 +864,5 @@ int ifconfig_main(int argc UNUSED_PARAM, char **argv)
+ 		close(sockfd);
+ 	return 0;
+ }
++
++#endif /* !__APPLE__ */
+diff --git a/networking/interface.c b/networking/interface.c
+index 6b6c094..e7644b1 100644
+--- a/networking/interface.c
++++ b/networking/interface.c
+@@ -34,6 +34,8 @@
+ #include "inet_common.h"
+ #include <net/if.h>
+ #include <net/if_arp.h>
++
++#if !defined(__APPLE__)
+ #ifdef HAVE_NET_ETHERNET_H
+ # include <net/ethernet.h>
+ #endif
+@@ -1078,8 +1080,188 @@ static int do_if_print(struct interface *ife, int show_downed_too)
+ 	return res;
+ }
+ 
++#endif /* !__APPLE__ */
++
++#if defined(__APPLE__)
++/*
++ * Darwin port: if_readlist() and friends speak rtnetlink, which does not exist
++ * here.  getifaddrs(3) gives everything the printer needs in one pass: the
++ * flag word, one sockaddr per address family, and ifa_data pointing at a
++ * struct if_data with the metrics (mtu, bytes, packets, errors).
++ *
++ * Output follows macOS ifconfig closely enough for grep/awk use:
++ *   en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
++ *           ether a4:83:e7:xx:xx:xx
++ *           inet 192.168.1.24 netmask 0xffffff00 broadcast 192.168.1.255
++ *           inet6 fe80::1c2b:...%en0 prefixlen 64 scopeid 0x4
++ *           status: active
++ * Setting anything is not supported (see ifconfig.c's Darwin branch).
++ */
++#include <ifaddrs.h>
++#include <net/if_dl.h>
++#include <net/if_var.h>
++
++static void darwin_print_flags(int flags)
++{
++	static const struct {
++		unsigned bit;
++		const char *name;
++	} names[] = {
++		{ IFF_UP,          "UP"          },
++		{ IFF_BROADCAST,   "BROADCAST"   },
++		{ IFF_DEBUG,       "DEBUG"       },
++		{ IFF_LOOPBACK,    "LOOPBACK"    },
++		{ IFF_POINTOPOINT, "POINTOPOINT" },
++		{ IFF_NOTRAILERS,  "NOTRAILERS"  },
++		{ IFF_RUNNING,     "RUNNING"     },
++		{ IFF_NOARP,       "NOARP"       },
++		{ IFF_PROMISC,     "PROMISC"     },
++		{ IFF_ALLMULTI,    "ALLMULTI"    },
++		{ IFF_MULTICAST,   "MULTICAST"   },
++	};
++	unsigned i;
++	int first = 1;
++
++	for (i = 0; i < ARRAY_SIZE(names); i++) {
++		if (flags & names[i].bit) {
++			if (!first)
++				bb_putchar(',');
++			fputs(names[i].name, stdout);
++			first = 0;
++		}
++	}
++}
++
++/* 0xffffff00 style netmask, the way BSD ifconfig prints it */
++static void darwin_print_netmask(const struct sockaddr *sa)
++{
++	const struct sockaddr_in *sin = (const struct sockaddr_in *)sa;
++
++	if (!sa || sa->sa_family != AF_INET)
++		return;
++	printf(" netmask 0x%08x", (unsigned)ntohl(sin->sin_addr.s_addr));
++}
++
++static int darwin_display_interfaces(char *ifname)
++{
++	struct ifaddrs *ifap, *ifa;
++	int shown = 0;
++
++	if (getifaddrs(&ifap) != 0) {
++		bb_perror_msg("getifaddrs");
++		return 1;
++	}
++
++	for (ifa = ifap; ifa; ifa = ifa->ifa_next) {
++		/* One pass per interface: only act on the AF_LINK entry, which is
++		 * the one that carries flags and if_data, then print every
++		 * address that belongs to that name. */
++		struct ifaddrs *j;
++		const struct if_data *ifd;
++
++		if (!(ifa->ifa_flags & IFF_UP) && ifa != ifap)
++			continue;
++		if (ifa->ifa_addr == NULL)
++			continue;
++		if (ifa->ifa_addr->sa_family != AF_LINK)
++			continue;
++		if (ifname && ifname != IFNAME_SHOW_DOWNED_TOO && strcmp(ifname, ifa->ifa_name) != 0)
++			continue;
++		/* skip the address families already printed for this name */
++		{
++			int dup = 0;
++			for (j = ifap; j != ifa; j = j->ifa_next) {
++				if (j->ifa_addr
++				 && j->ifa_addr->sa_family == AF_LINK
++				 && strcmp(j->ifa_name, ifa->ifa_name) == 0
++				) {
++					dup = 1;
++					break;
++				}
++			}
++			if (dup)
++				continue;
++		}
++
++		ifd = (const struct if_data *)ifa->ifa_data;
++		printf("%s: flags=%x<", ifa->ifa_name, (unsigned)ifa->ifa_flags);
++		darwin_print_flags(ifa->ifa_flags);
++		bb_putchar('>');
++		if (ifd)
++			printf(" mtu %u", (unsigned)ifd->ifi_mtu);
++		bb_putchar('\n');
++
++		for (j = ifap; j; j = j->ifa_next) {
++			if (!j->ifa_addr || strcmp(j->ifa_name, ifa->ifa_name) != 0)
++				continue;
++			switch (j->ifa_addr->sa_family) {
++			case AF_LINK: {
++				const struct sockaddr_dl *sdl = (const struct sockaddr_dl *)j->ifa_addr;
++				const unsigned char *mac;
++				if (sdl->sdl_alen != 6)
++					break;
++				mac = (const unsigned char *)LLADDR(sdl);
++				printf("\tether %02x:%02x:%02x:%02x:%02x:%02x\n",
++					mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
++				break;
++			}
++			case AF_INET: {
++				char buf[64];
++				const struct sockaddr_in *sin = (const struct sockaddr_in *)j->ifa_addr;
++				inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf));
++				printf("\tinet %s", buf);
++				darwin_print_netmask(j->ifa_netmask);
++				if (j->ifa_broadaddr && (j->ifa_flags & IFF_BROADCAST)) {
++					const struct sockaddr_in *b = (const struct sockaddr_in *)j->ifa_broadaddr;
++					inet_ntop(AF_INET, &b->sin_addr, buf, sizeof(buf));
++					printf(" broadcast %s", buf);
++				}
++				bb_putchar('\n');
++				break;
++			}
++			case AF_INET6: {
++				char buf[64];
++				const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)j->ifa_addr;
++				const unsigned char *m = ((const struct sockaddr_in6 *)j->ifa_netmask)->sin6_addr.s6_addr;
++				int plen = 0;
++				unsigned k;
++
++				for (k = 0; k < 16; k++)
++					plen += __builtin_popcount(m[k]);
++				inet_ntop(AF_INET6, &sin6->sin6_addr, buf, sizeof(buf));
++				printf("\tinet6 %s prefixlen %d\n", buf, plen);
++				break;
++			}
++			default:
++				break;
++			}
++		}
++
++		if (ifd) {
++			printf("\tstatus: %s\n", (ifa->ifa_flags & IFF_RUNNING) ? "active" : "inactive");
++			if (ifd->ifi_ibytes || ifd->ifi_obytes) {
++				printf("\t%llu bytes in, %llu bytes out\n",
++					(unsigned long long)ifd->ifi_ibytes,
++					(unsigned long long)ifd->ifi_obytes);
++			}
++		}
++		shown++;
++	}
++
++	freeifaddrs(ifap);
++	if (!shown && ifname && ifname != IFNAME_SHOW_DOWNED_TOO) {
++		bb_error_msg("no such interface: %s", ifname);
++		return 1;
++	}
++	return 0;
++}
++#endif /* __APPLE__ */
++
+ int FAST_FUNC display_interfaces(char *ifname)
+ {
++#if defined(__APPLE__)
++	return darwin_display_interfaces(ifname);
++#else
+ 	struct interface *ife;
+ 	int res;
+ 	struct iface_list ilist;
+@@ -1104,9 +1286,10 @@ int FAST_FUNC display_interfaces(char *ifname)
+ 	res = do_if_print(ife, /*show_downed_too:*/ 1);
+  ret:
+ 	return (res < 0); /* status < 0 == 1 -- error */
++#endif /* !__APPLE__ */
+ }
+ 
+-#if ENABLE_FEATURE_HWIB
++#if ENABLE_FEATURE_HWIB && !defined(__APPLE__)
+ /* Input an Infiniband address and convert to binary. */
+ int FAST_FUNC in_ib(const char *bufp, struct sockaddr *sap)
+ {
+diff --git a/networking/ip.c b/networking/ip.c
+index 02f93ad..5ad9e75 100644
+--- a/networking/ip.c
++++ b/networking/ip.c
+@@ -8,8 +8,17 @@
+  * Rani Assaf <rani@magic.metawire.com> 980929: resolve addresses
+  * Bernhard Reutner-Fischer rewrote to use index_in_substr_array
+  */
++//config:config IP_BUILD_NETLINK
++//config:	bool "Build the libiproute netlink backends"
++//config:	default y
++//config:	depends on IP || IPADDR || IPLINK || IPROUTE || IPRULE || IPTUNNEL || IPNEIGH
++//config:	help
++//config:	The rtnetlink code in networking/libiproute is Linux-only.  Turn this
++//config:	off to keep the ip applet but drop those objects (the Darwin port
++//config:	provides its own getifaddrs/NET_RT_DUMP implementation).
++//config:
+ //config:config IP
+-//config:	bool "ip (35 kb)"
++//config:	bool "ip (35 kb)
+ //config:	default y
+ //config:	help
+ //config:	The "ip" applet is a TCP/IP interface configuration and routing
+@@ -371,6 +380,582 @@
+ 
+ #include "libbb.h"
+ 
++#if defined(__APPLE__)
++/*
++ * Read-only Darwin port.  busybox's ip delegates to libiproute, which is
++ * rtnetlink throughout, so the whole thing is compiled out below and replaced
++ * by three printers built on the same two sources as ifconfig and route:
++ *
++ *   ip link   getifaddrs(3)          - flags, mtu, MAC
++ *   ip addr   getifaddrs(3)          - inet/inet6 addresses with prefixlen
++ *   ip route  sysctl(NET_RT_DUMP)    - destination/gateway/device
++ *
++ * Output follows iproute2's shape closely enough for `ip a | grep inet` and
++ * `ip route | grep default`, which is what scripts actually use.
++ */
++#include <ifaddrs.h>
++#include <net/if_dl.h>
++#include <net/if_var.h>
++#include <net/route.h>
++#include <sys/sysctl.h>
++#include <sys/sockio.h>
++#include <net/if_arp.h>
++
++static void darwin_print_flags(int flags)
++{
++	static const struct { unsigned bit; const char *name; } t[] = {
++		{ IFF_UP, "UP" }, { IFF_BROADCAST, "BROADCAST" },
++		{ IFF_LOOPBACK, "LOOPBACK" }, { IFF_RUNNING, "RUNNING" },
++		{ IFF_MULTICAST, "MULTICAST" },
++	};
++	unsigned i;
++	int first = 1;
++	for (i = 0; i < ARRAY_SIZE(t); i++) {
++		if (flags & t[i].bit) {
++			if (!first) bb_putchar(',');
++			fputs(t[i].name, stdout);
++			first = 0;
++		}
++	}
++}
++
++static int darwin_if_index(const char *name)
++{
++	struct ifaddrs *ifap, *ifa;
++	int idx = 0;
++
++	if (getifaddrs(&ifap) != 0)
++		return 0;
++	for (ifa = ifap; ifa; ifa = ifa->ifa_next) {
++		if (ifa->ifa_addr && ifa->ifa_addr->sa_family == AF_LINK
++		 && strcmp(ifa->ifa_name, name) == 0
++		) {
++			idx = if_nametoindex(name);
++			break;
++		}
++	}
++	freeifaddrs(ifap);
++	return idx;
++}
++
++/* Print "1: en0: <FLAGS> mtu 1500" style lines, one per interface. */
++static void darwin_ip_link(void)
++{
++	struct ifaddrs *ifap, *ifa;
++
++	if (getifaddrs(&ifap) != 0) {
++		bb_perror_msg_and_die("getifaddrs");
++	}
++	for (ifa = ifap; ifa; ifa = ifa->ifa_next) {
++		const struct if_data *ifd;
++		struct ifaddrs *j;
++		int dup = 0;
++
++		if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_LINK)
++			continue;
++		for (j = ifap; j != ifa; j = j->ifa_next) {
++			if (j->ifa_addr && j->ifa_addr->sa_family == AF_LINK
++			 && strcmp(j->ifa_name, ifa->ifa_name) == 0
++			) {
++				dup = 1;
++				break;
++			}
++		}
++		if (dup)
++			continue;
++
++		ifd = (const struct if_data *)ifa->ifa_data;
++		printf("%d: %s: <", darwin_if_index(ifa->ifa_name), ifa->ifa_name);
++		darwin_print_flags(ifa->ifa_flags);
++		printf(">");
++		if (ifd)
++			printf(" mtu %u", (unsigned)ifd->ifi_mtu);
++		printf(" qlen 1000\n");
++		for (j = ifap; j; j = j->ifa_next) {
++			if (j->ifa_addr && strcmp(j->ifa_name, ifa->ifa_name) == 0
++			 && j->ifa_addr->sa_family == AF_LINK
++			) {
++				const struct sockaddr_dl *sdl = (const struct sockaddr_dl *)j->ifa_addr;
++				if (sdl->sdl_alen == 6) {
++					const unsigned char *m = (const unsigned char *)LLADDR(sdl);
++					printf("    link/ether %02x:%02x:%02x:%02x:%02x:%02x\n",
++						m[0], m[1], m[2], m[3], m[4], m[5]);
++				}
++				break;
++			}
++		}
++	}
++	freeifaddrs(ifap);
++}
++
++static void darwin_ip_addr(void)
++{
++	struct ifaddrs *ifap, *ifa;
++
++	if (getifaddrs(&ifap) != 0) {
++		bb_perror_msg_and_die("getifaddrs");
++	}
++	for (ifa = ifap; ifa; ifa = ifa->ifa_next) {
++		const struct if_data *ifd;
++		struct ifaddrs *j;
++		int dup = 0;
++
++		if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_LINK)
++			continue;
++		for (j = ifap; j != ifa; j = j->ifa_next) {
++			if (j->ifa_addr && j->ifa_addr->sa_family == AF_LINK
++			 && strcmp(j->ifa_name, ifa->ifa_name) == 0
++			) {
++				dup = 1;
++				break;
++			}
++		}
++		if (dup)
++			continue;
++
++		ifd = (const struct if_data *)ifa->ifa_data;
++		printf("%d: %s: <", darwin_if_index(ifa->ifa_name), ifa->ifa_name);
++		darwin_print_flags(ifa->ifa_flags);
++		printf(">");
++		if (ifd)
++			printf(" mtu %u", (unsigned)ifd->ifi_mtu);
++		printf("\n");
++
++		for (j = ifap; j; j = j->ifa_next) {
++			char buf[64];
++			if (!j->ifa_addr || strcmp(j->ifa_name, ifa->ifa_name) != 0)
++				continue;
++			if (j->ifa_addr->sa_family == AF_INET) {
++				const struct sockaddr_in *sin = (const struct sockaddr_in *)j->ifa_addr;
++				const struct sockaddr_in *nm = (const struct sockaddr_in *)j->ifa_netmask;
++				unsigned m = nm ? ntohl(nm->sin_addr.s_addr) : 0;
++				int plen = 0;
++				while (m & 0x80000000U) { plen++; m <<= 1; }
++				inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf));
++				printf("    inet %s/%d", buf, plen);
++				if (j->ifa_flags & IFF_LOOPBACK)
++					printf(" scope host");
++				else
++					printf(" scope global %s", ifa->ifa_name);
++				if (j->ifa_broadaddr && (j->ifa_flags & IFF_BROADCAST)) {
++					const struct sockaddr_in *b = (const struct sockaddr_in *)j->ifa_broadaddr;
++					inet_ntop(AF_INET, &b->sin_addr, buf, sizeof(buf));
++					printf(" brd %s", buf);
++				}
++				printf("\n");
++			} else if (j->ifa_addr->sa_family == AF_INET6) {
++				const struct sockaddr_in6 *s6 = (const struct sockaddr_in6 *)j->ifa_addr;
++				const unsigned char *m6 = ((const struct sockaddr_in6 *)j->ifa_netmask)->sin6_addr.s6_addr;
++				int plen = 0;
++				unsigned k;
++				for (k = 0; k < 16; k++)
++					plen += __builtin_popcount(m6[k]);
++				inet_ntop(AF_INET6, &s6->sin6_addr, buf, sizeof(buf));
++				printf("    inet6 %s/%d scope global\n", buf, plen);
++			}
++		}
++	}
++	freeifaddrs(ifap);
++}
++
++static void darwin_ip_route(void)
++{
++	int mib[6] = { CTL_NET, PF_ROUTE, 0, AF_INET, NET_RT_DUMP, 0 };
++	size_t needed = 0;
++	char *buf, *lim, *next;
++
++	if (sysctl(mib, 6, NULL, &needed, NULL, 0) != 0 || needed == 0)
++		return;
++	buf = xmalloc(needed);
++	if (sysctl(mib, 6, buf, &needed, NULL, 0) != 0) {
++		free(buf);
++		return;
++	}
++	lim = buf + needed;
++	for (next = buf; next + sizeof(struct rt_msghdr) <= lim; ) {
++		struct rt_msghdr *rtm = (struct rt_msghdr *)next;
++		const struct sockaddr *sa, *dst = NULL, *gw = NULL, *mask = NULL;
++		char d[64], g[64], m[64], ifname[IFNAMSIZ];
++		int i, is_default;
++
++		if (rtm->rtm_msglen == 0)
++			break;
++		next += rtm->rtm_msglen;
++		if (rtm->rtm_version != RTM_VERSION || !(rtm->rtm_flags & RTF_UP))
++			continue;
++
++		sa = (const struct sockaddr *)(rtm + 1);
++		for (i = 0; i < RTAX_MAX; i++) {
++			if (!(rtm->rtm_addrs & (1 << i)))
++				continue;
++			if ((const char *)sa >= next)
++				break;
++			switch (i) {
++			case RTAX_DST:     dst  = sa; break;
++			case RTAX_GATEWAY: gw   = sa; break;
++			case RTAX_NETMASK: mask = sa; break;
++			default: break;
++			}
++			sa = (const struct sockaddr *)((const char *)sa
++					+ ((sa->sa_len + 3) & ~3));
++		}
++
++		/* destination */
++		is_default = (!mask || mask->sa_len <= (int)offsetof(struct sockaddr_in, sin_addr))
++			&& dst && dst->sa_family == AF_INET
++			&& ((const struct sockaddr_in *)dst)->sin_addr.s_addr == 0;
++		if (is_default) {
++			safe_strncpy(d, "default", sizeof(d));
++		} else if (dst && dst->sa_family == AF_INET) {
++			unsigned p = 0;
++			if (mask && mask->sa_len > offsetof(struct sockaddr_in, sin_addr)) {
++				unsigned mm = ntohl(((const struct sockaddr_in *)mask)->sin_addr.s_addr);
++				while (mm & 0x80000000U) { p++; mm <<= 1; }
++			}
++			inet_ntop(AF_INET, &((const struct sockaddr_in *)dst)->sin_addr, d, sizeof(d));
++			if (p)
++				sprintf(d + strlen(d), "/%u", p);
++		} else {
++			safe_strncpy(d, "?", sizeof(d));
++		}
++
++		printf("%s", d);
++		if (gw && gw->sa_family == AF_INET) {
++			inet_ntop(AF_INET, &((const struct sockaddr_in *)gw)->sin_addr, g, sizeof(g));
++			printf(" via %s", g);
++		}
++		ifname[0] = '\0';
++		if_indextoname(rtm->rtm_index, ifname);
++		if (ifname[0])
++			printf(" dev %s", ifname);
++		if (rtm->rtm_flags & RTF_GATEWAY)
++			printf(" proto static");
++		bb_putchar('\n');
++	}
++	free(buf);
++}
++
++/*
++ * --- setters ---------------------------------------------------------------
++ * link set  : SIOCSIFFLAGS / SIOCSIFMTU / SIOCSIFLLADDR
++ * addr add|del : SIOCAIFADDR / SIOCDIFADDR (with the netmask in one message)
++ * route add|del : PF_ROUTE rt_msghdr, same as the route applet
++ */
++static int darwin_ip_sock(void)
++{
++	int s = socket(AF_INET, SOCK_DGRAM, 0);
++	if (s < 0)
++		bb_simple_perror_msg_and_die("socket");
++	return s;
++}
++
++static void darwin_ip_sockaddr(struct sockaddr_in *sin, const char *addr)
++{
++	char buf[64];
++	char *slash;
++
++	safe_strncpy(buf, addr, sizeof(buf));
++	slash = strchr(buf, '/');
++	if (slash)
++		*slash = '\0';
++	memset(sin, 0, sizeof(*sin));
++	sin->sin_len = sizeof(*sin);
++	sin->sin_family = AF_INET;
++	if (inet_pton(AF_INET, buf, &sin->sin_addr) != 1)
++		bb_error_msg_and_die("invalid address: %s", buf);
++}
++
++static int darwin_ip_prefix(const char *addr, int dflt)
++{
++	const char *slash = strchr(addr, '/');
++	return slash ? xatoi_positive(slash + 1) : dflt;
++}
++
++/* ip link set dev IFACE [up|down] [mtu N] [address MAC] */
++static void darwin_ip_link_set(char **args)
++{
++	int s = darwin_ip_sock();
++	const char *dev = NULL, *mac = NULL;
++	int up = -1, mtu = -1;
++
++	while (*args) {
++		if (strcmp(*args, "dev") == 0 && args[1]) {
++			dev = *++args; args++;
++		} else if (strcmp(*args, "up") == 0) {
++			up = 1; args++;
++		} else if (strcmp(*args, "down") == 0) {
++			up = 0; args++;
++		} else if (strcmp(*args, "mtu") == 0 && args[1]) {
++			mtu = xatoi_positive(*++args); args++;
++		} else if (strcmp(*args, "address") == 0 && args[1]) {
++			mac = *++args; args++;
++		} else {
++			bb_error_msg_and_die("unsupported: ip link set %s", *args);
++		}
++	}
++	if (!dev)
++		bb_show_usage();
++
++	if (mac) {
++		struct ifreq ifr;
++		struct sockaddr_dl *sdl;
++		unsigned b[6];
++		int i;
++
++		memset(&ifr, 0, sizeof(ifr));
++		strncpy(ifr.ifr_name, dev, IFNAMSIZ - 1);
++		sdl = (struct sockaddr_dl *)&ifr.ifr_addr;
++		memset(&ifr.ifr_addr, 0, sizeof(ifr.ifr_addr));
++		sdl->sdl_len = offsetof(struct sockaddr_dl, sdl_data) + 6;
++		sdl->sdl_family = AF_LINK;
++		sdl->sdl_alen = 6;
++		if (sscanf(mac, "%x:%x:%x:%x:%x:%x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6)
++			bb_error_msg_and_die("invalid MAC: %s", mac);
++		for (i = 0; i < 6; i++)
++			sdl->sdl_data[i] = (unsigned char)b[i];
++		if (ioctl(s, SIOCSIFLLADDR, &ifr) < 0)
++			bb_perror_msg_and_die("can't set address on %s", dev);
++	}
++	if (mtu > 0) {
++		struct ifreq ifr;
++		memset(&ifr, 0, sizeof(ifr));
++		strncpy(ifr.ifr_name, dev, IFNAMSIZ - 1);
++		ifr.ifr_mtu = mtu;
++		if (ioctl(s, SIOCSIFMTU, &ifr) < 0)
++			bb_perror_msg_and_die("can't set mtu on %s", dev);
++	}
++	if (up >= 0) {
++		struct ifreq ifr;
++		memset(&ifr, 0, sizeof(ifr));
++		strncpy(ifr.ifr_name, dev, IFNAMSIZ - 1);
++		if (ioctl(s, SIOCGIFFLAGS, &ifr) < 0)
++			bb_perror_msg_and_die("can't read flags of %s", dev);
++		if (up)
++			ifr.ifr_flags |= IFF_UP;
++		else
++			ifr.ifr_flags &= ~IFF_UP;
++		if (ioctl(s, SIOCSIFFLAGS, &ifr) < 0)
++			bb_perror_msg_and_die("can't change flags of %s", dev);
++	}
++	close(s);
++}
++
++/* ip addr add|del ADDR[/PFX] dev IFACE */
++static void darwin_ip_addr_set(char **args, int add)
++{
++	int s = darwin_ip_sock();
++	const char *addr = NULL, *dev = NULL;
++	struct ifaliasreq ifra;
++	struct sockaddr_in *sin;
++	int plen;
++
++	if (*args && (*args)[0] != '-') {
++		addr = *args++;
++	}
++	while (*args) {
++		if (strcmp(*args, "dev") == 0 && args[1]) {
++			dev = *++args; args++;
++		} else if (strcmp(*args, "peer") == 0 && args[1]) {
++			args += 2;                  /* accepted, unused */
++		} else {
++			bb_error_msg_and_die("unsupported: ip addr %s", *args);
++		}
++	}
++	if (!addr || !dev)
++		bb_show_usage();
++
++	plen = darwin_ip_prefix(addr, 32);
++	memset(&ifra, 0, sizeof(ifra));
++	strncpy(ifra.ifra_name, dev, IFNAMSIZ - 1);
++
++	sin = (struct sockaddr_in *)&ifra.ifra_addr;
++	darwin_ip_sockaddr(sin, addr);
++
++	sin = (struct sockaddr_in *)&ifra.ifra_mask;
++	sin->sin_len = sizeof(*sin);
++	sin->sin_family = AF_INET;
++	sin->sin_addr.s_addr = htonl(plen >= 32 ? 0xffffffffU
++			: (plen <= 0 ? 0 : (0xffffffffU << (32 - plen))));
++
++	if (ioctl(s, add ? SIOCAIFADDR : SIOCDIFADDR, &ifra) < 0)
++		bb_perror_msg_and_die("%s %s on %s", add ? "can't add" : "can't delete", addr, dev);
++	close(s);
++}
++
++/* ip route add|del DST [via GW] [dev IFACE] */
++static void darwin_ip_route_set(char **args, int add)
++{
++	int s;
++	struct {
++		struct rt_msghdr hdr;
++		struct sockaddr_in dst;
++		struct sockaddr_in gw;
++		struct sockaddr_in mask;
++	} msg;
++	char dest[64] = "";
++	const char *gw = NULL, *dev = NULL;
++	unsigned char addrs = 0;
++	char *cp;
++	int i;
++
++	while (*args) {
++		if (strcmp(*args, "via") == 0 && args[1]) {
++			gw = *++args; args++;
++		} else if (strcmp(*args, "dev") == 0 && args[1]) {
++			dev = *++args; args++;
++		} else if (strcmp(*args, "proto") == 0 && args[1]) {
++			args += 2;
++		} else if (!dest[0]) {
++			safe_strncpy(dest, *args, sizeof(dest));
++			args++;
++		} else {
++			bb_error_msg_and_die("unsupported: ip route %s", *args);
++		}
++	}
++	if (!dest[0])
++		bb_show_usage();
++
++	s = socket(PF_ROUTE, SOCK_RAW, 0);
++	if (s < 0)
++		bb_simple_perror_msg_and_die("socket(PF_ROUTE)");
++
++	memset(&msg, 0, sizeof(msg));
++	msg.hdr.rtm_version = RTM_VERSION;
++	msg.hdr.rtm_type = add ? RTM_ADD : RTM_DELETE;
++	msg.hdr.rtm_seq = (int)getpid();
++	msg.hdr.rtm_flags = RTF_UP;
++
++	msg.dst.sin_len = sizeof(msg.dst);
++	msg.dst.sin_family = AF_INET;
++	if (strcmp(dest, "default") == 0) {
++		msg.dst.sin_addr.s_addr = 0;
++	} else {
++		darwin_ip_sockaddr(&msg.dst, dest);
++	}
++	addrs |= RTA_DST;
++
++	{
++		int plen = darwin_ip_prefix(dest, strcmp(dest, "default") == 0 ? 0 : 32);
++		if (plen <= 0 && strcmp(dest, "default") != 0)
++			plen = 32;
++		msg.mask.sin_len = sizeof(msg.mask);
++		msg.mask.sin_family = AF_INET;
++		msg.mask.sin_addr.s_addr = htonl(plen >= 32 ? 0xffffffffU
++				: (plen <= 0 ? 0 : (0xffffffffU << (32 - plen))));
++		addrs |= RTA_NETMASK;
++		if (plen == 32)
++			msg.hdr.rtm_flags |= RTF_HOST;
++	}
++
++	if (gw) {
++		msg.gw.sin_len = sizeof(msg.gw);
++		msg.gw.sin_family = AF_INET;
++		if (inet_pton(AF_INET, gw, &msg.gw.sin_addr) != 1)
++			bb_error_msg_and_die("invalid gateway: %s", gw);
++		msg.hdr.rtm_flags |= RTF_GATEWAY;
++		addrs |= RTA_GATEWAY;
++	}
++
++	msg.hdr.rtm_addrs = addrs;
++	if (dev)
++		msg.hdr.rtm_index = if_nametoindex(dev);
++
++	cp = (char *)(&msg.hdr + 1);
++	for (i = 1; i < RTAX_MAX; i++) {
++		struct sockaddr *sa;
++		int n;
++		if (!(addrs & (1 << i)))
++			continue;
++		switch (i) {
++		case RTAX_DST:     sa = (struct sockaddr *)&msg.dst; break;
++		case RTAX_GATEWAY: sa = (struct sockaddr *)&msg.gw; break;
++		case RTAX_NETMASK: sa = (struct sockaddr *)&msg.mask; break;
++		default: continue;
++		}
++		n = (sa->sa_len + 3) & ~3;
++		memcpy(cp, sa, sa->sa_len);
++		cp += n;
++	}
++	msg.hdr.rtm_msglen = (u_short)(cp - (char *)&msg);
++
++	if (write(s, &msg, msg.hdr.rtm_msglen) < 0)
++		bb_perror_msg_and_die("%s %s", add ? "add" : "delete", dest);
++	close(s);
++}
++
++static int darwin_ip_usage(void)
++{
++	bb_show_usage();
++	return 1;
++}
++
++int ip_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
++int ip_main(int argc UNUSED_PARAM, char **argv)
++{
++	char *cmd;
++	char *verb;
++	int want_link = 0, want_addr = 0, want_route = 0;
++
++	++argv;
++	/* skip common option words the way iproute2 accepts them */
++	while (*argv && (*argv)[0] == '-')
++		argv++;
++
++	if (!*argv)
++		return darwin_ip_usage();
++
++	cmd = *argv;
++	if (is_prefixed_with(cmd, "link") || strcmp(cmd, "l") == 0) {
++		want_link = 1;
++		cmd = "link";
++	} else if (is_prefixed_with(cmd, "addr") || strcmp(cmd, "a") == 0) {
++		want_addr = 1;
++		cmd = "addr";
++	} else if (is_prefixed_with(cmd, "route") || strcmp(cmd, "r") == 0
++		|| strcmp(cmd, "ro") == 0
++	) {
++		want_route = 1;
++		cmd = "route";
++	} else {
++		bb_error_msg_and_die("only 'link', 'addr' and 'route' are supported on Darwin");
++	}
++
++	/* sub-verb: show/list print, add/del/set mutate */
++	verb = argv[1];
++
++	if (want_link) {
++		if (!verb || !strcmp(verb, "show") || !strcmp(verb, "list"))
++			darwin_ip_link();
++		else if (!strcmp(verb, "set"))
++			darwin_ip_link_set(argv + 2);
++		else
++			bb_error_msg_and_die("unsupported: ip link %s", verb);
++	} else if (want_addr) {
++		if (!verb || !strcmp(verb, "show") || !strcmp(verb, "list"))
++			darwin_ip_addr();
++		else if (!strcmp(verb, "add"))
++			darwin_ip_addr_set(argv + 2, 1);
++		else if (!strcmp(verb, "del") || !strcmp(verb, "delete"))
++			darwin_ip_addr_set(argv + 2, 0);
++		else
++			bb_error_msg_and_die("unsupported: ip addr %s", verb);
++	} else if (want_route) {
++		if (!verb || !strcmp(verb, "show") || !strcmp(verb, "list"))
++			darwin_ip_route();
++		else if (!strcmp(verb, "add"))
++			darwin_ip_route_set(argv + 2, 1);
++		else if (!strcmp(verb, "del") || !strcmp(verb, "delete"))
++			darwin_ip_route_set(argv + 2, 0);
++		else
++			bb_error_msg_and_die("unsupported: ip route %s", verb);
++	}
++
++	(void)cmd;
++	return EXIT_SUCCESS;
++}
++
++#else /* !__APPLE__ */
++
+ #include "libiproute/utils.h"
+ #include "libiproute/ip_common.h"
+ 
+@@ -475,3 +1060,4 @@ int ip_main(int argc UNUSED_PARAM, char **argv)
+ 	return ip_func(argv);
+ }
+ #endif
++#endif /* !__APPLE__ */
+diff --git a/networking/libiproute/Kbuild.src b/networking/libiproute/Kbuild.src
+index d94e4c6..4fa582d 100644
+--- a/networking/libiproute/Kbuild.src
++++ b/networking/libiproute/Kbuild.src
+@@ -18,7 +18,7 @@ lib-$(CONFIG_TC) += \
+ 	ll_proto.o \
+ 	utils.o
+ 
+-lib-$(CONFIG_IP) += \
++lib-$(CONFIG_IP_BUILD_NETLINK) += \
+ 	ip_parse_common_args.o \
+ 	libnetlink.o \
+ 	ll_addr.o \
+diff --git a/networking/ping.c b/networking/ping.c
+index b7e6955..d999120 100644
+--- a/networking/ping.c
++++ b/networking/ping.c
+@@ -128,6 +128,28 @@
+ #endif
+ #include <netinet/ip_icmp.h>
+ #include "libbb.h"
++
++#if defined(__APPLE__)
++/* BSD names for the Linux ICMP types, and no struct iphdr */
++#include <netinet/ip_icmp.h>
++#define ICMP_DEST_UNREACH   ICMP_UNREACH
++#define ICMP_SOURCE_QUENCH  ICMP_SOURCEQUENCH
++#define ICMP_TIME_EXCEEDED  ICMP_TIMXCEED
++#define ICMP_PARAMETERPROB  ICMP_PARAMPROB
++#define ICMP_TIMESTAMP      ICMP_TSTAMP
++#define ICMP_TIMESTAMPREPLY ICMP_TSTAMPREPLY
++#define ICMP_INFO_REQUEST   ICMP_IREQ
++#define ICMP_INFO_REPLY     ICMP_IREQREPLY
++#define ICMP_ADDRESS        ICMP_MASKREQ
++#define ICMP_ADDRESSREPLY   ICMP_MASKREPLY
++#define iphdr ip
++/* struct ip carries ip_hl / ip_ttl instead of ihl / ttl */
++#define ihl ip_hl
++#define ttl ip_ttl
++/* BSD uses the protocol number as the socket level name */
++#define SOL_IPV6 IPPROTO_IPV6
++#endif
++
+ #include "common_bufsiz.h"
+ 
+ #ifdef __BIONIC__
+diff --git a/networking/route.c b/networking/route.c
+index 9d9b724..5f98075 100644
+--- a/networking/route.c
++++ b/networking/route.c
+@@ -37,6 +37,28 @@
+ #include <net/route.h>
+ #include <net/if.h>
+ 
++#if defined(__APPLE__)
++#include <net/if_dl.h>	/* sockaddr_dl: link-layer gateways */
++/* macOS <net/route.h> has no RTF_REINSTATE and none of the Linux-only IPv6
++ * flag bits.  The values only need to be distinct: nothing is passed to a
++ * routing socket from the read-only listing path. */
++# ifndef RTF_REINSTATE
++#  define RTF_REINSTATE  0
++# endif
++# ifndef RTF_DEFAULT
++#  define RTF_DEFAULT    0x10000000
++# endif
++# ifndef RTF_ADDRCONF
++#  define RTF_ADDRCONF   0x20000000
++# endif
++# ifndef RTF_CACHE
++#  define RTF_CACHE      0x40000000
++# endif
++# ifndef RTF_NONEXTHOP
++#  define RTF_NONEXTHOP  0x00010000
++# endif
++#endif
++
+ #include "libbb.h"
+ #include "inet_common.h"
+ 
+@@ -158,6 +180,7 @@ static int kw_lookup(const char *kwtbl, char ***pargs)
+ 
+ /* Add or delete a route, depending on action. */
+ 
++#if !defined(__APPLE__)
+ static NOINLINE void INET_setroute(int action, char **args)
+ {
+ 	/* char buffer instead of bona-fide struct avoids aliasing warning */
+@@ -344,7 +367,9 @@ static NOINLINE void INET_setroute(int action, char **args)
+ 	if (ENABLE_FEATURE_CLEAN_UP) close(skfd);
+ }
+ 
+-#if ENABLE_FEATURE_IPV6
++#endif /* !__APPLE__ */
++
++#if ENABLE_FEATURE_IPV6 && !defined(__APPLE__)
+ 
+ static NOINLINE void INET6_setroute(int action, char **args)
+ {
+@@ -446,6 +471,188 @@ static NOINLINE void INET6_setroute(int action, char **args)
+ 
+ 	if (ENABLE_FEATURE_CLEAN_UP) close(skfd);
+ }
++#endif /* !__APPLE__ */
++
++#if defined(__APPLE__)
++/*
++ * Darwin route add/delete.
++ *
++ * struct rtentry is opaque here, so ioctl(SIOCADDRT) is not available - but it
++ * is also not needed: BSD and macOS manage the table through a PF_ROUTE
++ * socket, writing struct rt_msghdr messages.  That is exactly what the system
++ * route(8) does.  Requires root, like every other mutating networking call.
++ *
++ *   route add -net 10.0.0.0/8 gw 192.168.1.1 dev en0
++ *   route add default gw 192.168.1.1
++ *   route del -net 10.0.0.0/8
++ */
++#define BB_RTM_MAXMSG 512
++
++static void darwin_route_set(int action, char **args)
++{
++	int s;
++	struct {
++		struct rt_msghdr hdr;
++		struct sockaddr_in dst;
++		struct sockaddr_in gw;
++		struct sockaddr_in mask;
++	} msg;
++	char dest[64] = "";
++	char *gw = NULL, *dev = NULL, *mask = NULL;
++	int is_host = 0;
++	unsigned char addrs = 0;
++	struct sockaddr_dl *sdl_gw;
++	int n;
++
++	/* --- parse: [-net|-host] DEST [gw GW] [dev DEV] [netmask M] --- */
++	while (*args) {
++		if (strcmp(*args, "-net") == 0 || strcmp(*args, "#net") == 0) {
++			is_host = 0;
++			args++;
++		} else if (strcmp(*args, "-host") == 0 || strcmp(*args, "#host") == 0) {
++			is_host = 1;
++			args++;
++		} else if (strcmp(*args, "gw") == 0 && args[1]) {
++			gw = *++args;
++			args++;
++		} else if (strcmp(*args, "dev") == 0 && args[1]) {
++			dev = *++args;
++			args++;
++		} else if (strcmp(*args, "netmask") == 0 && args[1]) {
++			mask = *++args;
++			args++;
++		} else if (strcmp(*args, "metric") == 0 && args[1]) {
++			args += 2;                 /* accepted, not applicable */
++		} else if (strcmp(*args, "default") == 0) {
++			safe_strncpy(dest, "0.0.0.0", sizeof(dest));
++			addrs = 1;
++			args++;
++		} else if (!dest[0] && !addrs) {
++			char *slash;
++			safe_strncpy(dest, *args, sizeof(dest));
++			slash = strchr(dest, '/');
++			if (slash) {
++				*slash = '\0';
++				mask = NULL;       /* prefix length handled below */
++				/* remember prefix in a spare slot */
++				safe_strncpy(msg.mask.sin_zero, slash + 1,
++						sizeof(msg.mask.sin_zero));
++			}
++			args++;
++		} else {
++			bb_error_msg_and_die("unsupported route argument on Darwin: %s", *args);
++		}
++	}
++
++	if (!dest[0])
++		bb_show_usage();
++
++	s = socket(PF_ROUTE, SOCK_RAW, 0);
++	if (s < 0)
++		bb_simple_perror_msg_and_die("socket(PF_ROUTE)");
++
++	memset(&msg, 0, sizeof(msg));
++	msg.hdr.rtm_version = RTM_VERSION;
++	msg.hdr.rtm_type = (action == RTACTION_ADD) ? RTM_ADD : RTM_DELETE;
++	msg.hdr.rtm_seq = (int)getpid();
++
++	/* destination */
++	msg.dst.sin_len = sizeof(msg.dst);
++	msg.dst.sin_family = AF_INET;
++	if (inet_pton(AF_INET, dest, &msg.dst.sin_addr) != 1)
++		bb_error_msg_and_die("invalid destination: %s", dest);
++	addrs |= RTA_DST;
++
++	msg.hdr.rtm_flags = RTF_UP;
++	if (is_host)
++		msg.hdr.rtm_flags |= RTF_HOST;
++
++	/* gateway: either an IPv4 address or a link (dev) */
++	if (gw) {
++		if (strncmp(gw, "link", 4) == 0) {
++			sdl_gw = (struct sockaddr_dl *)&msg.gw;
++			sdl_gw->sdl_len = offsetof(struct sockaddr_dl, sdl_data) + 6;
++			sdl_gw->sdl_family = AF_LINK;
++			sdl_gw->sdl_index = dev ? if_nametoindex(dev) : 0;
++			sdl_gw->sdl_alen = 6;
++		} else {
++			msg.gw.sin_len = sizeof(msg.gw);
++			msg.gw.sin_family = AF_INET;
++			if (inet_pton(AF_INET, gw, &msg.gw.sin_addr) != 1)
++				bb_error_msg_and_die("invalid gateway: %s", gw);
++			msg.hdr.rtm_flags |= RTF_GATEWAY;
++		}
++		addrs |= RTA_GATEWAY;
++	}
++
++	if (mask) {
++		msg.mask.sin_len = sizeof(msg.mask);
++		msg.mask.sin_family = AF_INET;
++		if (inet_pton(AF_INET, mask, &msg.mask.sin_addr) != 1)
++			bb_error_msg_and_die("invalid netmask: %s", mask);
++		addrs |= RTA_NETMASK;
++	} else if (msg.mask.sin_zero[0]) {
++		/* prefix length captured during parsing */
++		int plen = xatoi_positive(msg.mask.sin_zero);
++		uint32_t m = plen >= 32 ? 0xffffffffU
++			: (plen <= 0 ? 0 : (0xffffffffU << (32 - plen)));
++		msg.mask.sin_len = sizeof(msg.mask);
++		msg.mask.sin_family = AF_INET;
++		msg.mask.sin_addr.s_addr = htonl(m);
++		addrs |= RTA_NETMASK;
++	} else if (!is_host && msg.dst.sin_addr.s_addr != 0) {
++		/* -net without a mask: classful default, as route(8) does */
++		uint32_t d = ntohl(msg.dst.sin_addr.s_addr);
++		uint32_t m = (d < 0x80000000U) ? 0xff000000U
++			: (d < 0xc0000000U) ? 0xffff0000U : 0xffffff00U;
++		msg.mask.sin_len = sizeof(msg.mask);
++		msg.mask.sin_family = AF_INET;
++		msg.mask.sin_addr.s_addr = htonl(m);
++		addrs |= RTA_NETMASK;
++	}
++
++	msg.hdr.rtm_addrs = addrs;
++	if (dev)
++		msg.hdr.rtm_index = if_nametoindex(dev);
++
++	/* lay out the sockaddrs in RTA_* order, rounding each to 4 bytes */
++	{
++		char *cp = (char *)(&msg.hdr + 1);
++		int i;
++		struct sockaddr *sa;
++
++		for (i = 1; i < RTAX_MAX; i++) {
++			if (!(addrs & (1 << i)))
++				continue;
++			switch (i) {
++			case RTAX_DST:     sa = (struct sockaddr *)&msg.dst; break;
++			case RTAX_GATEWAY: sa = (struct sockaddr *)&msg.gw; break;
++			case RTAX_NETMASK: sa = (struct sockaddr *)&msg.mask; break;
++			default: continue;
++			}
++			n = (sa->sa_len + 3) & ~3;
++			memcpy(cp, sa, sa->sa_len);
++			cp += n;
++		}
++		msg.hdr.rtm_msglen = (u_short)(cp - (char *)&msg);
++	}
++
++	if (write(s, &msg, msg.hdr.rtm_msglen) < 0)
++		bb_perror_msg_and_die("%s %s", action == RTACTION_ADD ? "add" : "delete", dest);
++	close(s);
++}
++
++static NOINLINE void INET_setroute(int action, char **args)
++{
++	darwin_route_set(action, args);
++}
++
++# if ENABLE_FEATURE_IPV6
++static NOINLINE void INET6_setroute(int action UNUSED_PARAM, char **args UNUSED_PARAM)
++{
++	bb_error_msg_and_die("IPv6 routes are not supported on Darwin");
++}
++# endif
+ #endif
+ 
+ static const
+@@ -487,6 +694,119 @@ static void set_flags(char *flagstr, int flags)
+ 	}
+ }
+ 
++#if defined(__APPLE__)
++/*
++ * Darwin port.  /proc/net/route does not exist; the table comes from
++ * sysctl(NET_RT_DUMP) over PF_ROUTE, one variable-length struct rt_msghdr per
++ * route followed by its sockaddrs.  RTAX_DST / RTAX_GATEWAY / RTAX_NETMASK are
++ * only present when their bit is set in rtm_addrs, and each sockaddr is padded
++ * to sizeof(uint32_t), so the walk must round every step.
++ *
++ * Also used by netstat, hence living here rather than in route.c's main.
++ */
++#include <sys/sysctl.h>
++#include <net/route.h>
++
++#define BB_SA_ROUNDUP(sa) \
++	(((sa)->sa_len + sizeof(uint32_t) - 1) & ~(sizeof(uint32_t) - 1))
++
++static void darwin_ntop(char *out, size_t outlen, const struct sockaddr *sa,
++		int noresolve, int is_mask)
++{
++	if (!sa) {
++		safe_strncpy(out, is_mask ? "0.0.0.0" : "*", outlen);
++		return;
++	}
++	if (sa->sa_family == AF_INET) {
++		const struct sockaddr_in *sin = (const struct sockaddr_in *)sa;
++		inet_ntop(AF_INET, &sin->sin_addr, out, outlen);
++		return;
++	}
++	if (is_mask && sa->sa_len > offsetof(struct sockaddr_in, sin_addr)) {
++		/* BSD sends netmask sockaddrs with sa_family == 0, but the address
++		 * bytes are still there; a zero-length one means /0. */
++		const struct sockaddr_in *sin = (const struct sockaddr_in *)sa;
++		inet_ntop(AF_INET, &sin->sin_addr, out, outlen);
++		return;
++	}
++	if (sa->sa_family == AF_LINK) {
++		safe_strncpy(out, "link", outlen);
++		return;
++	}
++	/* An unknown/empty mask sockaddr means a /0 route (the default route). */
++	safe_strncpy(out, is_mask ? "0.0.0.0" : "?", outlen);
++}
++
++void FAST_FUNC bb_displayroutes(int noresolve, int netstatfmt)
++{
++	int mib[6] = { CTL_NET, PF_ROUTE, 0, AF_INET, NET_RT_DUMP, 0 };
++	size_t needed = 0;
++	char *buf, *lim, *next;
++
++	printf("Kernel IP routing table\n"
++		"Destination     Gateway         Genmask         Flags %s Iface\n",
++			netstatfmt ? "  MSS Window  irtt" : "Metric Ref    Use");
++
++	if (sysctl(mib, 6, NULL, &needed, NULL, 0) != 0 || needed == 0)
++		return;
++	buf = xmalloc(needed);
++	if (sysctl(mib, 6, buf, &needed, NULL, 0) != 0) {
++		free(buf);
++		bb_simple_perror_msg_and_die("NET_RT_DUMP");
++	}
++	lim = buf + needed;
++
++	for (next = buf; next + sizeof(struct rt_msghdr) <= lim; ) {
++		struct rt_msghdr *rtm = (struct rt_msghdr *)next;
++		const struct sockaddr *sa, *dst = NULL, *gw = NULL, *mask = NULL;
++		char dest[64], gate[64], netmask[64], flags[16], ifname[IFNAMSIZ];
++		int i;
++
++		if (rtm->rtm_msglen == 0)
++			break;
++		next += rtm->rtm_msglen;
++		if (rtm->rtm_version != RTM_VERSION)
++			continue;
++		if (!(rtm->rtm_flags & RTF_UP))
++			continue;
++
++		sa = (const struct sockaddr *)(rtm + 1);
++		for (i = 0; i < RTAX_MAX; i++) {
++			if (!(rtm->rtm_addrs & (1 << i)))
++				continue;
++			if ((const char *)sa >= next)
++				break;
++			switch (i) {
++			case RTAX_DST:     dst  = sa; break;
++			case RTAX_GATEWAY: gw   = sa; break;
++			case RTAX_NETMASK: mask = sa; break;
++			default: break;
++			}
++			sa = (const struct sockaddr *)((const char *)sa + BB_SA_ROUNDUP(sa));
++		}
++
++		darwin_ntop(dest, sizeof(dest), dst, noresolve, 0);
++		darwin_ntop(gate, sizeof(gate), gw, noresolve, 0);
++		darwin_ntop(netmask, sizeof(netmask), mask, noresolve, 1);
++
++		set_flags(flags, (rtm->rtm_flags & IPV4_MASK));
++#ifdef RTF_REJECT
++		if (rtm->rtm_flags & RTF_REJECT)
++			flags[0] = '!';
++#endif
++		ifname[0] = '\0';
++		if_indextoname(rtm->rtm_index, ifname);
++
++		printf("%-15.15s %-15.15s %-16s%-6s", dest, gate, netmask, flags);
++		if (netstatfmt)
++			printf("%5d %-5d %6d %s\n", 0, 0, 0, ifname);
++		else
++			printf("%-6d %-2d %7d %s\n", rtm->rtm_flags & 0xff ? 0 : 0, 0, 0, ifname);
++	}
++	free(buf);
++}
++#else /* !__APPLE__ */
++
+ /* also used in netstat */
+ void FAST_FUNC bb_displayroutes(int noresolve, int netstatfmt)
+ {
+@@ -553,6 +873,8 @@ void FAST_FUNC bb_displayroutes(int noresolve, int netstatfmt)
+ 	fclose(fp);
+ }
+ 
++#endif /* !__APPLE__ */
++
+ #if ENABLE_FEATURE_IPV6
+ 
+ static void INET6_displayroutes(void)
+diff --git a/procps/free.c b/procps/free.c
+index d0c849b..df98f72 100644
+--- a/procps/free.c
++++ b/procps/free.c
+@@ -52,6 +52,7 @@
+ //NB: if we implement -s or -c, need to stop being NOFORK!
+ 
+ #include "libbb.h"
++#include "sysinfo_compat.h"
+ #ifdef __linux__
+ # include <sys/sysinfo.h>
+ #endif
+@@ -150,6 +151,17 @@ int free_main(int argc UNUSED_PARAM, char **argv IF_NOT_DESKTOP(UNUSED_PARAM))
+ 
+ 	sysinfo(&info);
+ 	/* Extract cached and memavailable from /proc/meminfo and convert to mem_units */
++#if defined(__APPLE__)
++	/* No /proc/meminfo on Darwin.  "buff/cache" must be the same quantity
++	 * vmstat's "cache" and top's "cached" show, i.e. buffers (wired+purgeable,
++	 * which sysinfo() calls bufferram) plus the reclaimable page cache
++	 * (inactive+purgeable), or the three tools disagree about the same machine. */
++	G.mem_unit = (info.mem_unit ? info.mem_unit : 1);
++	available = info.freeram;
++	cached = info.bufferram + bb_darwin_cached_bytes();
++	cached_plus_free = cached + info.freeram;
++	seen_available = 1;
++#else
+ 	seen_available = parse_meminfo(&G);
+ 	G.mem_unit = (info.mem_unit ? info.mem_unit : 1); /* kernels < 2.4.x return mem_unit==0, so cope */
+ 	available = ((unsigned long long) G.available_kb * 1024) / G.mem_unit;
+@@ -157,6 +169,7 @@ int free_main(int argc UNUSED_PARAM, char **argv IF_NOT_DESKTOP(UNUSED_PARAM))
+ 	cached += info.bufferram;
+ 	cached += ((unsigned long long) G.reclaimable_kb * 1024) / G.mem_unit;
+ 	cached_plus_free = cached + info.freeram;
++#endif
+ 
+ 	printf("%12s%12s%12s",
+ 		scale(&G, info.totalram),                //total
+diff --git a/procps/fuser.c b/procps/fuser.c
+index f72552f..9980bd3 100644
+--- a/procps/fuser.c
++++ b/procps/fuser.c
+@@ -268,6 +268,67 @@ static smallint scan_recursive(const char *path)
+ 	return retval;
+ }
+ 
++#if defined(__APPLE__)
++/*
++ * No /proc/PID/{cwd,exe,root,fd}: walk the descriptors with libproc instead and
++ * match by `dev`/`ino` exactly like the /proc version does.  `-m` (maps) and
++ * PORT/PROTO arguments have no equivalent here and say so rather than dying.
++ */
++#include <libproc.h>
++
++#define FUSER_MAX_FDS 512
++
++static int darwin_fuser_scan(void)
++{
++	procps_status_t *proc = NULL;
++	pid_t self = getpid();
++	int found = 0;
++
++	while ((proc = procps_scan(proc, PSSCAN_PID | PSSCAN_ARGV0)) != NULL) {
++		struct proc_fdinfo fds[FUSER_MAX_FDS];
++		int nfds, i, hit = 0;
++
++		if (proc->pid == 0 || proc->pid == (unsigned)self)
++			continue;
++		nfds = proc_pidinfo((int)proc->pid, PROC_PIDLISTFDS, 0,
++				fds, sizeof(fds));
++		if (nfds <= 0)
++			continue;
++		nfds /= (int)sizeof(fds[0]);
++		for (i = 0; i < nfds && !hit; i++) {
++			struct vnode_fdinfowithpath vp;
++			struct stat st;
++
++			if (fds[i].proc_fdtype != PROX_FDTYPE_VNODE)
++				continue;
++			if (proc_pidfdinfo((int)proc->pid, fds[i].proc_fd,
++					PROC_PIDFDVNODEPATHINFO,
++					&vp, sizeof(vp)) <= 0
++			) {
++				continue;
++			}
++			if (stat(vp.pvip.vip_path, &st) == 0
++			 && search_dev_inode(&st)
++			) {
++				hit = 1;
++			}
++		}
++		if (!hit)
++			continue;
++		if (option_mask32 & OPT_KILL) {
++			if (kill((pid_t)proc->pid, G.killsig) != 0) {
++				bb_perror_msg("kill pid %u", proc->pid);
++				G.kill_failed = 1;
++			}
++		}
++		if (!(option_mask32 & OPT_SILENT))
++			printf("%u ", proc->pid);
++		found = 1;
++	}
++	return found;
++}
++#endif /* __APPLE__ */
++
+ int fuser_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
+ int fuser_main(int argc UNUSED_PARAM, char **argv)
+ {
+@@ -309,12 +370,21 @@ int fuser_main(int argc UNUSED_PARAM, char **argv)
+ 		char path[sizeof("/proc/net/TCP6")];
+ 
+ 		strcpy(path, "/proc/net/");
++#if defined(__APPLE__)
++		if (sscanf(*pp, "%u/%4s", &port, path + sizeof("/proc/net/")-1) == 2) {
++			bb_error_msg("skipping '%s': PORT/PROTO needs /proc/net", *pp);
++			pp++;
++			continue;
++		}
++#else
+ 		if (sscanf(*pp, "%u/%4s", &port, path + sizeof("/proc/net/")-1) == 2
+ 		 && access(path, R_OK) == 0
+ 		) {
+ 			/* PORT/PROTO */
+ 			scan_proc_net_or_maps(path, port);
+-		} else {
++		} else
++#endif
++		{
+ 			/* FILE */
+ 			struct stat statbuf;
+ 			xstat(*pp, &statbuf);
+@@ -323,7 +393,11 @@ int fuser_main(int argc UNUSED_PARAM, char **argv)
+ 		pp++;
+ 	}
+ 
++#if defined(__APPLE__)
++	if (darwin_fuser_scan()) {
++#else
+ 	if (scan_recursive("/proc")) {
++#endif
+ 		if (!(option_mask32 & OPT_SILENT))
+ 			bb_putchar('\n');
+ 		return G.kill_failed;
+diff --git a/procps/iostat.c b/procps/iostat.c
+index d315775..5263a83 100644
+--- a/procps/iostat.c
++++ b/procps/iostat.c
+@@ -16,6 +16,18 @@
+ 
+ //kbuild:lib-$(CONFIG_IOSTAT) += iostat.o
+ 
++#if defined(__APPLE__)
++/* These MUST precede libbb.h.  libbb.h does `#define setlocale(x,y) ((void)0)`
++ * when locale support is off, and CoreFoundation pulls in <locale.h>, whose
++ * `setlocale` prototype would then be macro-expanded into a syntax error.
++ * Including <locale.h> first parses the declaration before the macro exists. */
++#include <locale.h>
++#include <CoreFoundation/CoreFoundation.h>
++#include <IOKit/IOKitLib.h>
++#include <IOKit/IOBSD.h>
++#include <IOKit/storage/IOBlockStorageDriver.h>
++#endif
++
+ #include "libbb.h"
+ #include <sys/utsname.h>  /* struct utsname */
+ 
+@@ -144,8 +156,169 @@ static void print_timestamp(void)
+ 	puts(buf);
+ }
+ 
++#if defined(__APPLE__)
++/* defined below the /proc helpers, but used by the Darwin collector */
++static stats_dev_t *stats_dev_find_or_new(const char *dev_name);
++static void print_stats_dev_struct(stats_dev_t *stats_dev, cputime_t itv);
++#endif
++
++#if defined(__APPLE__)
++/*
++ * Darwin port.  Three /proc files to replace:
++ *   /proc/uptime   -> KERN_BOOTTIME
++ *   /proc/stat     -> host_statistics(HOST_CPU_LOAD_INFO)
++ *   /proc/diskstats-> IOKit IOBlockStorageDriver "Statistics"
++ *
++ * IOKit is a public framework present on every supported macOS, so the Darwin
++ * link line adds "-framework IOKit" (see build.sh).  Key names come from
++ * <IOKit/storage/IOBlockStorageDriver.h>; the BSD name lives on the driver's
++ * child IOMedia object, not on the driver itself.
++ */
++#include <mach/mach.h>
++#include <mach/host_info.h>
++#include <sys/sysctl.h>
++
++static cputime_t iostat_uptime_darwin(void)
++{
++	struct timeval boot, now;
++	size_t len = sizeof(boot);
++	int mib[2] = { CTL_KERN, KERN_BOOTTIME };
++
++	if (sysctl(mib, 2, &boot, &len, NULL, 0) != 0)
++		return 0;
++	gettimeofday(&now, NULL);
++	if (now.tv_sec <= boot.tv_sec)
++		return 0;
++	return (cputime_t)(now.tv_sec - boot.tv_sec) * G.clk_tck;
++}
++
++static void iostat_cpu_darwin(stats_cpu_t *sc)
++{
++	host_cpu_load_info_data_t ci;
++	mach_msg_type_number_t count = HOST_CPU_LOAD_INFO_COUNT;
++
++	memset(sc, 0, sizeof(*sc));
++	if (host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO,
++			(host_info_t)&ci, &count) != KERN_SUCCESS
++	) {
++		return;
++	}
++	sc->vector[STATS_CPU_USER]   = ci.cpu_ticks[CPU_STATE_USER];
++	sc->vector[STATS_CPU_NICE]   = ci.cpu_ticks[CPU_STATE_NICE];
++	sc->vector[STATS_CPU_SYSTEM] = ci.cpu_ticks[CPU_STATE_SYSTEM];
++	sc->vector[STATS_CPU_IDLE]   = ci.cpu_ticks[CPU_STATE_IDLE];
++	/* GLOBAL_UPTIME is the sum of all per-state ticks (this is what the
++	 * /proc parser stores), and SMP_UPTIME is the wall-clock uptime.  Both
++	 * feed get_interval(); leaving them zero makes every rate divide by 1. */
++	sc->vector[GLOBAL_UPTIME] = sc->vector[STATS_CPU_USER]
++		+ sc->vector[STATS_CPU_NICE]
++		+ sc->vector[STATS_CPU_SYSTEM]
++		+ sc->vector[STATS_CPU_IDLE];
++	sc->vector[SMP_UPTIME] = iostat_uptime_darwin();
++}
++
++/* Read one unsigned 64-bit counter out of the Statistics dictionary. */
++static unsigned long long darwin_stat(CFDictionaryRef dict, CFStringRef key)
++{
++	CFNumberRef num;
++	long long v = 0;
++
++	if (!dict || CFGetTypeID(dict) != CFDictionaryGetTypeID())
++		return 0;
++	num = (CFNumberRef)CFDictionaryGetValue(dict, key);
++	if (!num || CFGetTypeID(num) != CFNumberGetTypeID())
++		return 0;
++	if (!CFNumberGetValue(num, kCFNumberLongLongType, &v))
++		return 0;
++	return (unsigned long long)v;
++}
++
++static void do_disk_statistics_darwin(cputime_t itv)
++{
++	io_iterator_t iter = 0;
++	io_object_t drv;
++	CFMutableDictionaryRef match;
++
++	match = IOServiceMatching(kIOBlockStorageDriverClass);
++	if (!match)
++		return;
++	if (IOServiceGetMatchingServices(kIOMasterPortDefault, match, &iter) != KERN_SUCCESS)
++		return;
++
++	while ((drv = IOIteratorNext(iter)) != 0) {
++		CFDictionaryRef stats;
++		io_iterator_t kids = 0;
++		io_object_t kid;
++		char dev_name[MAX_DEVICE_NAME + 1];
++		stats_dev_data_t *curr_data;
++		stats_dev_t *stats_dev;
++
++		dev_name[0] = '\0';
++		if (IORegistryEntryGetChildIterator(drv, kIOServicePlane, &kids) == KERN_SUCCESS) {
++			while ((kid = IOIteratorNext(kids)) != 0) {
++				CFTypeRef bsd = IORegistryEntryCreateCFProperty(kid,
++						CFSTR(kIOBSDNameKey), kCFAllocatorDefault, 0);
++				if (bsd) {
++					if (CFGetTypeID(bsd) == CFStringGetTypeID())
++						CFStringGetCString(bsd, dev_name, sizeof(dev_name),
++								kCFStringEncodingUTF8);
++					CFRelease(bsd);
++				}
++				IOObjectRelease(kid);
++				if (dev_name[0])
++					break;
++			}
++			IOObjectRelease(kids);
++		}
++		if (!dev_name[0]) {
++			IOObjectRelease(drv);
++			continue;
++		}
++		/* The -x list uses whole-disk names like the /proc version */
++		if (G.dev_name_list && !llist_find_str(G.dev_name_list, dev_name)) {
++			IOObjectRelease(drv);
++			continue;
++		}
++
++		stats = (CFDictionaryRef)IORegistryEntryCreateCFProperty(drv,
++				CFSTR(kIOBlockStorageDriverStatisticsKey),
++				kCFAllocatorDefault, 0);
++
++		stats_dev = stats_dev_find_or_new(dev_name);
++		curr_data = &stats_dev->curr_data;
++		curr_data->rd_sectors = darwin_stat(stats,
++				CFSTR(kIOBlockStorageDriverStatisticsBytesReadKey)) >> 9;
++		curr_data->wr_sectors = darwin_stat(stats,
++				CFSTR(kIOBlockStorageDriverStatisticsBytesWrittenKey)) >> 9;
++		curr_data->rd_ops = (unsigned long)darwin_stat(stats,
++				CFSTR(kIOBlockStorageDriverStatisticsReadsKey));
++		curr_data->wr_ops = (unsigned long)darwin_stat(stats,
++				CFSTR(kIOBlockStorageDriverStatisticsWritesKey));
++		if (stats)
++			CFRelease(stats);
++
++		if (!G.dev_name_list
++		 && !G.show_all
++		 && curr_data->rd_ops == 0
++		 && curr_data->wr_ops == 0
++		) {
++			IOObjectRelease(drv);
++			continue;
++		}
++
++		print_stats_dev_struct(stats_dev, itv);
++		stats_dev->prev_data = *curr_data;
++		IOObjectRelease(drv);
++	}
++	IOObjectRelease(iter);
++}
++#endif /* __APPLE__ */
++
+ static cputime_t get_smp_uptime(void)
+ {
++#if defined(__APPLE__)
++	return iostat_uptime_darwin();
++#endif
+ 	FILE *fp;
+ 	unsigned long sec, dec;
+ 
+@@ -162,6 +335,10 @@ static cputime_t get_smp_uptime(void)
+ /* Fetch CPU statistics from /proc/stat */
+ static void get_cpu_statistics(stats_cpu_t *sc)
+ {
++#if defined(__APPLE__)
++	iostat_cpu_darwin(sc);
++	return;
++#endif
+ 	FILE *fp;
+ 	char buf[1024];
+ 
+@@ -319,6 +496,10 @@ static void stats_dev_free(stats_dev_t *stats_dev)
+ 
+ static void do_disk_statistics(cputime_t itv)
+ {
++#if defined(__APPLE__)
++	do_disk_statistics_darwin(itv);
++	return;
++#endif
+ 	char buf[128];
+ 	char dev_name[MAX_DEVICE_NAME + 1];
+ 	unsigned long long rd_sec_or_dummy;
+diff --git a/procps/lsof.c b/procps/lsof.c
+index 57e385c..37edecc 100644
+--- a/procps/lsof.c
++++ b/procps/lsof.c
+@@ -29,18 +29,69 @@
+  *
+  * COMMAND    PID USER   FD   TYPE             DEVICE     SIZE       NODE NAME
+  * init         1 root  cwd    DIR                8,5     4096          2 /
+- * init         1 root  rtd    DIR                8,5     4096          2 /
+  * init         1 root  txt    REG                8,5   872400      63408 /app/busybox-1.19.2/busybox
+- * rpc.portm 1064 root  mem    REG                8,5    43494      47451 /app/glibc-2.11/lib/libnss_files-2.11.so
+  * rpc.portm 1064 root    3u  IPv4               2178                 UDP *:111
+- * rpc.portm 1064 root    4u  IPv4               1244                 TCP *:111 (LISTEN)
+  * runsvdir  1116 root    0r   CHR                1,3                1214 /dev/null
+- * runsvdir  1116 root    1w   CHR                1,3                1214 /dev/null
+- * runsvdir  1116 root    2w   CHR                1,3                1214 /dev/null
+- * runsvdir  1116 root    3r   DIR                8,6     1560      58359 /.local/var/service
+  * gpm       1128 root    4u  unix 0xffff88007c09ccc0                1302 /dev/gpmctl
+  */
+ 
++#if defined(__APPLE__)
++/*
++ * No /proc/PID/fd and no /proc/PID/exe on Darwin.  libproc provides both:
++ *   proc_pidinfo(PID, PROC_PIDLISTFDS)             -> the descriptor list
++ *   proc_pidfdinfo(PID, fd, PROC_PIDFDVNODEPATHINFO) -> a vnode's path
++ * Sockets and pipes have no path, so - as with the /proc version, which only
++ * printed resolvable symlinks - they are skipped.
++ */
++#include <libproc.h>
++
++#define LSOF_MAX_FDS 512
++
++static const char *lsof_exe(procps_status_t *p)
++{
++	return p->exe ? p->exe : (p->argv0 ? p->argv0 : p->comm);
++}
++
++int lsof_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
++int lsof_main(int argc UNUSED_PARAM, char **argv UNUSED_PARAM)
++{
++	procps_status_t *proc = NULL;
++	pid_t self = getpid();
++
++	while ((proc = procps_scan(proc, PSSCAN_PID | PSSCAN_ARGV0)) != NULL) {
++		struct proc_fdinfo fds[LSOF_MAX_FDS];
++		int nfds, i;
++
++		if (proc->pid == 0 || proc->pid == (unsigned)self)
++			continue;
++		nfds = proc_pidinfo((int)proc->pid, PROC_PIDLISTFDS, 0,
++				fds, sizeof(fds));
++		if (nfds <= 0)
++			continue;
++		nfds /= (int)sizeof(fds[0]);
++		for (i = 0; i < nfds; i++) {
++			struct vnode_fdinfowithpath vp;
++
++			if (fds[i].proc_fdtype != PROX_FDTYPE_VNODE)
++				continue;
++			if (proc_pidfdinfo((int)proc->pid, fds[i].proc_fd,
++					PROC_PIDFDVNODEPATHINFO,
++					&vp, sizeof(vp)) <= 0
++			) {
++				continue;
++			}
++			printf("%d\t%s\t%d\t%s\n",
++				(int)proc->pid,
++				lsof_exe(proc),
++				fds[i].proc_fd,
++				vp.pvip.vip_path);
++		}
++	}
++	return EXIT_SUCCESS;
++}
++
++#else /* !__APPLE__ */
++
+ int lsof_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
+ int lsof_main(int argc UNUSED_PARAM, char **argv UNUSED_PARAM)
+ {
+@@ -76,3 +127,5 @@ int lsof_main(int argc UNUSED_PARAM, char **argv UNUSED_PARAM)
+ 
+ 	return EXIT_SUCCESS;
+ }
++
++#endif /* __APPLE__ */
+diff --git a/procps/mpstat.c b/procps/mpstat.c
+index 795b4cc..4707cf9 100644
+--- a/procps/mpstat.c
++++ b/procps/mpstat.c
+@@ -450,11 +450,81 @@ static void write_stats_avg(int current)
+ 	write_stats_core(2, current, "Average:", "Average:");
+ }
+ 
++#if defined(__APPLE__)
++#include <mach/mach.h>
++#include <mach/processor_info.h>
++#include <sys/sysctl.h>
++
++static void mpstat_cpu_darwin(struct stats_cpu *cpu, data_t *up, data_t *up0)
++{
++	processor_cpu_load_info_t cl;
++	mach_msg_type_number_t ncpu, i;
++	natural_t ncpu_nat;
++	vm_size_t cl_size;
++	data_t tot = 0;
++
++	if (host_processor_info(mach_host_self(), PROCESSOR_CPU_LOAD_INFO,
++			&ncpu_nat, (processor_info_array_t *)&cl, &ncpu) != KERN_SUCCESS
++	 || ncpu == 0
++	) {
++		bb_error_msg_and_die("can't read CPU statistics");
++	}
++	/* On some macOS versions ncpu is number of ints (ncpu_nat*4), not CPUs */
++	if (ncpu != ncpu_nat && ncpu == ncpu_nat * 4)
++		ncpu = ncpu_nat;
++	else if (ncpu_nat != 0 && ncpu_nat != ncpu)
++		ncpu = ncpu_nat;
++	cl_size = (vm_size_t)ncpu * (vm_size_t)sizeof(*cl);
++	/* Do not grow beyond the allocated G.st_cpu[] size; clamp if needed */
++	if ((int)ncpu > G.cpu_nr)
++		ncpu = G.cpu_nr;
++	else
++		G.cpu_nr = (int)ncpu;
++	memset(cpu, 0, sizeof(*cpu) * (G.cpu_nr + 1));
++	for (i = 0; i < ncpu; i++) {
++		struct stats_cpu *c = &cpu[i + 1];
++		data_t sum;
++		c->cpu_user   = cl[i].cpu_ticks[CPU_STATE_USER];
++		c->cpu_nice   = cl[i].cpu_ticks[CPU_STATE_NICE];
++		c->cpu_system = cl[i].cpu_ticks[CPU_STATE_SYSTEM];
++		c->cpu_idle   = cl[i].cpu_ticks[CPU_STATE_IDLE];
++		sum = c->cpu_user + c->cpu_nice + c->cpu_system + c->cpu_idle;
++		tot += sum;
++		if (i == 0)
++			*up0 = sum;
++		cpu[0].cpu_user   += c->cpu_user;
++		cpu[0].cpu_nice   += c->cpu_nice;
++		cpu[0].cpu_system += c->cpu_system;
++		cpu[0].cpu_idle   += c->cpu_idle;
++	}
++	*up = tot;
++	vm_deallocate(mach_task_self(), (vm_address_t)cl, cl_size);
++}
++
++static void mpstat_uptime_darwin(data_t *uptime)
++{
++	struct timeval boot, now;
++	size_t len;
++	int mib[2] = { CTL_KERN, KERN_BOOTTIME };
++	*uptime = 0;
++	len = sizeof(boot);
++	if (sysctl(mib, 2, &boot, &len, NULL, 0) != 0)
++		return;
++	gettimeofday(&now, NULL);
++	if (now.tv_sec > boot.tv_sec)
++		*uptime = (data_t)(now.tv_sec - boot.tv_sec) * G.hz;
++}
++#endif /* __APPLE__ */
++
+ /*
+  * Read CPU statistics
+  */
+ static void get_cpu_statistics(struct stats_cpu *cpu, data_t *up, data_t *up0)
+ {
++#if defined(__APPLE__)
++	mpstat_cpu_darwin(cpu, up, up0);
++	return;
++#endif
+ 	FILE *fp;
+ 	char buf[1024];
+ 
+@@ -517,8 +587,11 @@ static void get_cpu_statistics(struct stats_cpu *cpu, data_t *up, data_t *up0)
+ /*
+  * Read IRQs from /proc/stat
+  */
+-static void get_irqs_from_stat(struct stats_irq *irq)
++static void get_irqs_from_stat(struct stats_irq *irq UNUSED_PARAM)
+ {
++#if defined(__APPLE__)
++	return;
++#endif
+ 	FILE *fp;
+ 	char buf[1024];
+ 
+@@ -538,10 +611,13 @@ static void get_irqs_from_stat(struct stats_irq *irq)
+ /*
+  * Read stats from /proc/interrupts or /proc/softirqs
+  */
+-static void get_irqs_from_interrupts(const char *fname,
+-		struct stats_irqcpu *per_cpu_stats[],
+-		int irqs_per_cpu, int current)
++static void get_irqs_from_interrupts(const char *fname UNUSED_PARAM,
++		struct stats_irqcpu *per_cpu_stats[] UNUSED_PARAM,
++		int irqs_per_cpu UNUSED_PARAM, int current UNUSED_PARAM)
+ {
++#if defined(__APPLE__)
++	return;
++#endif
+ 	FILE *fp;
+ 	struct stats_irq *irq_i;
+ 	struct stats_irqcpu *ic;
+@@ -638,6 +714,10 @@ static void get_irqs_from_interrupts(const char *fname,
+ 
+ static void get_uptime(data_t *uptime)
+ {
++#if defined(__APPLE__)
++	mpstat_uptime_darwin(uptime);
++	return;
++#endif
+ 	FILE *fp;
+ 	char buf[sizeof(long)*3 * 2 + 4]; /* enough for long.long */
+ 	unsigned long uptime_sec, decimal;
+@@ -801,8 +881,11 @@ static void print_header(struct tm *t)
+ /*
+  * Get number of interrupts available per processor
+  */
+-static int get_irqcpu_nr(const char *f, int max_irqs)
++static int get_irqcpu_nr(const char *f UNUSED_PARAM, int max_irqs UNUSED_PARAM)
+ {
++#if defined(__APPLE__)
++	return 0;
++#endif
+ 	FILE *fp;
+ 	char *line;
+ 	unsigned linelen;
+diff --git a/procps/ps.c b/procps/ps.c
+index 5b521ae..35d0d7b 100644
+--- a/procps/ps.c
++++ b/procps/ps.c
+@@ -109,6 +109,7 @@
+ //usage:       " 2990 andersen andersen R ps\n"
+ 
+ #include "libbb.h"
++#include "sysinfo_compat.h"
+ #include "common_bufsiz.h"
+ #ifdef __linux__
+ # include <sys/sysinfo.h>
+@@ -131,8 +132,13 @@ static unsigned long get_uptime(void)
+ 	/* /proc/uptime is "UPTIME_SEC.NN IDLE_SEC.NN\n"
+ 	 * (where IDLE is cumulative over all CPUs)
+ 	 */
++#if defined(__APPLE__)
++	if (open_read_close("/proc/uptime", buf, sizeof(buf)) <= 0)
++		return 0;    /* no /proc/uptime on Darwin */
++#else
+ 	if (open_read_close("/proc/uptime", buf, sizeof(buf)) <= 0)
+ 		bb_perror_msg_and_die("can't read '%s'", "/proc/uptime");
++#endif
+ 	buf[sizeof(buf)-1] = '\0';
+ 	sscanf(buf, "%lu", &uptime);
+ 	return uptime;
+diff --git a/procps/top.c b/procps/top.c
+index 7902e82..32f2753 100644
+--- a/procps/top.c
++++ b/procps/top.c
+@@ -306,8 +306,94 @@ static NOINLINE int read_cpu_jiffy(FILE *fp, jiffy_counts_t *p_jif)
+ 	return ret;
+ }
+ 
++#if defined(__APPLE__)
++/*
++ * Darwin has no /proc/stat and no /proc/meminfo.  Public sources:
++ *   CPU ticks  host_statistics(HOST_CPU_LOAD_INFO) - cumulative per-state ticks,
++ *              exactly the four counters jiffy_counts_t wants (usr/nic/sys/idle).
++ *              iowait/irq/softirq/steal stay 0, which display_cpus() prints as 0%.
++ *   per CPU    host_processor_info(PROCESSOR_CPU_LOAD_INFO) for the SMP lines.
++ * Whitepace in the /proc file does not exist here, so the parser is replaced
++ * rather than fed a synthesised file.
++ */
++#include <mach/mach.h>
++#include <mach/host_info.h>
++#include <mach/processor_info.h>
++
++static void darwin_jif_from_cpu_load(jiffy_counts_t *j, const unsigned *ticks)
++{
++	j->usr     = ticks[CPU_STATE_USER];
++	j->nic     = ticks[CPU_STATE_NICE];
++	j->sys     = ticks[CPU_STATE_SYSTEM];
++	j->idle    = ticks[CPU_STATE_IDLE];
++	j->iowait  = 0;
++	j->irq     = 0;
++	j->softirq = 0;
++	j->steal   = 0;
++	j->total   = j->usr + j->nic + j->sys + j->idle;
++	/* procps 2.x does not count iowait as busy time */
++	j->busy    = j->total - j->idle;
++}
++
++static void get_jiffy_counts_darwin(void)
++{
++	host_cpu_load_info_data_t cpuinfo;
++	mach_msg_type_number_t count = HOST_CPU_LOAD_INFO_COUNT;
++
++	prev_jif = cur_jif;
++	if (host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO,
++			(host_info_t)&cpuinfo, &count) == KERN_SUCCESS
++	) {
++		darwin_jif_from_cpu_load(&cur_jif, cpuinfo.cpu_ticks);
++	}
++	/* The header shows cur_jif totals; give the first frame something to
++	 * diff against so the first screen is not all 0%. */
++	if (prev_jif.total == 0)
++		prev_jif = cur_jif;
++
++#if ENABLE_FEATURE_TOP_SMP_CPU
++	if (smp_cpu_info) {
++		processor_cpu_load_info_t cl;
++		mach_msg_type_number_t n, i;
++		natural_t n_nat;
++		unsigned cpus;
++
++		if (host_processor_info(mach_host_self(), PROCESSOR_CPU_LOAD_INFO,
++				&n_nat, (processor_info_array_t *)&cl, &n) != KERN_SUCCESS
++		  || n == 0
++		) {
++			smp_cpu_info = 0;
++			return;
++		}
++		/* host_processor_info returns array size in n and CPU count in
++		 * n_nat (the reverse of host_statistics); see docs */
++		cpus = (n_nat != 0 && n_nat != n) ? (unsigned)n_nat : (unsigned)n;
++		if (!num_cpus) {
++			num_cpus = cpus;
++			cpu_jif = xzalloc(sizeof(cpu_jif[0]) * num_cpus);
++			cpu_prev_jif = xzalloc(sizeof(cpu_prev_jif[0]) * num_cpus);
++		}
++		if (cpus > num_cpus)
++			cpus = num_cpus;
++		for (i = 0; i < cpus; i++)
++			darwin_jif_from_cpu_load(&cpu_jif[i], cl[i].cpu_ticks);
++		/* mirror the Linux branch: first per-cpu frame has no previous */
++		if (!cpu_prev_jif[0].total) {
++			memcpy(cpu_prev_jif, cpu_jif, sizeof(cpu_jif[0]) * cpus);
++		}
++		vm_deallocate(mach_task_self(), (vm_address_t)cl,
++			(vm_size_t)cpus * (vm_size_t)sizeof(*cl));
++	}
++#endif
++}
++#endif /* __APPLE__ */
++
+ static void get_jiffy_counts(void)
+ {
++#if defined(__APPLE__)
++	get_jiffy_counts_darwin();
++	return;
++#endif
+ 	FILE* fp = xfopen_for_read("stat");
+ 
+ 	/* We need to parse cumulative counts even if SMP CPU display is on,
+@@ -569,8 +655,56 @@ enum {
+ 	MI_MAX
+ };
+ 
++#if defined(__APPLE__)
++/*
++ * Memory totals from sysctl/Mach.  bb_sysinfo() gives totalram/freeram/
++ * bufferram and sharedram from host_statistics64 (see sysinfo_compat.h);
++ * swap comes from vm.swapusage.  macOS has no Slab/Writeback/AnonPages, and
++ * top only prints total/free/shared/buffers/cached, so the rest stay 0.
++ */
++#include <sys/sysctl.h>
++#include "sysinfo_compat.h"
++
++static void parse_meminfo_darwin(unsigned long meminfo[MI_MAX])
++{
++	struct sysinfo si;
++	struct xsw_usage xsw;
++	vm_statistics64_data_t vm;
++	mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
++	unsigned long page = (unsigned long)vm_page_size;
++	size_t len;
++
++	memset(meminfo, 0, sizeof(meminfo[0]) * MI_MAX);
++	sysinfo(&si);
++
++	meminfo[MI_MEMTOTAL] = (unsigned long)(si.totalram >> 10);
++	meminfo[MI_MEMFREE]  = (unsigned long)(si.freeram  >> 10);
++	meminfo[MI_BUFFERS]  = (unsigned long)(si.bufferram >> 10);
++
++	/* Linux top's "cached" is reclaimable page cache.  macOS has no page
++	 * cache counter, but inactive + purgeable pages are the closest match
++	 * and are what every macOS memory tool reports as "cached files". */
++	if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
++			(host_info64_t)&vm, &count) == KERN_SUCCESS
++	) {
++		meminfo[MI_CACHED] = (unsigned long)
++			((((uint64_t)vm.inactive_count + vm.purgeable_count) * page) >> 10);
++	}
++
++	len = sizeof(xsw);
++	if (sysctlbyname("vm.swapusage", &xsw, &len, NULL, 0) == 0) {
++		meminfo[MI_SWAPTOTAL] = (unsigned long)(xsw.xsu_total >> 10);
++		meminfo[MI_SWAPFREE]  = (unsigned long)(xsw.xsu_avail >> 10);
++	}
++}
++#endif /* __APPLE__ */
++
+ static void parse_meminfo(unsigned long meminfo[MI_MAX])
+ {
++#if defined(__APPLE__)
++	parse_meminfo_darwin(meminfo);
++	return;
++#endif
+ 	static const char fields[] ALIGN1 =
+ 		"MemTotal\0"
+ 		"MemFree\0"
+@@ -636,9 +770,17 @@ static unsigned long display_header(void)
+ 
+ 	/* Read load average as a string */
+ 	buf = stpcpy(G.line_buf, "Load average: ");
++#if defined(__APPLE__)
++	{
++		double load[3] = { 0, 0, 0 };
++		if (getloadavg(load, 3) > 0)
++			sprintf(buf, "%.2f %.2f %.2f", load[0], load[1], load[2]);
++	}
++#else
+ 	open_read_close("loadavg", buf, sizeof(G.line_buf) - sizeof("Load average: "));
+ 	G.line_buf[sizeof(G.line_buf) - 1] = '\0'; /* paranoia */
+ 	strchrnul(buf, '\n')[0] = '\0';
++#endif
+ 	print_line_buf();
+ 
+ 	return meminfo[MI_MEMTOTAL];
+@@ -1245,7 +1387,9 @@ int top_main(int argc UNUSED_PARAM, char **argv)
+ 	}
+ #endif
+ 
++#if !defined(__APPLE__)
+ 	xchdir("/proc");
++#endif
+ 
+ #if ENABLE_FEATURE_TOP_CPU_USAGE_PERCENTAGE
+ 	sort_function[0] = pcpu_sort;
+diff --git a/procps/uptime.c b/procps/uptime.c
+index aec7bd7..5715dc5 100644
+--- a/procps/uptime.c
++++ b/procps/uptime.c
+@@ -40,6 +40,7 @@
+ //usage:       "  1:55pm  up  2:30, load average: 0.09, 0.04, 0.00\n"
+ 
+ #include "libbb.h"
++#include "sysinfo_compat.h"
+ #ifdef __linux__
+ # include <sys/sysinfo.h>
+ #endif
+diff --git a/procps/vmstat.c b/procps/vmstat.c
+index 6cdd641..5c0252f 100644
+--- a/procps/vmstat.c
++++ b/procps/vmstat.c
+@@ -205,7 +205,89 @@ static int find_col(unsigned char from, const char *fromspec)
+  * Reads current system state into the data array elements corresponding
+  * to coldescs[] columns.
+  */
+-static void load_row(data_t data[NCOLS])
++#if defined(__APPLE__)
++/*
++ * Darwin has no /proc/stat, /proc/meminfo or /proc/vmstat.  Public sources:
++ *   CPU ticks   host_statistics(HOST_CPU_LOAD_INFO) - cumulative, so the
++ *               generic M_DPERCENT code turns them into percentages
++ *   memory      bb_sysinfo() (host_statistics64 + hw.memsize)
++ *   swap        sysctl vm.swapusage (struct xsw_usage)
++ *   procs       one KERN_PROC_ALL fetch, counting runnable processes
++ * Columns with no macOS equivalent (si so bi bo in cs) stay 0, which is also
++ * what Linux prints when a kernel lacks the counter.
++ */
++#include <mach/mach.h>
++#include <mach/host_info.h>
++#include <sys/sysctl.h>
++#include "sysinfo_compat.h"
++
++static void load_row_darwin(data_t data[NCOLS])
++{
++	host_cpu_load_info_data_t cpuinfo;
++	mach_msg_type_number_t count = HOST_CPU_LOAD_INFO_COUNT;
++	vm_statistics64_data_t vmstats;
++	mach_msg_type_number_t vmcount = HOST_VM_INFO64_COUNT;
++	struct sysinfo si;
++	struct xsw_usage xsw;
++	size_t len;
++	struct kinfo_proc *procs;
++	unsigned running = 0;
++	int nproc, i;
++
++	memset(data, 0, NCOLS * sizeof(data[0]));
++
++	{
++		int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0 };
++		size_t sz = 0;
++
++		if (sysctl(mib, 4, NULL, &sz, NULL, 0) == 0 && sz > 0) {
++			sz += 32 * sizeof(struct kinfo_proc);
++			procs = xmalloc(sz);
++			if (sysctl(mib, 4, procs, &sz, NULL, 0) == 0) {
++				nproc = (int)(sz / sizeof(struct kinfo_proc));
++				for (i = 0; i < nproc; i++) {
++					/* 1 idle 2 runnable 3 sleeping 4 stopped 5 zombie */
++					if (procs[i].kp_proc.p_stat == 2)
++						running++;
++				}
++			}
++			free(procs);
++		}
++	}
++	/* macOS has no run-queue length: p_stat/pbi_status report SRUN for
++	 * sleeping processes too, so counting them yields the process count
++	 * (1000+) rather than anything runnable.  Like si/so/bi/bo/in/cs
++	 * below, report 0 (unknown) instead of a misleading number. */
++	(void)running;
++	data[0] = 0;        /* r */
++	data[1] = 0;        /* b  - no blocked count on Darwin */
++
++	sysinfo(&si);
++	memset(&vmstats, 0, sizeof(vmstats));
++	host_statistics64(mach_host_self(), HOST_VM_INFO64,
++			(host_info64_t)&vmstats, &vmcount);
++
++	len = sizeof(xsw);
++	if (sysctlbyname("vm.swapusage", &xsw, &len, NULL, 0) == 0)
++		data[2] = (data_t)(xsw.xsu_used / 1024);   /* swpd */
++	data[3] = (data_t)(si.freeram / 1024);         /* free */
++	data[4] = (data_t)(si.bufferram / 1024);       /* buff: wired+purgeable */
++	data[5] = (data_t)((((uint64_t)vmstats.inactive_count + vmstats.purgeable_count)
++			* (unsigned long long)vm_page_size) / 1024);        /* cache: inactive+purgeable */
++
++	if (host_statistics(mach_host_self(), HOST_CPU_LOAD_INFO,
++			(host_info_t)&cpuinfo, &count) == KERN_SUCCESS
++	) {
++		data[12] = cpuinfo.cpu_ticks[CPU_STATE_USER]
++			+ cpuinfo.cpu_ticks[CPU_STATE_NICE];
++		data[13] = cpuinfo.cpu_ticks[CPU_STATE_SYSTEM];
++		data[14] = cpuinfo.cpu_ticks[CPU_STATE_IDLE];
++		/* data[15..17] iowait/steal/guest stay 0 */
++	}
++}
++#endif /* __APPLE__ */
++
++static void load_row_proc(data_t data[NCOLS])
+ {
+ 	FILE *fp;
+ 	char label[32];
+@@ -455,6 +537,19 @@ static void print_row(const data_t data[NCOLS],
+ }
+ 
+ /* Print column header rows */
++/*
++ * Darwin collects the same columns from sysctls and Mach host statistics;
++ * everything else goes through the /proc parser.
++ */
++static void load_row(data_t data[NCOLS])
++{
++#if defined(__APPLE__)
++	load_row_darwin(data);
++#else
++	load_row_proc(data);
++#endif
++}
++
+ static void print_header(void)
+ {
+ #if FIXED_HEADER
+diff --git a/shell/ash.c b/shell/ash.c
+index 9afeaed..a6b3412 100644
+--- a/shell/ash.c
++++ b/shell/ash.c
+@@ -906,8 +906,8 @@ out2str(const char *p)
+ 
+ /* ${VAR[ops]} encoding is CTLVAR,<type_byte>,"VARNAME=",<ops_encoded(details?)>,CTLENDVAR */
+ /* variable type byte (follows CTLVAR) */
+-#define VSTYPE         0x0f     /* type of variable substitution */
+-#define VSNUL          0x10     /* colon: the op is one of :- :+ :? := */
++#define VSTYPE         0x1f     /* type of variable substitution */
++#define VSNUL          0x20     /* colon: the op is one of :- :+ :? := */
+ /* values of VSTYPE field. The first 5 must be in this order, "}-+?=" string is used elsewhere to index into them */
+ #define VSNORMAL        0x1     /* $var or ${var} */
+ #define VSMINUS         0x2     /* ${var[:]-text} */
+@@ -926,6 +926,12 @@ out2str(const char *p)
+ #define VSREPLACE       0xc     /* ${var/pattern/replacement} */
+ #define VSREPLACEALL    0xd     /* ${var//pattern/replacement} */
+ #endif
++#if BASH_EPOCH_VARS
++#define VSUPPER         0xe     /* ${var^}:  first character upper-cased */
++#define VSUPPERALL      0xf     /* ${var^^}: every character upper-cased */
++#define VSLOWER         0x10    /* ${var,}:  first character lower-cased */
++#define VSLOWERALL      0x11    /* ${var,,}: every character lower-cased */
++#endif
+ #if DEBUG || JOBS
+ static const char vstype_suffix[][3] ALIGN1 = {
+ 	[VSNORMAL       - VSNORMAL] = "}", // $var or ${var}
+@@ -945,6 +951,12 @@ static const char vstype_suffix[][3] ALIGN1 = {
+ 	[VSREPLACE      - VSNORMAL] = "/", // ${var/pattern/replacement}
+ 	[VSREPLACEALL   - VSNORMAL] = "//",// ${var//pattern/replacement}
+ # endif
++# if BASH_EPOCH_VARS
++	[VSUPPER        - VSNORMAL] = "^", // ${var^}
++	[VSUPPERALL     - VSNORMAL] = "^^",// ${var^^}
++	[VSLOWER        - VSNORMAL] = ",", // ${var,}
++	[VSLOWERALL     - VSNORMAL] = ",,",// ${var,,}
++# endif
+ };
+ #endif
+ 
+@@ -2284,6 +2296,9 @@ static void changemail(const char *var_value) FAST_FUNC;
+ static void changepath(const char *) FAST_FUNC;
+ #if ENABLE_ASH_RANDOM_SUPPORT
+ static void change_random(const char *) FAST_FUNC;
++#if BASH_EPOCH_VARS
++static void change_shseconds(const char *) FAST_FUNC;
++#endif
+ #endif
+ #if BASH_EPOCH_VARS
+ static void change_seconds(const char *) FAST_FUNC;
+@@ -2325,6 +2340,7 @@ static const struct {
+ #if BASH_EPOCH_VARS
+ 	{ VSTRFIXED|VTEXTFIXED|VUNSET|VDYNAMIC, "EPOCHSECONDS", change_seconds },
+ 	{ VSTRFIXED|VTEXTFIXED|VUNSET|VDYNAMIC, "EPOCHREALTIME", change_realtime },
++	{ VSTRFIXED|VTEXTFIXED|VUNSET|VDYNAMIC, "SECONDS", change_shseconds },
+ #endif
+ #if ENABLE_LOCALE_SUPPORT
+ 	{ VSTRFIXED|VTEXTFIXED|VUNSET, "LC_ALL"    , change_lc_all   },
+@@ -2386,10 +2402,12 @@ extern struct globals_var *BB_GLOBAL_CONST ash_ptr_to_globals_var;
+ #if BASH_EPOCH_VARS
+ # define vepochs  varinit[VAR_OFFSET3 + 7]
+ # define vepochr  varinit[VAR_OFFSET3 + 8]
++# define vshsecs  varinit[VAR_OFFSET3 + 9]
+ #endif
+ #define INIT_G_var() do { \
+ 	unsigned i; \
+ 	XZALLOC_CONST_PTR(&ash_ptr_to_globals_var, sizeof(G_var)); \
++	IF_ASH_BASH_COMPAT(xgettimeofday(&sh_seconds_start);) \
+ 	for (i = 0; i < ARRAY_SIZE(varinit_data); i++) { \
+ 		varinit[i].flags    = varinit_data[i].flags; \
+ 		varinit[i].var_text = varinit_data[i].var_text; \
+@@ -5171,6 +5189,20 @@ cmdputs(const char *s)
+ 			break;
+ 		case CTLVAR:
+ 			subtype = *p++;
++			if (getenv("ASH_DBG")) {
++				const char *q;
++				fprintf(stderr, "DBG CTLVAR subtype=%#x text=[", subtype);
++				for (q = p; *q && *q != '\n'; q++) {
++					unsigned char b = (unsigned char)*q;
++					if (b < 32 || b > 0x7e)
++						fprintf(stderr, "\\x%02x", b);
++					else
++						fprintf(stderr, "%c", b);
++					if (b == 0x83)  /* CTLENDVAR */
++						break;
++				}
++				fprintf(stderr, "]\n");
++			}
+ 			if ((subtype & VSTYPE) == VSLENGTH)
+ 				str = "${#";
+ 			else
+@@ -8052,9 +8084,24 @@ evalvar(char *p, int flag)
+ 	ssize_t varlen;
+ 	int discard;
+ 	int quoted;
++#if BASH_EPOCH_VARS
++	char casemod = 0;    /* '^' or ',' for a case conversion */
++	int case_all = 0;    /* the doubled form: every character */
++#endif
+ 
+ 	varflags = (unsigned char) *p++;
+ 	subtype = varflags & VSTYPE;
++#if BASH_EPOCH_VARS
++	if (subtype == VSUPPER || subtype == VSUPPERALL
++	 || subtype == VSLOWER || subtype == VSLOWERALL
++	) {
++		casemod = (subtype == VSUPPER || subtype == VSUPPERALL) ? '^' : ',';
++		case_all = (subtype == VSUPPERALL || subtype == VSLOWERALL);
++		varflags &= ~VSTYPE;
++		varflags |= VSNORMAL;
++		subtype = VSNORMAL;
++	}
++#endif
+ 
+ 	quoted = flag & EXP_QUOTED;
+ 	var = p;
+@@ -8101,8 +8148,30 @@ evalvar(char *p, int flag)
+ 		goto really_record;
+ 	}
+ 
+-	if (subtype == VSNORMAL)
++	if (subtype == VSNORMAL) {
++#if BASH_EPOCH_VARS
++		if (casemod) {
++			/* recompute: makestrspace() in varvalue may move the block */
++			char *str = (char *)stackblock() + startloc;
++			int n = expdest - str;
++			int i;
++
++			/* The caller reads the type byte itself and, for an operator
++			 * subtype, expects evalvar to have consumed the terminator. */
++			if ((unsigned char)*p == CTLENDVAR)
++				p++;
++
++			for (i = 0; i < n; i++) {
++				if (!case_all && i > 0)
++					break;
++				str[i] = (casemod == '^')
++					? toupper((unsigned char)str[i])
++					: tolower((unsigned char)str[i]);
++			}
++		}
++#endif
+ 		goto record;
++	}
+ 
+ #if DEBUG
+ 	switch (subtype) {
+@@ -8116,6 +8185,12 @@ evalvar(char *p, int flag)
+ #if BASH_PATTERN_SUBST
+ 	case VSREPLACE:
+ 	case VSREPLACEALL:
++#endif
++#if BASH_EPOCH_VARS
++	case VSUPPER:
++	case VSUPPERALL:
++	case VSLOWER:
++	case VSLOWERALL:
+ #endif
+ 		break;
+ 	default:
+@@ -8548,12 +8623,235 @@ expandmeta(struct strlist *str /*, int flag*/)
+  * perform splitting and file name expansion.  When arglist is NULL, perform
+  * here document expansion.
+  */
++static void expandarg(union node *arg, struct arglist *arglist, int flag);
++
++
++#if ENABLE_ASH_BASH_COMPAT
++/*
++ * Brace expansion: `a{b,c}d' -> `abd acd', `{1..3}' -> `1 2 3'.
++ * Bash does this before every other expansion, strictly textually, so it runs
++ * on the raw word text before argstr().  Quoted characters arrive marked with
++ * CTLESC, which is how a quoted `{a,b}' is told apart from a bare one.
++ */
++#define BRACE_MAX_ALTS 4096
++
++static int brace_is_seq(const char *s, int len)
++{
++	int i, ndots = 0;
++
++	for (i = 0; i < len; i++) {
++		if (s[i] != '.')
++			continue;
++		if (i + 1 >= len || s[i + 1] != '.')
++			return 0;
++		ndots++;
++		i++;
++	}
++	if (ndots < 1 || ndots > 2)
++		return 0;
++	for (i = 0; i < len; i++) {
++		char c = s[i];
++		if (c == '.')
++			i++;
++		else if (!isalnum((unsigned char)c) && c != '-' && c != '+')
++			return 0;
++	}
++	return 1;
++}
++
++static int brace_find_group(const char *s, int *beg, int *end)
++{
++	int i, j;
++
++	for (i = 0; s[i]; i++) {
++		int depth, comma, k;
++
++		if (s[i] == CTLESC && s[i + 1]) {  /* quoted char: not an operator */
++			i++;
++			continue;
++		}
++		if (s[i] != '{')
++			continue;
++		if (i > 0 && s[i - 1] == '$')      /* ${param...} */
++			continue;
++		depth = 0;
++		for (j = i; s[j]; j++) {
++			if (s[j] == CTLESC && s[j + 1]) {
++				j++;
++				continue;
++			}
++			if (s[j] == '{')
++				depth++;
++			else if (s[j] == '}' && --depth == 0)
++				break;
++		}
++		if (!s[j])
++			return 0;
++		comma = 0;
++		depth = 0;
++		for (k = i + 1; k < j; k++) {
++			if (s[k] == CTLESC && s[k + 1]) {
++				k++;
++				continue;
++			}
++			if (s[k] == '{')
++				depth++;
++			else if (s[k] == '}')
++				depth--;
++			else if (depth == 0 && s[k] == ',')
++				comma = 1;
++		}
++		if (comma || brace_is_seq(s + i + 1, j - i - 1)) {
++			*beg = i;
++			*end = j;
++			return 1;
++		}
++	}
++	return 0;
++}
++
++static void brace_text(const char *text, struct arglist *arglist, int flag);
++static int brace_word(const char *word, struct arglist *arglist, int flag);
++
++static void brace_emit(const char *pre, int prelen, const char *alt,
++		const char *post, struct arglist *arglist, int flag)
++{
++	char *w = xasprintf("%.*s%s%s", prelen, pre, alt, post);
++
++	if (!brace_word(w, arglist, flag))
++		brace_text(w, arglist, flag);
++	free(w);
++}
++
++static int brace_word(const char *word, struct arglist *arglist, int flag)
++{
++	const char *post;
++	int beg, end;
++
++	if (!word || !brace_find_group(word, &beg, &end))
++		return 0;
++	post = word + end + 1;
++
++	if (brace_is_seq(word + beg + 1, end - beg - 1)) {
++		const char *c = word + beg + 1;
++		int len = end - beg - 1;
++		char left[24], right[24];
++		const char *p1 = c, *p2, *p3;
++		int llen, rlen, step = 1;
++
++		p2 = c;
++		while (p2 < c + len && !(p2[0] == '.' && p2[1] == '.'))
++			p2++;
++		if (p2 >= c + len)
++			return 0;
++		llen = (int)(p2 - p1);
++		p2 += 2;
++		p3 = p2;
++		while (p3 < c + len && !(p3[0] == '.' && p3[1] == '.'))
++			p3++;
++		rlen = (int)(p3 - p2);
++		if (p3 + 2 <= c + len && p3[0] == '.' && p3[1] == '.')
++			step = atoi(p3 + 2);
++		if (llen <= 0 || rlen <= 0 || llen > 20 || rlen > 20 || step == 0)
++			return 0;
++
++		if (isalpha((unsigned char)p1[0]) && llen == 1
++		 && isalpha((unsigned char)p2[0]) && rlen == 1
++		) {
++			int a = p1[0], b = p2[0];
++			int n;
++
++			if (a > b)
++				step = -step;
++			for (n = a; (step > 0) ? n <= b : n >= b; n += step) {
++				char alt[2];
++				alt[0] = (char)n;
++				alt[1] = '\0';
++				brace_emit(word, beg, alt, post, arglist, flag);
++			}
++			return 1;
++		}
++		{
++			long a, b;
++			int width = 0, n = 0;
++
++			memcpy(left, p1, llen); left[llen] = '\0';
++			memcpy(right, p2, rlen); right[rlen] = '\0';
++			if (!is_number(left) || !is_number(right))
++				return 0;
++			a = atol(left);
++			b = atol(right);
++			if (a > b)
++				step = -step;
++			if ((p1[0] == '0' && llen > 1) || (p2[0] == '0' && rlen > 1))
++				width = (llen > rlen) ? llen : rlen;
++			for (; (step > 0) ? a <= b : a >= b; a += step) {
++				char alt[24];
++				if (++n > BRACE_MAX_ALTS)
++					return 1;
++				if (width)
++					snprintf(alt, sizeof(alt), "%0*ld", width, a);
++				else
++					snprintf(alt, sizeof(alt), "%ld", a);
++				brace_emit(word, beg, alt, post, arglist, flag);
++			}
++			return 1;
++		}
++	}
++
++	{
++		const char *q = word + beg + 1;
++		const char *endp = word + end;
++		const char *start = q;
++		int depth = 0, nalt = 0;
++
++		while (q <= endp) {
++			if (q == endp || (depth == 0 && *q == ',')) {
++				char *alt = xasprintf("%.*s", (int)(q - start), start);
++				brace_emit(word, beg, alt, endp + 1, arglist, flag);
++				free(alt);
++				if (++nalt > BRACE_MAX_ALTS)
++					return 1;
++				start = q + 1;
++			} else if (*q == CTLESC && q + 1 < endp) {
++				q++;
++			} else if (*q == '{') {
++				depth++;
++			} else if (*q == '}') {
++				depth--;
++			}
++			q++;
++		}
++	}
++	return 1;
++}
++
++static void brace_text(const char *text, struct arglist *arglist, int flag)
++{
++	union node node;
++
++	memset(&node, 0, sizeof(node));
++	node.narg.type = NARG;
++	node.narg.text = (char *)text;
++	node.narg.backquote = NULL;
++	expandarg(&node, arglist, flag);
++}
++#endif /* ENABLE_ASH_BASH_COMPAT */
++
+ static void
+ expandarg(union node *arg, struct arglist *arglist, int flag)
+ {
+ 	struct strlist *sp;
+ 	char *p;
+ 
++#if ENABLE_ASH_BASH_COMPAT
++	if ((flag & EXP_FULL)
++	 && arg->narg.backquote == NULL
++	 && brace_word(arg->narg.text, arglist, flag)
++	) {
++		return;
++	}
++#endif
+ 	argbackq = arg->narg.backquote;
+ 	STARTSTACKSTR(expdest);
+ 	TRACE(("expandarg: argstr('%s',flags:%x)\n", arg->narg.text, flag));
+@@ -12315,6 +12613,22 @@ change_random(const char *value)
+ #endif
+ 
+ #if BASH_EPOCH_VARS
++/* $SECONDS: whole seconds since this shell started */
++static struct timeval sh_seconds_start;
++
++static void FAST_FUNC
++change_shseconds(const char *value UNUSED_PARAM)
++{
++	struct timeval tv;
++	char buf[sizeof(long long) * 3];
++
++	xgettimeofday(&tv);
++	sprintf(buf, "%llu",
++		(unsigned long long)(tv.tv_sec - sh_seconds_start.tv_sec));
++	setvar(vshsecs.var_text, buf, VNOFUNC);
++	vshsecs.flags &= ~VNOFUNC;
++}
++
+ static void FAST_FUNC
+ change_epoch(struct var *vepoch, const char *fmt)
+ {
+@@ -13211,6 +13525,14 @@ readtoken1(int c, int syntax, struct heredoc *eofmark)
+ 			c = pgetc_top(synstack);
+ 			goto loop;              /* continue outer loop */
+ 		case CWORD:
++#if ENABLE_ASH_BASH_COMPAT
++			/* A quoted {, } or , must not take part in brace expansion */
++			if ((synstack->syntax == SQSYNTAX || synstack->syntax == DQSYNTAX)
++			 && (c == '{' || c == '}' || c == ',')
++			) {
++				USTPUTC(CTLESC, out);
++			}
++#endif
+ 			USTPUTC(c, out);
+ 			break;
+ 		case CCTL:
+@@ -13669,6 +13991,18 @@ parsesub: {
+ 				subtype |= p - types + VSNORMAL;
+ 				break;
+ 			}
++#if BASH_EPOCH_VARS
++			case '^':
++			case ',':
++				subtype = (c == '^') ? VSUPPER : VSLOWER;
++				c = pgetc_eatbnl();
++				if (c == cc)
++					subtype++;   /* ^^ or ,, : all characters */
++				else
++					pungetc();   /* the '}' is next */
++				newsyn = BASESYNTAX;
++				break;
++#endif
+ 			case '%':
+ 			case '#':
+ 				subtype = (c == '#' ? VSTRIMLEFT : VSTRIMRIGHT);
+diff --git a/shell/hush.c b/shell/hush.c
+index afed0b5..6e337e7 100644
+--- a/shell/hush.c
++++ b/shell/hush.c
+@@ -3021,6 +3021,14 @@ static int i_getch(struct in_str *i)
+ 
+ 	ch = i_getch_interactive(i);
+  out:
++	/* hush encodes variable references in its internal o_string buffers with
++	 * byte SPECIAL_VAR_SYMBOL (0x03).  A *literal* 0x03 arriving from the
++	 * script text is indistinguishable from that marker and corrupts the
++	 * parse - before this check it was a NULL dereference in
++	 * expand_vars_to_list (repro: printf '\140\003\140' | hush).
++	 * Refuse the byte instead of guessing; no shell syntax needs it. */
++	if (ch == SPECIAL_VAR_SYMBOL)
++		bb_error_msg_and_die("script contains byte 0x03, which hush uses internally");
+ 	debug_printf("i_getch: got '%c' %d\n", ch, ch);
+ #if ENABLE_HUSH_LINENO_VAR
+ 	if (ch == '\n') {
+@@ -7193,6 +7201,14 @@ static NOINLINE int expand_one_var(o_string *output, int n, char *arg, char **pp
+ 	val = NULL;
+ 	to_be_freed = NULL;
+ 	p = *pp;
++	if (!p) {
++		/* hush encodes variables in o_string buffers with byte
++		 * SPECIAL_VAR_SYMBOL (0x03).  A *literal* 0x03 in the script text
++		 * reaches this point as a stray marker with no payload and the
++		 * store below used to dereference NULL (SIGSEGV on `\140\003\140`).
++		 * Treat it as a malformed expansion instead of dying. */
++		return n;
++	}
+ 	*p = '\0'; /* replace trailing SPECIAL_VAR_SYMBOL */
+ 	var = arg;
+ 	exp_saveptr = arg[1] ? (char*)strchr(VAR_ENCODED_SUBST_OPS, arg[1]) : NULL;
+diff --git a/util-linux/fallocate.c b/util-linux/fallocate.c
+index d5c2589..58e1db8 100644
+--- a/util-linux/fallocate.c
++++ b/util-linux/fallocate.c
+@@ -70,6 +70,7 @@
+ //    Option --keep-size can be specified to prevent file length modification.
+ 
+ #include "libbb.h"
++#include "sysinfo_compat.h"
+ 
+ int fallocate_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
+ int fallocate_main(int argc UNUSED_PARAM, char **argv)
+diff --git a/util-linux/fdisk.c b/util-linux/fdisk.c
+index b3ed1b9..98f3193 100644
+--- a/util-linux/fdisk.c
++++ b/util-linux/fdisk.c
+@@ -99,7 +99,12 @@
+ # define _LARGEFILE64_SOURCE
+ #endif
+ #include <assert.h>             /* assert */
+-#include <sys/mount.h>
++#if defined(__APPLE__)
++# include <sys/disk.h>          /* DKIOCGETBLOCK{SIZE,COUNT} */
++#else
++/* on Linux this pulls in <linux/fs.h>, i.e. BLKGETSIZE / BLKRRPART */
++# include <sys/mount.h>
++#endif
+ #include "libbb.h"
+ #include "unicode.h"
+ #if !defined(BLKSSZGET)
+@@ -486,6 +491,27 @@ struct globals {
+ /* TODO: move to libbb? */
+ static uint64_t bb_getsize_in_512sect(int fd)
+ {
++#if defined(__APPLE__)
++	/* Darwin has no BLKGETSIZE*; a block device reports its geometry
++	 * through DKIOCGETBLOCK{SIZE,COUNT}, a regular file (disk image) does
++	 * not, so fall back to seeking to the end. */
++	{
++		uint32_t bsize = 0;
++		uint64_t bcount = 0;
++
++		if (ioctl(fd, DKIOCGETBLOCKSIZE, &bsize) == 0
++		 && ioctl(fd, DKIOCGETBLOCKCOUNT, &bcount) == 0
++		 && bsize != 0
++		) {
++			return (bcount * (uint64_t)bsize) >> 9;
++		}
++	}
++	{
++		off_t sz = xlseek(fd, 0, SEEK_END);
++		xlseek(fd, 0, SEEK_SET);
++		return (uint64_t)sz >> 9;
++	}
++#else
+ 	const char *how;
+ 	uint64_t sz64;
+ 	/* BLKGETSIZE64 takes pointer to uint64_t, not ullong: */
+@@ -538,6 +564,7 @@ static uint64_t bb_getsize_in_512sect(int fd)
+ 
+ 	/* Got bytes, convert to 512 byte blocks */
+ 	return sz64 >> 9;
++#endif /* !__APPLE__ */
+ }
+ 
+ static sector_t bb_getsize_in_sectors(int fd)
+@@ -2136,6 +2163,34 @@ static int is_whole_disk(const char *disk)
+ static void
+ list_devs_in_proc_partititons(void)
+ {
++#if defined(__APPLE__)
++	/* Darwin has no /proc/partitions.  Whole disks are /dev/diskN; a
++	 * trailing "sN" means it is a partition, so skip those. */
++	DIR *dir = opendir("/dev");
++	struct dirent *de;
++
++	if (!dir) {
++		bb_perror_msg("/dev");
++		return;
++	}
++	while ((de = readdir(dir)) != NULL) {
++		char devname[128];
++		const char *p = de->d_name;
++
++		if (strncmp(p, "disk", 4) != 0)
++			continue;
++		p += 4;
++		if (!isdigit((unsigned char)*p))
++			continue;
++		while (isdigit((unsigned char)*p))
++			p++;
++		if (*p != '\0')        /* disk0s1 = partition, not a whole disk */
++			continue;
++		sprintf(devname, "/dev/%s", de->d_name);
++		open_list_and_close(devname, 0);
++	}
++	closedir(dir);
++#else
+ 	FILE *procpt;
+ 	char line[100], ptname[100], devname[120];
+ 	int ma, mi, sz;
+@@ -2153,6 +2208,7 @@ list_devs_in_proc_partititons(void)
+ 	}
+ 	if (ENABLE_FEATURE_CLEAN_UP)
+ 		fclose(procpt);
++#endif
+ }
+ 
+ #if ENABLE_FEATURE_FDISK_WRITABLE
+diff --git a/util-linux/lsblk.c b/util-linux/lsblk.c
+index bc9e540..4bb0176 100644
+--- a/util-linux/lsblk.c
++++ b/util-linux/lsblk.c
+@@ -59,8 +59,14 @@
+                       methods used to gather data (default: file,udev,blkid)
+  -H, --list-columns   list the available columns
+ */
++#if defined(__APPLE__)
++#include <locale.h>
++#include <CoreFoundation/CoreFoundation.h>
++#include <IOKit/IOKitLib.h>
++#include <IOKit/IOBSD.h>
++#include <IOKit/storage/IOMedia.h>
++#endif
+ #include "libbb.h"
+-#include <mntent.h>
+ 
+ struct blockdev_info {
+ 	char *name;
+@@ -263,6 +269,124 @@ static int compare_devices(const void *a, const void *b)
+ 	return strcmp(da->name, db->name);
+ }
+ 
++
++#if defined(__APPLE__)
++/*
++ * Darwin port: there is no /sys/block, so devices come from the IOKit
++ * IOMedia tree, and mountpoints from getmntinfo(3) (already wrapped by
++ * libbb/mntent.c for df and mount).
++ *
++ * IOKit properties used:
++ *   kIOBSDNameKey  -> "disk0", "disk0s1" ...
++ *   kIOMediaSizeKey-> byte size            (sectors = size >> 9)
++ *   kIOMediaWholeKey-> true for a whole disk, false for a partition
++ * MAJ:MIN has no meaning here, so that column prints "-" and the rest of the
++ * layout matches util-linux / busybox on Linux.
++ */
++static unsigned long long cf_ull_prop(io_object_t obj, CFStringRef key)
++{
++	CFTypeRef v = IORegistryEntryCreateCFProperty(obj, key, kCFAllocatorDefault, 0);
++	unsigned long long out = 0;
++
++	if (v) {
++		if (CFGetTypeID(v) == CFNumberGetTypeID()) {
++			long long n = 0;
++			if (CFNumberGetValue((CFNumberRef)v, kCFNumberLongLongType, &n))
++				out = (unsigned long long)n;
++		} else if (CFGetTypeID(v) == CFBooleanGetTypeID()) {
++			out = CFBooleanGetValue((CFBooleanRef)v) ? 1 : 0;
++		}
++		CFRelease(v);
++	}
++	return out;
++}
++
++static char *cf_str_prop(io_object_t obj, CFStringRef key)
++{
++	CFTypeRef v = IORegistryEntryCreateCFProperty(obj, key, kCFAllocatorDefault, 0);
++	char buf[64];
++	char *out = NULL;
++
++	if (v) {
++		if (CFGetTypeID(v) == CFStringGetTypeID()
++		 && CFStringGetCString((CFStringRef)v, buf, sizeof(buf), kCFStringEncodingUTF8)
++		) {
++			out = xstrdup(buf);
++		}
++		CFRelease(v);
++	}
++	return out;
++}
++
++int lsblk_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
++int lsblk_main(int argc UNUSED_PARAM, char **argv)
++{
++	io_iterator_t iter = 0;
++	io_object_t media;
++	CFMutableDictionaryRef match;
++	unsigned i;
++
++	INIT_G();
++
++	getopt32(argv, "a");   /* -a is the only option this version accepts */
++	argv += optind;
++
++	match = IOServiceMatching(kIOMediaClass);
++	if (match && IOServiceGetMatchingServices(kIOMasterPortDefault, match, &iter) == KERN_SUCCESS) {
++		while ((media = IOIteratorNext(iter)) != 0) {
++			char *name = cf_str_prop(media, CFSTR(kIOBSDNameKey));
++			if (name) {
++				struct blockdev_info *b;
++				unsigned long long bytes = cf_ull_prop(media, CFSTR(kIOMediaSizeKey));
++				int whole = (int)cf_ull_prop(media, CFSTR(kIOMediaWholeKey));
++
++				b = get_or_create_info(name);
++				b->size = bytes >> 9;          /* lsblk prints 512-byte sectors */
++				b->type = whole ? "disk" : "part";
++				b->majmin = "-";
++				free(name);
++			}
++			IOObjectRelease(media);
++		}
++		IOObjectRelease(iter);
++	}
++
++	if (G.count == 0)
++		return 32;
++
++	qsort(G.list, G.count, sizeof(G.list[0]), compare_devices);
++
++	printf("%-15s %-7s  SIZE TYPE MOUNTPOINTS\n", "NAME", "MAJ:MIN");
++
++	for (i = 0; i < G.count; i++) {
++		char buf6[6];
++		FILE *mt = setmntent(bb_path_mtab_file, "r");
++		struct mntent *m;
++		int printed = 0;
++
++		smart_ulltoa5(G.list[i].size * 512, buf6, " KMGTPEZY");
++		printf("%-15s %-7s %.5s %4s", G.list[i].name, G.list[i].majmin,
++				buf6, G.list[i].type);
++
++		if (mt) {
++			char want[64];
++			snprintf(want, sizeof(want), "/dev/%s", G.list[i].name);
++			while ((m = getmntent(mt)) != NULL) {
++				if (strcmp(m->mnt_fsname, want) == 0) {
++					printf("%s%s", printed ? "\n" : " ", m->mnt_dir);
++					printed = 1;
++				}
++			}
++			endmntent(mt);
++		}
++		bb_putchar('\n');
++	}
++
++	fflush_stdout_and_exit(EXIT_SUCCESS);
++}
++#endif /* __APPLE__ */
++
++#if !defined(__APPLE__)
+ int lsblk_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
+ int lsblk_main(int argc UNUSED_PARAM, char **argv)
+ {
+@@ -380,3 +504,4 @@ int lsblk_main(int argc UNUSED_PARAM, char **argv)
+ 
+ 	fflush_stdout_and_exit(G.exitcode);
+ }
++#endif /* !__APPLE__ */
+diff --git a/util-linux/mount.c b/util-linux/mount.c
+index 728e728..d40893e 100644
+--- a/util-linux/mount.c
++++ b/util-linux/mount.c
+@@ -181,11 +181,71 @@
+ //usage:#define mount_notes_usage
+ //usage:       "Returns 0 for success, number of failed mounts for -a, or errno for one mount."
+ 
+-#include <mntent.h>
++#include "libbb.h"
++#ifdef HAVE_MNTENT_H
++# include <mntent.h>
++#endif
+ #if ENABLE_FEATURE_SYSLOG
+-#include <syslog.h>
++# include <syslog.h>
++#endif
++#ifndef __APPLE__
++# include <sys/mount.h>
+ #endif
+-#include <sys/mount.h>
++
++#if defined(__APPLE__)
++/*
++ * Darwin port, read-only: there is no MS_* flag set in <sys/mount.h> and
++ * mount(2)/umount(2) take different arguments, so this applet lists the
++ * mount table (via libbb/mntent.c, which wraps getmntinfo(3)) and refuses
++ * to mount.  The -o parser and the "type (opts)" printer still need the
++ * Linux flag names, so give them private values; nothing is passed to a
++ * kernel here.
++ */
++# define MS_RDONLY       (1 << 0)
++# define MS_NOSUID       (1 << 1)
++# define MS_NODEV        (1 << 2)
++# define MS_NOEXEC       (1 << 3)
++# define MS_SYNCHRONOUS  (1 << 4)
++# define MS_REMOUNT      (1 << 5)
++# define MS_MANDLOCK     (1 << 6)
++# define MS_NOATIME      (1 << 10)
++# define MS_NODIRATIME   (1 << 11)
++
++/* sys/mount.h on Linux declares this; <mntent.h> would have done it.  The
++ * /proc walkers in this file only need the file-scope copy that the
++ * dietlibc branch provides, so reuse the same trick. */
++static struct mntent *getmntent_r(FILE *stream, struct mntent *result,
++		char *buffer UNUSED_PARAM, int bufsize UNUSED_PARAM)
++{
++	struct mntent *ment = getmntent(stream);
++	if (!ment)
++		return NULL;
++	return memcpy(result, ment, sizeof(*ment));
++}
++
++/* /etc/mtab is meaningless on Darwin and libbb's setmntent() already
++ * refuses write mode; keep update_mtab() from being compiled into a
++ * call to a function that does not exist. */
++static int addmntent(FILE *stream UNUSED_PARAM, const struct mntent *mnt UNUSED_PARAM)
++{
++	return 1; /* "failed": nothing to update */
++}
++
++/* Listing works through getmntinfo; actually mounting does not.  Fail the
++ * syscall path with a clear message rather than silently succeeding. */
++static int darwin_mount_stub(const char *source UNUSED_PARAM,
++		const char *target UNUSED_PARAM,
++		const char *fstype UNUSED_PARAM,
++		unsigned long flags UNUSED_PARAM,
++		const void *data UNUSED_PARAM)
++{
++	/* quiet: singlemount() prints "mounting %s on %s failed: <errno>" */
++	errno = ENOSYS;
++	return -1;
++}
++# define mount(a, b, c, d, e) darwin_mount_stub(a, b, c, d, e)
++#endif /* __APPLE__ */
++
+ // Grab more as needed from util-linux's mount/mount_constants.h
+ #ifndef MS_DIRSYNC
+ # define MS_DIRSYNC     (1 << 7) // Directory modifications are synchronous
+@@ -240,7 +300,6 @@
+ // MS_ACTIVE and MS_NOUSER bits, so we are safe to use these.
+ // Just do not pass them to kernel).
+ 
+-#include "libbb.h"
+ #if ENABLE_FEATURE_MOUNT_LABEL
+ # include "volume_id.h"
+ #else
+diff --git a/util-linux/umount.c b/util-linux/umount.c
+index 337d718..f0af1df 100644
+--- a/util-linux/umount.c
++++ b/util-linux/umount.c
+@@ -61,13 +61,43 @@
+ //usage:#define umount_example_usage
+ //usage:       "$ umount /dev/hdc1\n"
+ 
+-#include <mntent.h>
+-#include <sys/mount.h>
++#include "libbb.h"
++#include "common_bufsiz.h"
++#ifdef HAVE_MNTENT_H
++# include <mntent.h>
++#endif
++#ifndef __APPLE__
++# include <sys/mount.h>
++#endif
+ #ifndef MNT_DETACH
+ # define MNT_DETACH 0x00000002
+ #endif
+-#include "libbb.h"
+-#include "common_bufsiz.h"
++
++#if defined(__APPLE__)
++/* Read-only Darwin build: listing uses getmntinfo(3) through
++ * libbb/mntent.c; unmounting is done by the system mount(8). */
++# define MNT_FORCE       0x00000001
++# define MS_RDONLY      (1 << 0)
++# define MS_REMOUNT     (1 << 5)
++static struct mntent *getmntent_r(FILE *stream, struct mntent *result,
++		char *buffer UNUSED_PARAM, int bufsize UNUSED_PARAM)
++{
++	struct mntent *ment = getmntent(stream);
++	if (!ment)
++		return NULL;
++	return memcpy(result, ment, sizeof(*ment));
++}
++
++static int darwin_umount_stub(const char *target UNUSED_PARAM)
++{
++	/* quiet: the caller already prints "can't unmount %s: <errno>" */
++	errno = ENOSYS;
++	return -1;
++}
++# define umount(t)      darwin_umount_stub(t)
++# define umount2(t, f)  darwin_umount_stub(t)
++# define mount(a, b, c, d, e) darwin_umount_stub(a)
++#endif /* __APPLE__ */
+ 
+ #if defined(__dietlibc__)
+ // TODO: This does not belong here.
+diff --git a/util-linux/column.c b/util-linux/column.c
+new file mode 100644
+new file mode 100644
+--- /dev/null
++++ b/util-linux/column.c
+@@ -0,0 +1,148 @@
++/* vi: set sw=4 ts=4: */
++/*
++ * column - format input into columns
++ *
++ * Licensed under GPLv2, see file LICENSE in this source tree.
++ */
++//config:config COLUMN
++//config:	bool "column (2.6 kb)"
++//config:	default y
++//config:	help
++//config:	Format input into aligned columns.
++
++//applet:IF_COLUMN(APPLET_NOEXEC(column, column, BB_DIR_USR_BIN, BB_SUID_DROP, column))
++
++//kbuild:lib-$(CONFIG_COLUMN) += column.o
++
++//usage:#define column_trivial_usage
++//usage:       "[-t] [-s SEP] [-o SEP] [FILE]..."
++//usage:#define column_full_usage "\n\n"
++//usage:       "Format lines into columns"
++//usage:     "\n	-t	Build a table: align fields into columns"
++//usage:     "\n	-s SEP	Input field separator (default: runs of blanks)"
++//usage:     "\n	-o SEP	Output separator between columns (default: two spaces)"
++
++#include "libbb.h"
++
++int column_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
++int column_main(int argc UNUSED_PARAM, char **argv)
++{
++	unsigned opts;
++	const char *in_sep = NULL;
++	const char *out_sep = "  ";
++	llist_t *lines = NULL;
++	llist_t *lp;
++	FILE *fp;
++	char *line;
++	unsigned nrows = 0;
++	unsigned maxcols = 0;
++	unsigned *width;      /* width[i]: widest cell in column i */
++	char ***cells;        /* cells[row][col] */
++	unsigned *ncells;     /* number of cells per row */
++	unsigned r, c;
++
++	/* bits: t = 1, s = 2, o = 4 */
++	opts = getopt32long(argv, "^" "ts:o:" "\0" "?1",
++		"table\0"          No_argument       "t"
++		"separator\0"      Required_argument "s"
++		"output-separator\0" Required_argument "o"
++		, &in_sep, &out_sep
++	);
++
++	argv += optind;
++	if (argv[0]) {
++		fp = xfopen_stdin(argv[0]);
++	} else {
++		fp = stdin;
++	}
++
++	while ((line = xmalloc_fgetline(fp)) != NULL)
++		llist_add_to_end(&lines, line);
++	if (fp != stdin)
++		fclose(fp);
++
++	/* First pass: split and measure. */
++	for (lp = lines; lp; lp = lp->link)
++		nrows++;
++
++	if (nrows == 0)
++		return EXIT_SUCCESS;
++
++	cells = xzalloc(nrows * sizeof(cells[0]));
++	ncells = xzalloc(nrows * sizeof(ncells[0]));
++	width = xzalloc(sizeof(width[0]));
++
++	r = 0;
++	for (lp = lines; lp; lp = lp->link) {
++		char *text = lp->data;
++		char **vec = NULL;
++		unsigned n = 0;
++
++		if (in_sep) {
++			/* single-character separator: split on each occurrence */
++			char *p = text;
++			while (p) {
++				char *next = strchr(p, in_sep[0]);
++				if (next)
++					*next++ = '\0';
++				vec = xrealloc_vector(vec, 4, n);
++				vec[n++] = p;
++				p = next;
++			}
++		} else {
++			/* default: split on runs of blanks, as `column -t` does */
++			char *p = text;
++			while (*p) {
++				while (*p == ' ' || *p == '\t')
++					p++;
++				if (!*p)
++					break;
++				vec = xrealloc_vector(vec, 4, n);
++				vec[n++] = p;
++				while (*p && *p != ' ' && *p != '\t')
++					p++;
++				if (*p)
++					*p++ = '\0';
++			}
++		}
++
++		cells[r] = vec;
++		ncells[r] = n;
++		if (n > maxcols)
++			maxcols = n;
++		r++;
++	}
++
++	if (maxcols == 0)
++		return EXIT_SUCCESS;
++
++	width = xrealloc(width, maxcols * sizeof(width[0]));
++	memset(width, 0, maxcols * sizeof(width[0]));
++	for (r = 0; r < nrows; r++) {
++		for (c = 0; c < ncells[r]; c++) {
++			unsigned w = strlen(cells[r][c]);
++			if (w > width[c])
++				width[c] = w;
++		}
++	}
++
++	for (r = 0; r < nrows; r++) {
++		for (c = 0; c < ncells[r]; c++) {
++			fputs(cells[r][c], stdout);
++			if (c + 1 < ncells[r]) {
++				unsigned pad = width[c] - strlen(cells[r][c]);
++				unsigned k;
++				if (opts & 1) { /* -t */
++					for (k = 0; k < pad; k++)
++						bb_putchar(' ');
++					fputs(out_sep, stdout);
++				} else {
++					fputs(out_sep, stdout);
++				}
++			}
++		}
++		bb_putchar('\n');
++	}
++
++	return EXIT_SUCCESS;
++}
+diff --git a/include/sysinfo_compat.h b/include/sysinfo_compat.h
+new file mode 100644
+new file mode 100644
+--- /dev/null
++++ b/include/sysinfo_compat.h
+@@ -0,0 +1,135 @@
++/* vi: set sw=4 ts=4: */
++/*
++ * shim for the one Linux API that free, uptime, fallocate and ps rely on.
++ * Kept entirely in this new header so the port never has to edit
++ * include/platform.h or libbb/platform.c, which patches 0002 and 0003 own.
++ *
++ * Licensed under GPLv2, see file LICENSE in this source tree.
++ */
++#ifndef BB_SYSINFO_COMPAT_H
++#define BB_SYSINFO_COMPAT_H
++
++#if !defined(__linux__)
++
++/* free/uptime/ps read struct sysinfo.  Off Linux there is none, so provide a
++ * minimal one, filled from sysctls below. */
++struct sysinfo {
++	unsigned long uptime;
++	unsigned long loads[3];
++	unsigned long totalram;
++	unsigned long freeram;
++	unsigned long sharedram;
++	unsigned long bufferram;
++	unsigned long totalswap;
++	unsigned long freeswap;
++	unsigned short procs;
++	unsigned long mem_unit;
++};
++
++#if defined(__APPLE__)
++#include <sys/sysctl.h>
++#include <mach/mach.h>
++#include <mach/vm_statistics.h>
++#include <mach/mach_host.h>
++
++static int bb_sysinfo(struct sysinfo *si)
++{
++	struct timeval boot, now;
++	size_t len;
++	uint64_t memsize = 0;
++	vm_statistics64_data_t vm;
++	mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
++	double loads[3];
++	int mib[2];
++
++	memset(si, 0, sizeof(*si));
++
++	mib[0] = CTL_KERN;
++	mib[1] = KERN_BOOTTIME;
++	len = sizeof(boot);
++	if (sysctl(mib, 2, &boot, &len, NULL, 0) == 0) {
++		gettimeofday(&now, NULL);
++		if (now.tv_sec > boot.tv_sec)
++			si->uptime = (unsigned long)(now.tv_sec - boot.tv_sec);
++	}
++
++	len = sizeof(memsize);
++	if (sysctlbyname("hw.memsize", &memsize, &len, NULL, 0) == 0)
++		si->totalram = (unsigned long)memsize;
++
++	if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
++			(host_info64_t)&vm, &count) == KERN_SUCCESS
++	) {
++		unsigned long page = (unsigned long)vm_page_size;
++
++		si->freeram = (unsigned long)
++			(((uint64_t)vm.free_count + vm.speculative_count) * page);
++		si->bufferram = (unsigned long)
++			(((uint64_t)vm.purgeable_count + vm.wire_count) * page);
++	}
++
++	si->mem_unit = 1;
++	{
++		/* free(1) prints Swap: total/used/free from these.  macOS keeps swap
++		 * accounting in vm.swapusage rather than in the VM stats. */
++		struct xsw_usage xsw;
++		size_t xlen = sizeof(xsw);
++		if (sysctlbyname("vm.swapusage", &xsw, &xlen, NULL, 0) == 0) {
++			si->totalswap = (unsigned long)xsw.xsu_total;
++			si->freeswap = (unsigned long)xsw.xsu_avail;
++		}
++	}
++	if (getloadavg(loads, 3) == 3) {
++		/* uptime prints these via LOAD_INT/LOAD_FRAC, i.e. /2048 */
++		si->loads[0] = (unsigned long)(loads[0] * 2048.0);
++		si->loads[1] = (unsigned long)(loads[1] * 2048.0);
++		si->loads[2] = (unsigned long)(loads[2] * 2048.0);
++	}
++	return 0;
++}
++#define sysinfo(info) bb_sysinfo(info)
++
++/* Reclaimable page cache: inactive + purgeable pages.  One definition for
++ * free, vmstat and top, so the three do not report different "cached" values
++ * for the same machine. */
++static unsigned long long bb_darwin_cached_bytes(void)
++{
++	vm_statistics64_data_t vm;
++	mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
++
++	memset(&vm, 0, sizeof(vm));
++	if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
++			(host_info64_t)&vm, &count) != KERN_SUCCESS)
++		return 0;
++	return ((unsigned long long)vm.inactive_count + vm.purgeable_count)
++		* (unsigned long long)vm_page_size;
++}
++
++
++/* macOS has no posix_fallocate: F_PREALLOCATE does the work, then the file is
++ * grown so the semantics match glibc (size becomes offset+len). */
++#include <sys/fcntl.h>
++static int bb_posix_fallocate(int fd, off_t offset, off_t len)
++{
++	struct fstore fst;
++	struct stat st;
++
++	memset(&fst, 0, sizeof(fst));
++	fst.fst_flags = F_ALLOCATEALL;
++	fst.fst_posmode = F_PEOFPOSMODE;
++	fst.fst_offset = offset;
++	fst.fst_length = len;
++	if (fcntl(fd, F_PREALLOCATE, &fst) == -1)
++		return errno ? errno : EIO;
++	if (fstat(fd, &st) == 0 && st.st_size < offset + len) {
++		if (ftruncate(fd, offset + len) != 0)
++			return errno ? errno : EIO;
++	}
++	return 0;
++}
++#define posix_fallocate(fd, off, len) bb_posix_fallocate(fd, off, len)
++#endif /* __APPLE__ */
++
++#endif /* !__linux__ */
++
++#endif

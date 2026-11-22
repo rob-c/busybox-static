@@ -1,0 +1,154 @@
+diff --git a/libbb/find_mount_point.c b/libbb/find_mount_point.c
+--- a/libbb/find_mount_point.c
++++ b/libbb/find_mount_point.c
+@@ -45,6 +45,65 @@
+ 	if (!mtab_fp)
+ 		return NULL;
+ 
++#if defined(__APPLE__)
++	/* APFS firmlinks make "/" and "/System/Volumes/Data" report the same
++	 * st_dev, so the device matching below cannot tell them apart and the
++	 * first table entry (always "/") wins.  Match the longest mount-point
++	 * prefix of the requested path instead, which is what df(1) does.
++	 *
++	 * getmntent() hands back one reused static struct, so the winning entry
++	 * must be COPIED while iterating - keeping a pointer only ever yields the
++	 * last row of the table. */
++	if (!block_dev) {
++		char resolved[PATH_MAX];
++		const char *want = name;
++		/* static: the returned struct points into these */
++		static char best_dir[PATH_MAX];
++		static char best_name[PATH_MAX];
++		static char best_type[64];
++		size_t best_len = 0;
++		struct mntent *e;
++
++		best_dir[0] = best_name[0] = best_type[0] = '\0';
++		if (realpath(name, resolved))
++			want = resolved;
++		while ((e = getmntent(mtab_fp)) != NULL) {
++			size_t l = strlen(e->mnt_dir);
++			char last;
++
++			if (l == 0)
++				continue;
++			if (strncmp(want, e->mnt_dir, l) != 0)
++				continue;
++			/* the prefix must end on a path boundary */
++			last = e->mnt_dir[l - 1];
++			if (want[l] != '\0' && want[l] != '/' && last != '/')
++				continue;
++			if (l > best_len) {
++				best_len = l;
++				safe_strncpy(best_dir, e->mnt_dir, sizeof(best_dir));
++				safe_strncpy(best_name, e->mnt_fsname, sizeof(best_name));
++				safe_strncpy(best_type, e->mnt_type ? e->mnt_type : "", sizeof(best_type));
++			}
++		}
++		endmntent(mtab_fp);
++		if (best_len) {
++			static struct mntent keep;
++			keep.mnt_fsname = best_name;
++			keep.mnt_dir = best_dir;
++			keep.mnt_type = best_type;
++			keep.mnt_opts = (char *)"";
++			keep.mnt_freq = 0;
++			keep.mnt_passno = 0;
++			return &keep;
++		}
++		/* nothing matched by prefix: fall back to device matching */
++		mtab_fp = setmntent(bb_path_mtab_file, "r");
++		if (!mtab_fp)
++			return NULL;
++	}
++#endif
++
+ 	while ((mountEntry = getmntent(mtab_fp)) != NULL) {
+ 		/* rootfs mount in Linux 2.6 exists always,
+ 		 * and it makes sense to always ignore it.
+diff --git a/coreutils/df.c b/coreutils/df.c
+--- a/coreutils/df.c
++++ b/coreutils/df.c
+@@ -111,6 +111,34 @@
+ }
+ #endif
+ 
++#if defined(__APPLE__)
++/*
++ * APFS volumes in one container share their free space, so statvfs() reports
++ * container-wide usage: df would claim "/" is 71% full when the sealed system
++ * volume actually holds ~13 GB.  /bin/df asks the volume itself via
++ * ATTR_VOL_SPACEUSED, whose reply is a packed { uint32_t length; off_t used; }
++ * - note the value sits at offset 4, not 8, so it cannot be read through a
++ * normally-aligned struct.
++ */
++#include <sys/attr.h>
++
++static unsigned long long darwin_volume_used(const char *path)
++{
++	struct attrlist al;
++	unsigned char buf[32];
++	uint64_t used;
++
++	memset(&al, 0, sizeof(al));
++	al.bitmapcount = ATTR_BIT_MAP_COUNT;
++	al.volattr = ATTR_VOL_INFO | ATTR_VOL_SPACEUSED;
++	memset(buf, 0, sizeof(buf));
++	if (getattrlist(path, &al, buf, sizeof(buf), 0) != 0)
++		return 0;
++	memcpy(&used, buf + sizeof(uint32_t), sizeof(used));
++	return (unsigned long long)used;
++}
++#endif
++
+ int df_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
+ int df_main(int argc UNUSED_PARAM, char **argv)
+ {
+@@ -262,6 +290,7 @@
+ 
+ 		if ((s.f_blocks > 0) || !mount_table || (opt & OPT_ALL)) {
+ 			unsigned long long blocks_used;
++			unsigned long long print_used;
+ 			unsigned long long blocks_total;
+ 			unsigned blocks_percent_used;
+ 
+@@ -273,6 +302,20 @@
+ 					df_disp_hr = 1;
+ 			}
+ 			blocks_used = s.f_blocks - s.f_bfree;
++#if defined(__APPLE__)
++			/* per-volume usage, as /bin/df reports it */
++			if (!(opt & OPT_INODE)) {
++				unsigned long long vu = darwin_volume_used(mount_point);
++				if (vu != 0 && s.f_frsize != 0) {
++					unsigned long long in_frsize = vu / s.f_frsize;
++					if (in_frsize <= s.f_blocks)
++						blocks_used = in_frsize;
++				}
++			}
++#endif
++			/* the percentage loop below shifts blocks_used, so keep a copy
++			 * for the "Used" column */
++			print_used = blocks_used;
+ 			blocks_total = blocks_used + s.f_bavail;
+ 			blocks_percent_used = blocks_total; /* 0% if blocks_total == 0, else... */
+ 			if (blocks_total != 0) {
+@@ -334,7 +377,7 @@
+ 			printf(" %9s " + 1,
+ 				/* EXPR x f_frsize / df_disp_hr, show one fractional,
+ 				 * use suffixes if df_disp_hr == 0 */
+-				make_human_readable_str((s.f_blocks - s.f_bfree),
++				make_human_readable_str(print_used,
+ 						s.f_frsize, df_disp_hr));
+ 
+ 			printf("%9s %3u%% %s\n",
+@@ -345,7 +388,7 @@
+ #else
+ 			printf(" %9lu %9lu %9lu %3u%% %s\n",
+ 				kscale(s.f_blocks, s.f_frsize),
+-				kscale(s.f_blocks - s.f_bfree, s.f_frsize),
++				kscale(print_used, s.f_frsize),
+ 				kscale(s.f_bavail, s.f_frsize),
+ 				blocks_percent_used, mount_point);
+ #endif

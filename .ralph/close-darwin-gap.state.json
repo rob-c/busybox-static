@@ -1,0 +1,14 @@
+{
+  "name": "close-darwin-gap",
+  "taskFile": ".ralph/close-darwin-gap.md",
+  "iteration": 1,
+  "maxIterations": 50,
+  "itemsPerIteration": 1,
+  "reflectEvery": 5,
+  "reflectInstructions": "REFLECTION CHECKPOINT\n\nPause and reflect on your progress:\n1. What has been accomplished so far?\n2. What's working well?\n3. What's not working or blocking progress?\n4. Should the approach be adjusted?\n5. What are the next priorities?\n\nUpdate the task file with your reflection, then continue working.",
+  "active": true,
+  "status": "active",
+  "startedAt": "2026-11-21T19:51:40.613Z",
+  "lastReflectionAt": 0,
+  "ownerSessionId": "01a1fe54-f8af-734b-a09e-6b184ab91da4"
+}

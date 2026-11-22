@@ -1,0 +1,2026 @@
+diff --git a/coreutils/peek.c b/coreutils/peek.c
+new file mode 100644
+index 0000000..f23241c
+--- /dev/null
++++ b/coreutils/peek.c
+@@ -0,0 +1,846 @@
++/* vi: set sw=4 ts=4: */
++/*
++ * peek - bounded, numbered and versioned file reads.
++ *
++ * Licensed under GPLv2, see file LICENSE in this source tree.
++ */
++//config:config PEEK
++//config:	bool "peek (7 kb)"
++//config:	default y
++//config:	select AGENT_JSON
++//config:	help
++//config:	Bounded file inspection for tools: numbered lines, byte budget,
++//config:	truncation cursor and a content version for guarded edits.
++
++//applet:IF_PEEK(APPLET(peek, BB_DIR_USR_BIN, BB_SUID_DROP))
++
++//kbuild:lib-$(CONFIG_PEEK) += peek.o
++
++//usage:#define peek_trivial_usage
++//usage:       "[OPTIONS] FILE..."
++//usage:#define peek_full_usage "\n\n"
++//usage:       "Print numbered lines of FILE with an explicit byte budget"
++//usage:     "\n"
++//usage:     "\n	-l RANGE	Lines to print, 1-based inclusive: A:B, A, or :B"
++//usage:     "\n	-a STRING	Print windows around each literal STRING match"
++//usage:     "\n	-c N		Context lines for -a (default 10)"
++//usage:     "\n	-r		Treat -a as a POSIX extended regex"
++//usage:     "\n	-F N		Start at byte offset N (continuation)"
++//usage:     "\n	-B N		Byte budget for content (default 16384)"
++//usage:     "\n	-M N		Refuse files larger than N bytes (default 33554432)"
++//usage:     "\n	-R FILE		Batch request (JSON)"
++//usage:     "\n	-p		Hex preview of binary files"
++//usage:     "\n	-f FMT		Output format: text (default) or json"
++//usage:     "\n"
++//usage:     "\nExit: 0 ok, 1 operation failed, 2 usage error"
++//usage:     "\n\"truncated=true\" comes with next=--from-byte N; nothing is skipped."
++
++#include <regex.h>
++#include "libbb.h"
++#include "json_read.h"
++
++enum {
++	DEFAULT_MAX_BYTES = 16384,
++	DEFAULT_MAX_FILE = 32 * 1024 * 1024,
++	DEFAULT_CONTEXT = 10,
++	MAX_WINDOWS = 200,
++	BINARY_SNIFF = 8192,
++};
++
++struct peek_req {
++	char *id;
++	char *path;
++	char *lines;
++	char *around;
++	int context;
++	long from_byte;      /* -1 when unset */
++	int has_from;
++};
++
++struct peek_range {
++	unsigned first, last;   /* 0-based, inclusive */
++};
++
++struct peek_out {
++	int json;
++	size_t budget;      /* remaining content bytes */
++	size_t shown;       /* content bytes emitted */
++	int truncated;
++	size_t next_off;    /* byte offset to continue from */
++};
++
++/* ---------- helpers ---------- */
++
++static const char *find_bytes(const char *hay, size_t hlen,
++		const char *needle, size_t nlen, size_t start)
++{
++	size_t i, last;
++
++	if (nlen == 0 || nlen > hlen || start > hlen - nlen)
++		return NULL;
++	last = hlen - nlen;
++	for (i = start; i <= last; i++) {
++		if (hay[i] == needle[0] && memcmp(hay + i, needle, nlen) == 0)
++			return hay + i;
++	}
++	return NULL;
++}
++
++static size_t utf8_cut(const char *s, size_t n)
++{
++	while (n > 0 && ((unsigned char)s[n] & 0xc0) == 0x80)
++		n--;
++	return n;
++}
++
++static int detect_binary(const char *d, size_t len)
++{
++	size_t i, n = len < BINARY_SNIFF ? len : BINARY_SNIFF;
++	size_t ctrl = 0;
++
++	for (i = 0; i < n; i++) {
++		unsigned char c = (unsigned char)d[i];
++		if (c == 0)
++			return 1;
++		if (c < 0x20 && c != '\t' && c != '\n' && c != '\r')
++			ctrl++;
++	}
++	return n >= 8 && ctrl * 100 / n > 30;
++}
++
++static int read_whole_file(const char *path, size_t limit,
++		char **pdata, size_t *plen, int *pbin)
++{
++	int fd;
++	struct stat st;
++	char *data;
++	size_t len = 0, cap;
++
++	fd = open(path, O_RDONLY);
++	if (fd < 0)
++		return -1;
++	if (fstat(fd, &st) != 0) {
++		close(fd);
++		return -1;
++	}
++	if (S_ISDIR(st.st_mode)) {
++		close(fd);
++		errno = EISDIR;
++		return -1;
++	}
++	cap = st.st_size > 0 ? (size_t)st.st_size + 1 : 4096;
++	if (cap - 1 > limit) {
++		close(fd);
++		errno = EFBIG;
++		return -1;
++	}
++	data = xmalloc(cap);
++	for (;;) {
++		ssize_t r;
++
++		if (len == cap - 1) {
++			if (cap - 1 >= limit) {
++				free(data);
++				close(fd);
++				errno = EFBIG;
++				return -1;
++			}
++			cap *= 2;
++			if (cap - 1 > limit)
++				cap = limit + 1;
++			data = xrealloc(data, cap);
++		}
++		r = safe_read(fd, data + len, cap - 1 - len);
++		if (r < 0) {
++			if (errno == EINTR)
++				continue;
++			free(data);
++			close(fd);
++			return -1;
++		}
++		if (r == 0)
++			break;
++		len += (size_t)r;
++	}
++	close(fd);
++	data[len] = '\0';
++	*pdata = data;
++	*plen = len;
++	*pbin = detect_binary(data, len);
++	return 0;
++}
++
++static size_t *build_line_starts(const char *d, size_t len, unsigned *pn)
++{
++	size_t *v;
++	size_t i;
++	unsigned n = 0, cap = 256;
++
++	v = xmalloc(cap * sizeof(*v));
++	v[n++] = 0;
++	for (i = 0; i < len; i++) {
++		if (d[i] != '\n' || i + 1 >= len)
++			continue;
++		if (n == cap) {
++			cap *= 2;
++			v = xrealloc(v, cap * sizeof(*v));
++		}
++		v[n++] = i + 1;
++	}
++	*pn = n;
++	return v;
++}
++
++/* Index of the line containing byte offset off. */
++static unsigned line_of(const size_t *starts, unsigned n, size_t off)
++{
++	unsigned lo = 0, hi = n;
++
++	while (lo + 1 < hi) {
++		unsigned mid = (lo + hi) / 2;
++		if (starts[mid] <= off)
++			lo = mid;
++		else
++			hi = mid;
++	}
++	return lo;
++}
++
++static size_t line_text_len(const char *d, const size_t *starts,
++		unsigned n, size_t len, unsigned i)
++{
++	size_t end = (i + 1 < n) ? starts[i + 1] - 1 : len;
++
++	/* Drop the terminator for display only; the bytes are still hashed. */
++	if (end > starts[i] && d[end - 1] == '\n')
++		end--;
++	if (end > starts[i] && d[end - 1] == '\r')
++		end--;
++	return end - starts[i];
++}
++
++static void sha256_hex(const char *d, size_t len, char *out65)
++{
++	sha256_ctx_t ctx;
++	uint8_t raw[32];
++	unsigned i;
++
++	sha256_begin(&ctx);
++	sha256_hash(&ctx, d, len);
++	sha256_end(&ctx, raw);
++	for (i = 0; i < 32; i++)
++		sprintf(out65 + i * 2, "%02x", raw[i]);
++	out65[64] = '\0';
++}
++
++/* Write s as a JSON string literal. */
++static void json_write_str(const char *s, size_t n)
++{
++	size_t i;
++	char buf[8];
++
++	putchar('"');
++	for (i = 0; i < n; i++) {
++		unsigned char c = (unsigned char)s[i];
++		switch (c) {
++		case '"':  fputs("\\\"", stdout); break;
++		case '\\': fputs("\\\\", stdout); break;
++		case '\n': fputs("\\n", stdout); break;
++		case '\r': fputs("\\r", stdout); break;
++		case '\t': fputs("\\t", stdout); break;
++		case '\b': fputs("\\b", stdout); break;
++		case '\f': fputs("\\f", stdout); break;
++		default:
++			if (c < 0x20) {
++				sprintf(buf, "\\u%04x", c);
++				fputs(buf, stdout);
++			} else {
++				putchar(c);
++			}
++		}
++	}
++	putchar('"');
++}
++
++static void json_member_str(const char *key, const char *val)
++{
++	printf("\"%s\":", key);
++	if (val)
++		json_write_str(val, strlen(val));
++	else
++		fputs("null", stdout);
++}
++
++/* ---------- body emission ---------- */
++
++static void emit_line_text(unsigned n, const char *t, size_t tlen, int partial)
++{
++	printf("%u | ", n);
++	fwrite(t, 1, tlen, stdout);
++	if (partial)
++		fputs(" ...", stdout);
++	putchar('\n');
++}
++
++/*
++ * Emit lines first..last (0-based). from_off, when nonzero, starts the first
++ * line mid-way (continuation after a truncated view).
++ * Returns 1 when everything fit, 0 when the budget stopped us.
++ */
++static int emit_lines(const char *d, size_t len, const size_t *starts,
++		unsigned nlines, unsigned first, unsigned last, size_t from_off,
++		struct peek_out *o, int *any_emitted)
++{
++	unsigned li;
++
++	for (li = first; li <= last; li++) {
++		const char *t = d + starts[li];
++		size_t tlen = line_text_len(d, starts, nlines, len, li);
++		size_t skip = 0;
++		unsigned n = li + 1;
++		int ndig;
++		size_t cost;
++
++		if (from_off && li == first && from_off > starts[li]) {
++			skip = from_off - starts[li];
++			if (skip > tlen)
++				skip = tlen;
++		}
++		t += skip;
++		tlen -= skip;
++
++		ndig = (n < 10) ? 1 : (n < 100) ? 2 : (n < 1000) ? 3 :
++			(n < 10000) ? 4 : (n < 100000) ? 5 : 6;
++		cost = (size_t)ndig + 3 + tlen + 1;
++
++		if (o->shown + cost > o->budget) {
++			if (o->shown == 0 && o->budget > (size_t)ndig + 3) {
++				size_t room = o->budget - ((size_t)ndig + 3);
++				size_t cut = utf8_cut(t, room);
++				if (o->json) {
++					if (*any_emitted)
++						putchar(',');
++					printf("{\"n\":%u,\"text\":", n);
++					json_write_str(t, cut);
++					fputs("}", stdout);
++				} else {
++					emit_line_text(n, t, cut, 1);
++				}
++				*any_emitted = 1;
++				o->shown += (size_t)ndig + 3 + cut;
++				o->truncated = 1;
++				o->next_off = starts[li] + skip + cut;
++				return 0;
++			}
++			o->truncated = 1;
++			o->next_off = starts[li] + skip;
++			return 0;
++		}
++		if (o->json) {
++			if (*any_emitted)
++				putchar(',');
++			printf("{\"n\":%u,\"text\":", n);
++			json_write_str(t, tlen);
++			fputs("}", stdout);
++		} else {
++			emit_line_text(n, t, tlen, 0);
++		}
++		*any_emitted = 1;
++		o->shown += cost;
++	}
++	return 1;
++}
++
++static void hex_preview(const char *d, size_t len)
++{
++	size_t i, n = len < 64 ? len : 64;
++
++	printf("preview_bytes=%u\n", (unsigned)n);
++	for (i = 0; i < n; i += 16) {
++		size_t j, k = (n - i < 16) ? n - i : 16;
++
++		printf("%06x  ", (unsigned)i);
++		for (j = 0; j < 16; j++) {
++			if (j < k)
++				printf("%02x ", (unsigned char)d[i + j]);
++			else
++				fputs("   ", stdout);
++		}
++		putchar(' ');
++		for (j = 0; j < k; j++) {
++			unsigned char c = (unsigned char)d[i + j];
++			putchar((c >= 0x20 && c < 0x7f) ? c : '.');
++		}
++		putchar('\n');
++	}
++}
++
++/* ---------- request handling ---------- */
++
++static void fail_text(const char *path, const char *code, const char *msg)
++{
++	fflush(stdout);
++	bb_error_msg("%s: %s: %s", path ? path : "-", code, msg);
++}
++
++/*
++ * Run one request. Returns 0 on success, 1 on a handled failure.
++ * In JSON mode the result object is written by the caller's framing; this
++ * function writes only the object body via out_json_result().
++ */
++static int run_request(struct peek_req *rq, size_t max_file,
++		struct peek_out *o, int preview, int regex_mode,
++		char **err_code, char **err_msg)
++{
++	char *data = NULL;
++	size_t len = 0;
++	int bin = 0;
++	size_t *starts = NULL;
++	unsigned nlines = 0;
++	char hex[65];
++	struct peek_range ranges[MAX_WINDOWS];
++	unsigned nranges = 0;
++	unsigned i;
++	int any_emitted = 0;
++
++	*err_code = NULL;
++	*err_msg = NULL;
++	o->shown = 0;
++	o->truncated = 0;
++	o->next_off = 0;
++
++	if (!rq->path) {
++		*err_code = (char *)"INVALID_ARGUMENT";
++		*err_msg = xstrdup("request has no path");
++		return 1;
++	}
++	if (read_whole_file(rq->path, max_file, &data, &len, &bin) != 0) {
++		int e = errno;
++		*err_code = (char *)((e == ENOENT || e == ENOTDIR) ? "NOT_FOUND" :
++				(e == EFBIG) ? "UNSUPPORTED" :
++				(e == EACCES) ? "INVALID_ARGUMENT" : "INVALID_ARGUMENT");
++		*err_msg = xasprintf("%s", strerror(e));
++		return 1;
++	}
++
++	sha256_hex(data, len, hex);
++	starts = build_line_starts(data, len, &nlines);
++
++	/* Decide which lines to show. */
++	if (rq->lines) {
++		char *s = xstrdup(rq->lines);
++		char *colon = strchr(s, ':');
++		long a = 1, b;
++
++		if (colon) {
++			*colon = '\0';
++			if (s[0])
++				a = strtol(s, NULL, 10);
++			b = colon[1] ? strtol(colon + 1, NULL, 10) : (long)nlines;
++		} else {
++			a = strtol(s, NULL, 10);
++			b = a;
++		}
++		free(s);
++		if (a < 1)
++			a = 1;
++		if (b < a || (unsigned)a > nlines) {
++			*err_code = (char *)"NOT_FOUND";
++			*err_msg = xasprintf("line range %s is outside 1:%u",
++					rq->lines, nlines);
++			goto fail;
++		}
++		if ((unsigned)b > nlines)
++			b = (long)nlines;
++		ranges[0].first = (unsigned)a - 1;
++		ranges[0].last = (unsigned)b - 1;
++		nranges = 1;
++	} else if (rq->around) {
++		regex_t re;
++		int have_re = 0;
++		size_t off = 0;
++		unsigned ctx = rq->context < 0 ? 0 : (unsigned)rq->context;
++
++		if (regex_mode) {
++			if (regcomp(&re, rq->around, REG_EXTENDED) != 0) {
++				*err_code = (char *)"INVALID_ARGUMENT";
++				*err_msg = xasprintf("bad regex: %s", rq->around);
++				goto fail;
++			}
++			have_re = 1;
++		}
++		while (off <= len && nranges < MAX_WINDOWS) {
++			size_t mstart, mend;
++			unsigned line;
++
++			if (have_re) {
++				regmatch_t m;
++				if (regexec(&re, data + off, 1, &m, 0) != 0)
++					break;
++				mstart = off + (size_t)m.rm_so;
++				mend = off + (size_t)m.rm_eo;
++				if (mend == mstart)
++					mend = mstart + 1;   /* empty match: advance */
++			} else {
++				const char *hit = find_bytes(data, len, rq->around,
++						strlen(rq->around), off);
++				if (!hit)
++					break;
++				mstart = (size_t)(hit - data);
++				mend = mstart + strlen(rq->around);
++			}
++			line = line_of(starts, nlines, mstart);
++			{
++				unsigned lo = line > ctx ? line - ctx : 0;
++				unsigned hi = line + ctx;
++				if (hi >= nlines)
++					hi = nlines - 1;
++				if (nranges && lo <= ranges[nranges - 1].last + 1) {
++					if (hi > ranges[nranges - 1].last)
++						ranges[nranges - 1].last = hi;
++				} else {
++					ranges[nranges].first = lo;
++					ranges[nranges].last = hi;
++					nranges++;
++				}
++			}
++			off = mend > off ? mend : off + 1;
++		}
++		if (have_re)
++			regfree(&re);
++		if (nranges == 0) {
++			*err_code = (char *)"NOT_FOUND";
++			*err_msg = xasprintf("no match for \"%s\"", rq->around);
++			goto fail;
++		}
++	} else if (rq->has_from) {
++		unsigned line;
++
++		if ((size_t)rq->from_byte > len) {
++			*err_code = (char *)"INVALID_ARGUMENT";
++			*err_msg = xasprintf("from_byte %ld is past end of file (%lu bytes)",
++					rq->from_byte, (unsigned long)len);
++			goto fail;
++		}
++		line = line_of(starts, nlines, (size_t)rq->from_byte);
++		ranges[0].first = line;
++		ranges[0].last = nlines - 1;
++		nranges = 1;
++	} else {
++		ranges[0].first = 0;
++		ranges[0].last = nlines - 1;
++		nranges = 1;
++	}
++
++	/* Header (text mode) / result prefix (json mode). */
++	if (o->json) {
++		putchar('{');
++		if (rq->id) {
++			json_member_str("id", rq->id);
++			putchar(',');
++		}
++		json_member_str("path", rq->path);
++		printf(",\"status\":\"ok\",\"binary\":%s,\"version\":\"sha256:%s\"",
++				bin ? "true" : "false", hex);
++		fputs(",\"lines\":[", stdout);
++		for (i = 0; i < nranges; i++)
++			printf("%s[%u,%u]", i ? "," : "",
++					ranges[i].first + 1, ranges[i].last + 1);
++		fputs("],\"content\":[", stdout);
++	} else {
++		printf("%s lines=", rq->path);
++		for (i = 0; i < nranges; i++)
++			printf("%s%u-%u", i ? "," : "",
++					ranges[i].first + 1, ranges[i].last + 1);
++		printf(" version=sha256:%s", hex);
++		if (bin)
++			fputs(" binary=true", stdout);
++		if (rq->has_from)
++			printf(" from_byte=%ld", rq->from_byte);
++		putchar('\n');
++	}
++
++	if (bin) {
++		if (!o->json && preview)
++			hex_preview(data, len);
++	} else {
++		for (i = 0; i < nranges; i++) {
++			if (!o->json && i > 0)
++				fputs("--\n", stdout);
++			if (!emit_lines(data, len, starts, nlines,
++					ranges[i].first, ranges[i].last,
++					(i == 0 && rq->has_from) ? (size_t)rq->from_byte : 0,
++					o, &any_emitted))
++				break;
++		}
++	}
++
++	if (o->json) {
++		fputs("],", stdout);
++		printf("\"shown_bytes\":%u,\"truncated\":%s,\"next\":",
++				(unsigned)o->shown, o->truncated ? "true" : "false");
++		if (o->truncated)
++			printf("{\"from_byte\":%ld}", (long)o->next_off);
++		else
++			fputs("null", stdout);
++		putchar('}');
++	} else {
++		printf("shown_bytes=%u truncated=%s",
++				(unsigned)o->shown, o->truncated ? "true" : "false");
++		if (o->truncated)
++			printf(" next=--from-byte %ld", (long)o->next_off);
++		putchar('\n');
++	}
++	if (!o->json)
++		fflush(stdout);
++
++	free(starts);
++	free(data);
++	return 0;
++ fail:
++	free(starts);
++	free(data);
++	return 1;
++}
++
++static void json_error_result(const struct peek_req *rq,
++		const char *code, const char *msg)
++{
++	putchar('{');
++	if (rq->id) {
++		json_member_str("id", rq->id);
++		putchar(',');
++	}
++	if (rq->path) {
++		json_member_str("path", rq->path);
++		putchar(',');
++	}
++	fputs("\"status\":\"error\",\"code\":", stdout);
++	json_write_str(code, strlen(code));
++	fputs(",\"message\":", stdout);
++	json_write_str(msg, strlen(msg));
++	putchar('}');
++}
++
++int peek_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
++int peek_main(int argc UNUSED_PARAM, char **argv)
++{
++	char *opt_lines = NULL;
++	char *opt_around = NULL;
++	char *opt_ctx = NULL;
++	char *opt_budget = NULL;
++	char *opt_maxfile = NULL;
++	char *opt_from = NULL;
++	char *opt_fmt = NULL;
++	char *opt_req = NULL;
++	unsigned opts;
++	int json = 0;
++	int regex_mode = 0;
++	int preview = 0;
++	size_t budget = DEFAULT_MAX_BYTES;
++	size_t max_file = DEFAULT_MAX_FILE;
++	struct peek_out out;
++	int exitcode = 0;
++
++	static const char peek_longopts[] ALIGN1 =
++		"lines\0"      Required_argument "l"
++		"around\0"     Required_argument "a"
++		"context\0"    Required_argument "c"
++		"regex\0"      No_argument       "r"
++		"from-byte\0"  Required_argument "F"
++		"max-bytes\0"  Required_argument "B"
++		"max-file-bytes\0" Required_argument "M"
++		"request\0"    Required_argument "R"
++		"preview\0"    No_argument       "p"
++		"format\0"     Required_argument "f"
++		;
++
++	xfunc_error_retval = 2;   /* usage errors exit 2 */
++
++	opts = getopt32long(argv, "l:a:c:rF:B:M:R:pf:",
++			peek_longopts, &opt_lines, &opt_around, &opt_ctx,
++			&opt_from, &opt_budget, &opt_maxfile, &opt_req,
++			&opt_fmt);
++	(void)opts;
++	argv += optind;
++
++	regex_mode = (opts & (1 << 3)) != 0;    /* r is the 4th letter */
++	preview = (opts & (1 << 8)) != 0;       /* p is the 9th letter */
++
++	if (opt_fmt) {
++		if (strcmp(opt_fmt, "json") == 0)
++			json = 1;
++		else if (strcmp(opt_fmt, "text") != 0)
++			bb_error_msg_and_die("unknown format \"%s\"", opt_fmt);
++	}
++	if (opt_budget)
++		budget = (size_t)strtoul(opt_budget, NULL, 10);
++	if (opt_maxfile)
++		max_file = (size_t)strtoul(opt_maxfile, NULL, 10);
++
++	memset(&out, 0, sizeof(out));
++	out.json = json;
++	out.budget = budget;
++
++	if (opt_req) {
++		char *data = NULL;
++		size_t len = 0;
++		int bin;
++		char *err = NULL;
++		json_value_t *doc;
++		const json_value_t *reqs;
++		unsigned n, i;
++		unsigned emitted = 0;
++		unsigned unprocessed = 0;
++		size_t total_shown = 0;
++		int budget_left = (budget > 0);
++
++		if (read_whole_file(opt_req, 64 * 1024 * 1024, &data, &len, &bin) != 0) {
++			int e = errno;
++			if (json) {
++				printf("{\"schema\":1,\"error\":{\"code\":\"NOT_FOUND\","
++						"\"message\":");
++				json_write_str(strerror(e), strlen(strerror(e)));
++				fputs("}}\n", stdout);
++				return 1;
++			}
++			errno = e;
++			bb_perror_msg_and_die("%s", opt_req);
++		}
++		doc = json_parse(data, len, &err);
++		if (!doc) {
++			if (json) {
++				printf("{\"schema\":1,\"error\":{\"code\":\"INVALID_ARGUMENT\","
++						"\"message\":");
++				json_write_str(err ? err : "bad json", strlen(err ? err : "bad json"));
++				fputs("}}\n", stdout);
++				free(err);
++				free(data);
++				return 2;
++			}
++			bb_error_msg_and_die("%s: %s", opt_req, err ? err : "bad json");
++		}
++		free(err);
++		reqs = json_get(doc, "requests");
++		n = json_len(reqs);
++		if (json)
++			fputs("{\"schema\":1,\"results\":[", stdout);
++		for (i = 0; i < n; i++) {
++			const json_value_t *rj = json_at(reqs, i);
++			struct peek_req rq;
++			long fromb = json_int(json_get(rj, "from_byte"), -1);
++			long ctxv = json_int(json_get(rj, "context"), DEFAULT_CONTEXT);
++			char *code = NULL, *msg = NULL;
++
++			memset(&rq, 0, sizeof(rq));
++			rq.id = (char *)json_str(json_get(rj, "id"), NULL);
++			rq.path = (char *)json_str(json_get(rj, "path"), NULL);
++			rq.lines = (char *)json_str(json_get(rj, "lines"), NULL);
++			rq.around = (char *)json_str(json_get(rj, "around"), NULL);
++			rq.context = (int)ctxv;
++			if (fromb >= 0) {
++				rq.from_byte = fromb;
++				rq.has_from = 1;
++			}
++			if (emitted > 0 && budget_left == 0) {
++				/* budget spent: report, do not silently skip */
++				if (json) {
++					if (emitted > 0)
++						putchar(',');
++					json_error_result(&rq, "TRUNCATED", "output budget exhausted");
++				} else {
++					fail_text(rq.path, "TRUNCATED", "output budget exhausted");
++				}
++				exitcode = 1;
++				unprocessed++;
++				emitted++;
++				continue;
++			}
++			if (json && emitted > 0)
++				putchar(',');
++			out.budget = budget_left
++					? (total_shown < budget ? budget - total_shown : 0)
++					: 0;
++			if (run_request(&rq, max_file, &out, preview, regex_mode,
++					&code, &msg) != 0) {
++				exitcode = 1;
++				if (json)
++					json_error_result(&rq, code, msg);
++				else
++					fail_text(rq.path, code, msg);
++				free(msg);
++			}
++			emitted++;
++			total_shown += out.shown;
++			if (out.truncated || total_shown >= budget)
++				budget_left = 0;
++		}
++		if (json)
++			printf("],\"shown_bytes\":%u,\"unprocessed\":%u}\n",
++					(unsigned)total_shown, unprocessed);
++		json_free(doc);
++		free(data);
++		return exitcode;
++	}
++
++	/* Command line mode: one or more files. */
++	if (!argv[0])
++		bb_show_usage();
++	if (opt_lines && opt_around)
++		bb_error_msg_and_die("--lines and --around are mutually exclusive");
++	if (opt_lines && opt_from)
++		bb_error_msg_and_die("--lines and --from-byte are mutually exclusive");
++
++	if (json)
++		fputs("{\"schema\":1,\"results\":[", stdout);
++
++	{
++		unsigned idx = 0;
++		char **ap;
++		size_t total_shown = 0;
++		int budget_exhausted = 0;
++
++		for (ap = argv; *ap; ap++, idx++) {
++			struct peek_req rq;
++			char *code = NULL, *msg = NULL;
++
++			memset(&rq, 0, sizeof(rq));
++			rq.path = *ap;
++			rq.lines = opt_lines;
++			rq.around = opt_around;
++			rq.context = opt_ctx ? (int)strtol(opt_ctx, NULL, 10) : DEFAULT_CONTEXT;
++			if (opt_from) {
++				rq.from_byte = strtol(opt_from, NULL, 10);
++				rq.has_from = 1;
++			}
++			if (idx > 0 && budget_exhausted) {
++				if (json) {
++					if (idx > 0)
++						putchar(',');
++					json_error_result(&rq, "TRUNCATED", "output budget exhausted");
++				}
++				exitcode = 1;
++				continue;
++			}
++			if (json && idx > 0)
++				putchar(',');
++			out.budget = budget_exhausted ? 0
++					: budget - (total_shown < budget ? total_shown : budget);
++			if (run_request(&rq, max_file, &out, preview, regex_mode,
++					&code, &msg) != 0) {
++				exitcode = 1;
++				if (json)
++					json_error_result(&rq, code, msg);
++				else
++					fail_text(rq.path, code, msg);
++				free(msg);
++			}
++			total_shown += out.shown;
++			if (out.truncated || total_shown >= budget)
++				budget_exhausted = 1;
++		}
++		if (json)
++			printf("],\"shown_bytes\":%u}\n", (unsigned)total_shown);
++	}
++	return exitcode;
++}
+diff --git a/include/json_read.h b/include/json_read.h
+new file mode 100644
+index 0000000..15c6aee
+--- /dev/null
++++ b/include/json_read.h
+@@ -0,0 +1,53 @@
++/* vi: set sw=4 ts=4: */
++/*
++ * Minimal JSON reader for the agent-facing applets.
++ *
++ * Licensed under GPLv2, see file LICENSE in this source tree.
++ */
++#ifndef JSON_READ_H
++#define JSON_READ_H 1
++
++#include <stddef.h>
++
++enum { JSON_MAX_DEPTH = 32 };
++
++typedef enum {
++	JSON_NULL,
++	JSON_TRUE,
++	JSON_FALSE,
++	JSON_STRING,
++	JSON_NUMBER,
++	JSON_ARRAY,
++	JSON_OBJECT,
++} json_type_t;
++
++struct json_value {
++	json_type_t type;
++	char *key;                    /* member name; NULL at top level or in arrays */
++	char *str;                    /* STRING: decoded bytes. NUMBER: literal text */
++	struct json_value *child;     /* first child of ARRAY/OBJECT */
++	struct json_value *next;      /* next sibling */
++};
++typedef struct json_value json_value_t;
++
++/*
++ * Parse a complete JSON document. Strict RFC 8259 subset: no comments, no
++ * trailing commas, no single quotes, no NaN/Infinity, duplicate keys rejected.
++ * On error returns NULL and stores a malloc'd description (caller frees) in *err.
++ */
++json_value_t *json_parse(const char *buf, size_t len, char **err) FAST_FUNC;
++
++void json_free(json_value_t *v) FAST_FUNC;
++
++/* Lookup in an OBJECT. Returns NULL when absent or when v is not an object. */
++const json_value_t *json_get(const json_value_t *v, const char *key) FAST_FUNC;
++
++/* Typed accessors, all returning dflt on mismatch/missing. */
++const char *json_str(const json_value_t *v, const char *dflt) FAST_FUNC;
++long json_int(const json_value_t *v, long dflt) FAST_FUNC;
++int json_bool(const json_value_t *v, int dflt) FAST_FUNC;
++/* Element i of an ARRAY (0-based), NULL when out of range. */
++const json_value_t *json_at(const json_value_t *v, unsigned i) FAST_FUNC;
++unsigned json_len(const json_value_t *v) FAST_FUNC;
++
++#endif
+diff --git a/libbb/appletlib.c b/libbb/appletlib.c
+index 34b74c3..9efe2e7 100644
+--- a/libbb/appletlib.c
++++ b/libbb/appletlib.c
+@@ -28,6 +28,7 @@
+ 
+ /* Define this accessor before we #define "errno" our way */
+ #include <errno.h>
++#include <sys/utsname.h>
+ static inline int *get_perrno(void) { return &errno; }
+ 
+ #include "busybox.h"
+@@ -754,6 +755,21 @@ get_script_content(unsigned n)
+ # endif /* NUM_SCRIPTS > 0 */
+ 
+ # if ENABLE_BUSYBOX
++/* Cross-platform "arm64"/"aarch64"/"x86_64": uname(2) exists on both targets. */
++static const char *bb_utsname_machine(void)
++{
++	static char machine[64];
++	struct utsname u;
++
++	if (machine[0])
++		return machine;
++	if (uname(&u) == 0) {
++		strncpy(machine, u.machine, sizeof(machine) - 1);
++		machine[sizeof(machine) - 1] = '\0';
++	}
++	return machine[0] ? machine : "unknown";
++}
++
+ #  if ENABLE_FEATURE_SH_STANDALONE && ENABLE_FEATURE_TAB_COMPLETION
+     /*
+      * Insert "busybox" into applet table as well.
+@@ -850,6 +866,121 @@ int busybox_main(int argc UNUSED_PARAM, char **argv)
+ 	}
+ #  endif
+ 
++#if !defined(ENABLE_PEEK)
++# define ENABLE_PEEK 0
++#endif
++#if !defined(ENABLE_REPLACE)
++# define ENABLE_REPLACE 0
++#endif
++#if !defined(ENABLE_WAITFOR)
++# define ENABLE_WAITFOR 0
++#endif
++#if !defined(ENABLE_RUN)
++# define ENABLE_RUN 0
++#endif
++#if !defined(ENABLE_LOG)
++# define ENABLE_LOG 0
++#endif
++#if !defined(ENABLE_DOCTOR)
++# define ENABLE_DOCTOR 0
++#endif
++#if !defined(ENABLE_AGENT_JSON)
++# define ENABLE_AGENT_JSON 0
++#endif
++#if !defined(ENABLE_FEATURE_GNU_LONG_OPTS)
++# define ENABLE_FEATURE_GNU_LONG_OPTS 0
++#endif
++
++	if (strcmp(argv[1], "--caps") == 0) {
++		const char *a;
++		unsigned n = 0;
++		int json = 0;
++		int feat_n = 0;
++
++		if (argv[2] && strcmp(argv[2], "--format") == 0) {
++			if (!argv[3] || strcmp(argv[3], "json") != 0)
++				bb_error_msg_and_die("--format needs json");
++			json = 1;
++		} else if (argv[2]) {
++			bb_error_msg_and_die("unknown argument '%s'", argv[2]);
++		}
++
++		a = applet_names;
++		while (*a) {
++			n++;
++			a += strlen(a) + 1;
++		}
++
++#define CAP_FEATURE(cond, name) \
++	do { \
++		if (cond) { \
++			if (feat_n++) \
++				putchar(','); \
++			if (json) \
++				printf("\"%s\"", name); \
++			else \
++				fputs(name, stdout); \
++		} \
++	} while (0)
++
++		if (json) {
++			printf("{\"schema\":1,\"version\":\"%s\",\"platform\":\"%s\","
++				"\"arch\":\"%s\",\"count\":%u,\"features\":[",
++				BB_VER,
++#if defined(__APPLE__)
++				"darwin",
++#elif defined(__linux__)
++				"linux",
++#else
++				"unknown",
++#endif
++				bb_utsname_machine(), n);
++			CAP_FEATURE(ENABLE_FEATURE_GNU_LONG_OPTS, "gnu-long-opts");
++			CAP_FEATURE(ENABLE_PEEK, "peek");
++			CAP_FEATURE(ENABLE_REPLACE, "replace");
++			CAP_FEATURE(ENABLE_WAITFOR, "waitfor");
++			CAP_FEATURE(ENABLE_RUN, "run");
++			CAP_FEATURE(ENABLE_LOG, "log");
++			CAP_FEATURE(ENABLE_DOCTOR, "doctor");
++			CAP_FEATURE(ENABLE_AGENT_JSON, "json");
++			fputs("],\"names\":[", stdout);
++			a = applet_names;
++			{
++				unsigned i;
++				for (i = 0; i < n; i++) {
++					if (i)
++						putchar(',');
++					printf("\"%s\"", a);
++					a += strlen(a) + 1;
++				}
++			}
++			fputs("]}\n", stdout);
++		} else {
++			printf("busybox %s\nplatform=%s arch=%s schema=1 applets=%u\nfeatures=",
++				BB_VER,
++#if defined(__APPLE__)
++				"darwin",
++#elif defined(__linux__)
++				"linux",
++#else
++				"unknown",
++#endif
++				bb_utsname_machine(), n);
++			CAP_FEATURE(ENABLE_FEATURE_GNU_LONG_OPTS, "gnu-long-opts");
++			CAP_FEATURE(ENABLE_PEEK, "peek");
++			CAP_FEATURE(ENABLE_REPLACE, "replace");
++			CAP_FEATURE(ENABLE_WAITFOR, "waitfor");
++			CAP_FEATURE(ENABLE_RUN, "run");
++			CAP_FEATURE(ENABLE_LOG, "log");
++			CAP_FEATURE(ENABLE_DOCTOR, "doctor");
++			CAP_FEATURE(ENABLE_AGENT_JSON, "json");
++			putchar('\n');
++		}
++#undef CAP_FEATURE
++		fflush(NULL);
++		return 0;
++	}
++
+ 	if (is_prefixed_with(argv[1], "--list")) {
+ 		unsigned i = 0;
+ 		const char *a = applet_names;
+diff --git a/libbb/json_read.c b/libbb/json_read.c
+new file mode 100644
+index 0000000..ed6ae04
+--- /dev/null
++++ b/libbb/json_read.c
+@@ -0,0 +1,529 @@
++/* vi: set sw=4 ts=4: */
++/*
++ * Minimal JSON reader for the agent-facing applets.
++ *
++ * Strict RFC 8259 subset, DOM-lite, no allocation tricks: a document is parsed
++ * into a tree of json_value_t and freed with json_free(). Deliberately not a
++ * jq clone: no pretty-printer, no path expressions, no writer.
++ *
++ * Licensed under GPLv2, see file LICENSE in this source tree.
++ */
++//config:config AGENT_JSON
++//config:	bool
++//config:	default n
++//config:	help
++//config:	Internal: JSON reader used by peek, replace and run.
++//config:	Selected automatically; not a user-visible option.
++
++//kbuild:lib-$(CONFIG_AGENT_JSON) += json_read.o
++
++#include "libbb.h"
++#include "json_read.h"
++
++struct parser {
++	const char *p;
++	const char *end;
++	unsigned depth;
++	char *err;
++};
++
++static void set_err(struct parser *ps, const char *fmt, ...)
++{
++	va_list ap;
++	char buf[256];
++
++	if (ps->err)
++		return;
++	va_start(ap, fmt);
++	vsnprintf(buf, sizeof(buf), fmt, ap);
++	va_end(ap);
++	ps->err = xstrdup(buf);
++}
++
++static int at_end(struct parser *ps)
++{
++	return ps->p >= ps->end;
++}
++
++static void skip_ws(struct parser *ps)
++{
++	while (!at_end(ps)
++	 && (*ps->p == ' ' || *ps->p == '\t' || *ps->p == '\n' || *ps->p == '\r')
++	) {
++		ps->p++;
++	}
++}
++
++static json_value_t *new_value(json_type_t t)
++{
++	json_value_t *v = xzalloc(sizeof(*v));
++	v->type = t;
++	return v;
++}
++
++/* Encode one code point as UTF-8 (no validation: callers supply scalars). */
++static unsigned put_utf8(char *out, unsigned cp)
++{
++	if (cp < 0x80) {
++		out[0] = (char)cp;
++		return 1;
++	}
++	if (cp < 0x800) {
++		out[0] = (char)(0xc0 | (cp >> 6));
++		out[1] = (char)(0x80 | (cp & 0x3f));
++		return 2;
++	}
++	if (cp < 0x10000) {
++		out[0] = (char)(0xe0 | (cp >> 12));
++		out[1] = (char)(0x80 | ((cp >> 6) & 0x3f));
++		out[2] = (char)(0x80 | (cp & 0x3f));
++		return 3;
++	}
++	out[0] = (char)(0xf0 | (cp >> 18));
++	out[1] = (char)(0x80 | ((cp >> 12) & 0x3f));
++	out[2] = (char)(0x80 | ((cp >> 6) & 0x3f));
++	out[3] = (char)(0x80 | (cp & 0x3f));
++	return 4;
++}
++
++static int hex4(struct parser *ps, unsigned *out)
++{
++	unsigned v = 0;
++	int i;
++
++	if (ps->end - ps->p < 4) {
++		set_err(ps, "truncated \\u escape");
++		return 0;
++	}
++	for (i = 0; i < 4; i++) {
++		char c = ps->p[i];
++		v <<= 4;
++		if (c >= '0' && c <= '9')
++			v |= (unsigned)(c - '0');
++		else if (c >= 'a' && c <= 'f')
++			v |= (unsigned)(c - 'a' + 10);
++		else if (c >= 'A' && c <= 'F')
++			v |= (unsigned)(c - 'A' + 10);
++		else {
++			set_err(ps, "bad hex digit in \\u escape");
++			return 0;
++		}
++	}
++	ps->p += 4;
++	*out = v;
++	return 1;
++}
++
++/* Parse a string token; ps->p points at the opening quote. */
++static char *pstring(struct parser *ps)
++{
++	char *out;
++	size_t cap, len = 0;
++
++	ps->p++;                     /* opening quote */
++	cap = (size_t)(ps->end - ps->p) + 1;   /* upper bound */
++	out = xmalloc(cap);
++	for (;;) {
++		char c;
++
++		if (at_end(ps)) {
++			set_err(ps, "unterminated string");
++			goto bad;
++		}
++		c = *ps->p++;
++		if (c == '"')
++			break;
++		if ((unsigned char)c < 0x20) {
++			set_err(ps, "raw control character 0x%02x in string", (unsigned char)c);
++			goto bad;
++		}
++		if (c != '\\') {
++			out[len++] = c;
++			continue;
++		}
++		if (at_end(ps)) {
++			set_err(ps, "unterminated escape");
++			goto bad;
++		}
++		c = *ps->p++;
++		switch (c) {
++		case '"':  out[len++] = '"';  break;
++		case '\\': out[len++] = '\\'; break;
++		case '/':  out[len++] = '/';  break;
++		case 'b':  out[len++] = '\b'; break;
++		case 'f':  out[len++] = '\f'; break;
++		case 'n':  out[len++] = '\n'; break;
++		case 'r':  out[len++] = '\r'; break;
++		case 't':  out[len++] = '\t'; break;
++		case 'u': {
++			unsigned cp;
++			if (!hex4(ps, &cp))
++				goto bad;
++			if (cp >= 0xd800 && cp <= 0xdbff) {
++				unsigned lo;
++				if (ps->end - ps->p < 2 || ps->p[0] != '\\' || ps->p[1] != 'u') {
++					set_err(ps, "unpaired high surrogate");
++					goto bad;
++				}
++				ps->p += 2;
++				if (!hex4(ps, &lo))
++					goto bad;
++				if (lo < 0xdc00 || lo > 0xdfff) {
++					set_err(ps, "bad low surrogate");
++					goto bad;
++				}
++				cp = 0x10000 + ((cp - 0xd800) << 10) + (lo - 0xdc00);
++			} else if (cp >= 0xdc00 && cp <= 0xdfff) {
++				set_err(ps, "unpaired low surrogate");
++				goto bad;
++			}
++			len += put_utf8(out + len, cp);
++			break;
++		}
++		default:
++			set_err(ps, "unknown escape \\%c", c);
++			goto bad;
++		}
++	}
++	out[len] = '\0';
++	return out;
++ bad:
++	free(out);
++	return NULL;
++}
++
++static json_value_t *pvalue(struct parser *ps);
++
++/* Validate a JSON number and keep its literal text. */
++static char *pnumber(struct parser *ps)
++{
++	const char *start = ps->p;
++	const char *p = ps->p;
++
++	if (p < ps->end && *p == '-')
++		p++;
++	if (p >= ps->end)
++		goto bad;
++	if (*p == '0') {
++		p++;
++	} else if (*p >= '1' && *p <= '9') {
++		while (p < ps->end && *p >= '0' && *p <= '9')
++			p++;
++	} else {
++		goto bad;
++	}
++	if (p < ps->end && *p == '.') {
++		p++;
++		if (p >= ps->end || *p < '0' || *p > '9')
++			goto bad;
++		while (p < ps->end && *p >= '0' && *p <= '9')
++			p++;
++	}
++	if (p < ps->end && (*p == 'e' || *p == 'E')) {
++		p++;
++		if (p < ps->end && (*p == '+' || *p == '-'))
++			p++;
++		if (p >= ps->end || *p < '0' || *p > '9')
++			goto bad;
++		while (p < ps->end && *p >= '0' && *p <= '9')
++			p++;
++	}
++	ps->p = p;
++	return xstrndup(start, (size_t)(p - start));
++ bad:
++	set_err(ps, "malformed number");
++	return NULL;
++}
++
++static int key_seen(const json_value_t *obj, const char *key)
++{
++	const json_value_t *c;
++
++	for (c = obj->child; c; c = c->next)
++		if (c->key && strcmp(c->key, key) == 0)
++			return 1;
++	return 0;
++}
++
++static json_value_t *pobject(struct parser *ps)
++{
++	json_value_t *obj = new_value(JSON_OBJECT);
++	json_value_t **tail = &obj->child;
++
++	ps->p++;                     /* '{' */
++	skip_ws(ps);
++	if (!at_end(ps) && *ps->p == '}') {
++		ps->p++;
++		return obj;
++	}
++	for (;;) {
++		char *key;
++		json_value_t *val;
++
++		skip_ws(ps);
++		if (at_end(ps) || *ps->p != '"') {
++			set_err(ps, "expected object key");
++			goto bad;
++		}
++		key = pstring(ps);
++		if (!key)
++			goto bad;
++		if (key_seen(obj, key)) {
++			set_err(ps, "duplicate key \"%s\"", key);
++			free(key);
++			goto bad;
++		}
++		skip_ws(ps);
++		if (at_end(ps) || *ps->p != ':') {
++			set_err(ps, "expected ':' after key \"%s\"", key);
++			free(key);
++			goto bad;
++		}
++		ps->p++;
++		val = pvalue(ps);
++		if (!val) {
++			free(key);
++			goto bad;
++		}
++		val->key = key;
++		*tail = val;
++		tail = &val->next;
++		skip_ws(ps);
++		if (at_end(ps)) {
++			set_err(ps, "unterminated object");
++			goto bad;
++		}
++		if (*ps->p == ',') {
++			ps->p++;
++			continue;
++		}
++		if (*ps->p == '}') {
++			ps->p++;
++			return obj;
++		}
++		set_err(ps, "expected ',' or '}'");
++		goto bad;
++	}
++ bad:
++	json_free(obj);
++	return NULL;
++}
++
++static json_value_t *parray(struct parser *ps)
++{
++	json_value_t *arr = new_value(JSON_ARRAY);
++	json_value_t **tail = &arr->child;
++
++	ps->p++;                     /* '[' */
++	skip_ws(ps);
++	if (!at_end(ps) && *ps->p == ']') {
++		ps->p++;
++		return arr;
++	}
++	for (;;) {
++		json_value_t *val = pvalue(ps);
++
++		if (!val)
++			goto bad;
++		*tail = val;
++		tail = &val->next;
++		skip_ws(ps);
++		if (at_end(ps)) {
++			set_err(ps, "unterminated array");
++			goto bad;
++		}
++		if (*ps->p == ',') {
++			ps->p++;
++			continue;
++		}
++		if (*ps->p == ']') {
++			ps->p++;
++			return arr;
++		}
++		set_err(ps, "expected ',' or ']'");
++		goto bad;
++	}
++ bad:
++	json_free(arr);
++	return NULL;
++}
++
++static json_value_t *pvalue(struct parser *ps)
++{
++	json_value_t *v;
++
++	skip_ws(ps);
++	if (at_end(ps)) {
++		set_err(ps, "unexpected end of input");
++		return NULL;
++	}
++	if (ps->depth >= JSON_MAX_DEPTH) {
++		set_err(ps, "nesting deeper than %d", JSON_MAX_DEPTH);
++		return NULL;
++	}
++	switch (*ps->p) {
++	case '{':
++		ps->depth++;
++		v = pobject(ps);
++		ps->depth--;
++		return v;
++	case '[':
++		ps->depth++;
++		v = parray(ps);
++		ps->depth--;
++		return v;
++	case '"':
++		v = new_value(JSON_STRING);
++		v->str = pstring(ps);
++		if (!v->str) {
++			free(v);
++			return NULL;
++		}
++		return v;
++	case 't':
++		if (ps->end - ps->p >= 4 && memcmp(ps->p, "true", 4) == 0) {
++			ps->p += 4;
++			return new_value(JSON_TRUE);
++		}
++		break;
++	case 'f':
++		if (ps->end - ps->p >= 5 && memcmp(ps->p, "false", 5) == 0) {
++			ps->p += 5;
++			return new_value(JSON_FALSE);
++		}
++		break;
++	case 'n':
++		if (ps->end - ps->p >= 4 && memcmp(ps->p, "null", 4) == 0) {
++			ps->p += 4;
++			return new_value(JSON_NULL);
++		}
++		break;
++	default:
++		if (*ps->p == '-' || (*ps->p >= '0' && *ps->p <= '9')) {
++			v = new_value(JSON_NUMBER);
++			v->str = pnumber(ps);
++			if (!v->str) {
++				free(v);
++				return NULL;
++			}
++			return v;
++		}
++	}
++	set_err(ps, "unexpected character '%c'", *ps->p);
++	return NULL;
++}
++
++json_value_t *json_parse(const char *buf, size_t len, char **err)
++{
++	struct parser ps;
++	json_value_t *v;
++
++	memset(&ps, 0, sizeof(ps));
++	ps.p = buf;
++	ps.end = buf + len;
++	if (err)
++		*err = NULL;
++
++	/* Tolerate a UTF-8 BOM: some editors add one. */
++	if (len >= 3 && memcmp(buf, "\xef\xbb\xbf", 3) == 0)
++		ps.p += 3;
++
++	v = pvalue(&ps);
++	if (!v)
++		goto out;
++	skip_ws(&ps);
++	if (!at_end(&ps)) {
++		set_err(&ps, "trailing data after value");
++		json_free(v);
++		v = NULL;
++	}
++ out:
++	if (ps.err) {
++		char *with_off = xasprintf("at byte %ld: %s",
++				(long)(ps.p - buf), ps.err);
++		if (err)
++			*err = with_off;
++		else
++			free(with_off);
++	}
++	return v;
++}
++
++void json_free(json_value_t *v)
++{
++	while (v) {
++		json_value_t *next = v->next;
++		json_free(v->child);
++		free(v->key);
++		free(v->str);
++		free(v);
++		v = next;
++	}
++}
++
++const json_value_t *json_get(const json_value_t *v, const char *key)
++{
++	const json_value_t *c;
++
++	if (!v || v->type != JSON_OBJECT)
++		return NULL;
++	for (c = v->child; c; c = c->next)
++		if (c->key && strcmp(c->key, key) == 0)
++			return c;
++	return NULL;
++}
++
++const char *json_str(const json_value_t *v, const char *dflt)
++{
++	if (!v || v->type != JSON_STRING)
++		return dflt;
++	return v->str;
++}
++
++long json_int(const json_value_t *v, long dflt)
++{
++	char *end;
++	long n;
++
++	if (!v || v->type != JSON_NUMBER)
++		return dflt;
++	n = strtol(v->str, &end, 10);
++	if (end == v->str || *end)
++		return dflt;
++	return n;
++}
++
++int json_bool(const json_value_t *v, int dflt)
++{
++	if (!v)
++		return dflt;
++	if (v->type == JSON_TRUE)
++		return 1;
++	if (v->type == JSON_FALSE)
++		return 0;
++	return dflt;
++}
++
++const json_value_t *json_at(const json_value_t *v, unsigned i)
++{
++	const json_value_t *c;
++
++	if (!v || v->type != JSON_ARRAY)
++		return NULL;
++	for (c = v->child; c; c = c->next)
++		if (i-- == 0)
++			return c;
++	return NULL;
++}
++
++unsigned json_len(const json_value_t *v)
++{
++	const json_value_t *c;
++	unsigned n = 0;
++
++	if (!v || (v->type != JSON_ARRAY && v->type != JSON_OBJECT))
++		return 0;
++	for (c = v->child; c; c = c->next)
++		n++;
++	return n;
++}
+diff --git a/miscutils/waitfor.c b/miscutils/waitfor.c
+new file mode 100644
+index 0000000..d835e4c
+--- /dev/null
++++ b/miscutils/waitfor.c
+@@ -0,0 +1,418 @@
++/* vi: set sw=4 ts=4: */
++/*
++ * waitfor - bounded readiness polling.
++ *
++ * Licensed under GPLv2, see file LICENSE in this source tree.
++ */
++//config:config WAITFOR
++//config:	bool "waitfor (5 kb)"
++//config:	default y
++//config:	help
++//config:	Poll for file, TCP, unix-socket or HTTP readiness with one deadline.
++
++//applet:IF_WAITFOR(APPLET(waitfor, BB_DIR_USR_BIN, BB_SUID_DROP))
++
++//kbuild:lib-$(CONFIG_WAITFOR) += waitfor.o
++
++//usage:#define waitfor_trivial_usage
++//usage:       "[-T SECS] {--file PATH | --tcp HOST:PORT | --unix PATH | --http URL}"
++//usage:#define waitfor_full_usage "\n\n"
++//usage:       "Wait until a readiness condition holds, or the deadline expires"
++//usage:     "\n	-f, --file PATH		Wait for PATH to exist"
++//usage:     "\n	-t, --tcp HOST:PORT	Wait for a TCP connect to succeed"
++//usage:     "\n	-u, --unix PATH		Wait for a unix socket to accept"
++//usage:     "\n	-H, --http URL		Wait for an HTTP status (http:// only)"
++//usage:     "\n	-e, --expect CODE	Expected HTTP status (default 200)"
++//usage:     "\n	-T, --timeout SECS	Overall deadline (default 20)"
++//usage:     "\n	-i, --interval MS	Initial poll interval (default 20)"
++//usage:     "\n	-F, --format FMT	text (default) or json"
++//usage:     "\n"
++//usage:     "\nExit: 0 ready, 3 timeout/cancelled, 1 invalid input, 2 usage error"
++//usage:     "\nA TCP connect proves the port accepts connections, not that the"
++//usage:     "\napplication behind it is ready. https:// needs wget --spider."
++
++#include <sys/un.h>
++#include "libbb.h"
++
++enum {
++	DEFAULT_TIMEOUT_MS = 20000,
++	DEFAULT_INTERVAL_MS = 20,
++	MAX_INTERVAL_MS = 200,
++	CONNECT_TIMEOUT_MS = 1000,
++	HTTP_MAX_HEADER = 8192,
++};
++
++struct opts {
++	const char *file;
++	const char *unix_path;
++	const char *http;
++	const char *target;
++	char *host;
++	char *path;
++	int port;
++	int kind;           /* 0 file, 1 tcp, 2 unix, 3 http */
++	long expect;
++	long timeout_ms;
++	long interval_ms;
++	int json;
++};
++
++static void on_sig(int sig)
++{
++	bb_got_signal = sig;
++}
++
++static void sleep_ms(long ms)
++{
++	/* poll(), not sleep(): a signal interrupts it, so ^C is prompt */
++	if (ms > 0)
++		poll(NULL, 0, (int)ms);
++}
++
++static void json_str(const char *s)
++{
++	putchar('"');
++	for (; *s; s++) {
++		unsigned char c = (unsigned char)*s;
++		if (c == '"' || c == '\\') {
++			putchar('\\');
++			putchar(c);
++		} else if (c == '\n') {
++			fputs("\\n", stdout);
++		} else if (c >= 0x20) {
++			putchar(c);
++		}
++	}
++	putchar('"');
++}
++
++static int wait_file(const char *path)
++{
++	struct stat st;
++
++	return stat(path, &st) == 0;
++}
++
++/* Connect with its own timeout, so a single attempt cannot eat the deadline. */
++static int wait_unix(const char *path)
++{
++	struct sockaddr_un sun;
++	int fd, rc;
++
++	memset(&sun, 0, sizeof(sun));
++	sun.sun_family = AF_UNIX;
++	if (strlen(path) >= sizeof(sun.sun_path))
++		return 0;
++	strcpy(sun.sun_path, path);
++	fd = socket(AF_UNIX, SOCK_STREAM, 0);
++	if (fd < 0)
++		return 0;
++	rc = connect(fd, (struct sockaddr *)&sun, sizeof(sun));
++	close(fd);
++	return rc == 0;
++}
++
++static int wait_tcp(const char *host, int port, int timeout_ms)
++{
++	int fd, rc, err = 0;
++	socklen_t errlen = sizeof(err);
++	len_and_sockaddr *lsa;
++	struct pollfd pfd;
++
++	lsa = xhost2sockaddr(host, port);
++	fd = socket(lsa->u.sa.sa_family, SOCK_STREAM, 0);
++	if (fd < 0) {
++		free(lsa);
++		return 0;
++	}
++	ndelay_on(fd);
++	rc = connect(fd, &lsa->u.sa, lsa->len);
++	if (rc != 0) {
++		if (errno != EINPROGRESS) {
++			close(fd);
++			free(lsa);
++			return 0;
++		}
++		pfd.fd = fd;
++		pfd.events = POLLOUT;
++		pfd.revents = 0;
++		if (poll(&pfd, 1, timeout_ms) <= 0
++		 || getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &errlen) != 0
++		 || err != 0
++		) {
++			close(fd);
++			free(lsa);
++			return 0;
++		}
++	}
++	close(fd);
++	free(lsa);
++	return 1;
++}
++
++/* Plain HTTP GET: portable, and the status code is observable (unlike --spider). */
++static int try_http(const struct opts *o, int timeout_ms)
++{
++	int fd, status = 0;
++	len_and_sockaddr *lsa;
++	struct timeval tv;
++	struct pollfd pfd;
++	char req[512];
++	char *buf;
++	size_t used = 0, need, off;
++	ssize_t r;
++
++	lsa = xhost2sockaddr(o->host, o->port);
++	fd = socket(lsa->u.sa.sa_family, SOCK_STREAM, 0);
++	if (fd < 0) {
++		free(lsa);
++		return 0;
++	}
++	ndelay_on(fd);
++	if (connect(fd, &lsa->u.sa, lsa->len) != 0) {
++		int err = 0;
++		socklen_t errlen = sizeof(err);
++
++		if (errno != EINPROGRESS) {
++			close(fd);
++			free(lsa);
++			return 0;
++		}
++		pfd.fd = fd;
++		pfd.events = POLLOUT;
++		pfd.revents = 0;
++		if (poll(&pfd, 1, timeout_ms) <= 0
++		 || getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &errlen) != 0
++		 || err != 0
++		) {
++			close(fd);
++			free(lsa);
++			return 0;
++		}
++	}
++	free(lsa);
++
++	snprintf(req, sizeof(req),
++			"GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n"
++			"User-Agent: busybox-waitfor\r\n\r\n",
++			o->path, o->host);
++	need = strlen(req);
++	off = 0;
++	while (off < need) {
++		r = write(fd, req + off, need - off);
++		if (r < 0) {
++			if (errno == EINTR)
++				continue;
++			close(fd);
++			return 0;
++		}
++		off += (size_t)r;
++	}
++
++	tv.tv_sec = timeout_ms / 1000;
++	tv.tv_usec = (timeout_ms % 1000) * 1000;
++	setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
++
++	buf = xmalloc(HTTP_MAX_HEADER);
++	buf[0] = '\0';
++	while (used < HTTP_MAX_HEADER - 1) {
++		r = read(fd, buf + used, HTTP_MAX_HEADER - 1 - used);
++		if (r <= 0)
++			break;
++		used += (size_t)r;
++		buf[used] = '\0';
++		if (strstr(buf, "\r\n\r\n") || strstr(buf, "\n\n"))
++			break;
++	}
++	buf[used] = '\0';
++	if (used > 5 && strncmp(buf, "HTTP/", 5) == 0) {
++		const char *sp = strchr(buf, ' ');
++		if (sp)
++			status = atoi(sp + 1);
++	}
++	close(fd);
++	free(buf);
++	return status;
++}
++
++/* host, port and path out of http://HOST[:PORT]/PATH */
++static void parse_http(struct opts *o)
++{
++	const char *p = o->http + 7;    /* past "http://" */
++	const char *slash = strchr(p, '/');
++	const char *colon = strchr(p, ':');
++
++	o->port = 80;
++	if (colon && (!slash || colon < slash)) {
++		o->host = xstrndup(p, (size_t)(colon - p));
++		o->port = atoi(colon + 1);
++	} else {
++		o->host = xstrndup(p, slash ? (size_t)(slash - p) : strlen(p));
++	}
++	o->path = xstrdup(slash ? slash : "/");
++	if (o->port <= 0 || o->port > 65535)
++		bb_error_msg_and_die("bad port in \"%s\"", o->http);
++}
++
++int waitfor_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
++int waitfor_main(int argc UNUSED_PARAM, char **argv)
++{
++	char *opt_file = NULL;
++	char *opt_tcp = NULL;
++	char *opt_unix = NULL;
++	char *opt_http = NULL;
++	char *opt_expect = NULL;
++	char *opt_timeout = NULL;
++	char *opt_interval = NULL;
++	char *opt_fmt = NULL;
++	unsigned opts;
++	struct opts o;
++	unsigned long long deadline, start;
++	long attempt = 0, interval, elapsed_ms;
++	int ready = 0, last_status = 0;
++
++	static const char waitfor_longopts[] ALIGN1 =
++		"file\0"     Required_argument "f"
++		"tcp\0"      Required_argument "t"
++		"unix\0"     Required_argument "u"
++		"http\0"     Required_argument "H"
++		"expect\0"   Required_argument "e"
++		"timeout\0"  Required_argument "T"
++		"interval\0" Required_argument "i"
++		"format\0"   Required_argument "F"
++		;
++
++	xfunc_error_retval = 2;
++
++	opts = getopt32long(argv, "f:t:u:H:e:T:i:F:", waitfor_longopts,
++			&opt_file, &opt_tcp, &opt_unix, &opt_http, &opt_expect,
++			&opt_timeout, &opt_interval, &opt_fmt);
++	(void)opts;
++
++	memset(&o, 0, sizeof(o));
++	o.expect = 200;
++	o.timeout_ms = DEFAULT_TIMEOUT_MS;
++	o.interval_ms = DEFAULT_INTERVAL_MS;
++
++	if (opt_fmt) {
++		if (strcmp(opt_fmt, "json") == 0)
++			o.json = 1;
++		else if (strcmp(opt_fmt, "text") != 0)
++			bb_error_msg_and_die("unknown format \"%s\"", opt_fmt);
++	}
++	if (opt_expect)
++		o.expect = strtol(opt_expect, NULL, 10);
++	if (opt_timeout) {
++		double s = strtod(opt_timeout, NULL);
++		if (!(s > 0))
++			bb_error_msg_and_die("bad timeout \"%s\"", opt_timeout);
++		o.timeout_ms = (long)(s * 1000.0);
++	}
++	if (opt_interval)
++		o.interval_ms = strtol(opt_interval, NULL, 10);
++	if (o.interval_ms < 1)
++		o.interval_ms = 1;
++	if (o.interval_ms > MAX_INTERVAL_MS)
++		o.interval_ms = MAX_INTERVAL_MS;
++
++	if ((!!opt_file + !!opt_tcp + !!opt_unix + !!opt_http) != 1)
++		bb_error_msg_and_die("exactly one of --file/--tcp/--unix/--http is required");
++
++	o.file = opt_file;
++	o.unix_path = opt_unix;
++	o.http = opt_http;
++	if (opt_file) {
++		o.kind = 0;
++		o.target = opt_file;
++	} else if (opt_unix) {
++		o.kind = 2;
++		o.target = opt_unix;
++	} else if (opt_http) {
++		if (strncmp(opt_http, "http://", 7) != 0)
++			bb_error_msg_and_die("only http:// is handled here; "
++					"use `wget --spider` for https://");
++		o.kind = 3;
++		o.target = opt_http;
++		parse_http(&o);
++	} else {
++		char *colon = strrchr(opt_tcp, ':');
++		if (!colon)
++			bb_error_msg_and_die("--tcp needs HOST:PORT");
++		*colon = '\0';
++		o.kind = 1;
++		o.host = opt_tcp[0] ? xstrdup(opt_tcp) : xstrdup("127.0.0.1");
++		o.port = atoi(colon + 1);
++		if (o.port <= 0 || o.port > 65535)
++			bb_error_msg_and_die("bad port in \"%s\"", opt_tcp);
++		o.target = xasprintf("%s:%d", o.host, o.port);
++	}
++
++	bb_signals((1 << (SIGINT - 1)) | (1 << (SIGTERM - 1)), on_sig);
++
++	start = monotonic_us();
++	deadline = start + (unsigned long long)o.timeout_ms * 1000ULL;
++	interval = o.interval_ms;
++
++	for (;;) {
++		unsigned long long now;
++		long remain_ms;
++
++		if (bb_got_signal)
++			break;
++		attempt++;
++
++		switch (o.kind) {
++		case 0: ready = wait_file(o.file); break;
++		case 1: ready = wait_tcp(o.host, o.port, CONNECT_TIMEOUT_MS); break;
++		case 2: ready = wait_unix(o.unix_path); break;
++		default:
++			last_status = try_http(&o, CONNECT_TIMEOUT_MS);
++			ready = (last_status == o.expect);
++			break;
++		}
++		if (ready)
++			break;
++		now = monotonic_us();
++		if (now >= deadline)
++			break;
++		remain_ms = (long)((deadline - now) / 1000ULL);
++		if (remain_ms <= 0)
++			break;
++		sleep_ms(interval < remain_ms ? interval : remain_ms);
++		if (interval < MAX_INTERVAL_MS) {
++			interval *= 2;
++			if (interval > MAX_INTERVAL_MS)
++				interval = MAX_INTERVAL_MS;
++		}
++	}
++
++	elapsed_ms = (long)((monotonic_us() - start) / 1000ULL);
++
++	if (o.json) {
++		printf("{\"schema\":1,\"ready\":%s,\"kind\":\"%s\",\"target\":",
++				ready ? "true" : "false",
++				o.kind == 0 ? "file" : o.kind == 1 ? "tcp" :
++				o.kind == 2 ? "unix" : "http");
++		json_str(o.target);
++		printf(",\"attempts\":%ld,\"elapsed_ms\":%ld", attempt, elapsed_ms);
++		if (o.kind == 3)
++			printf(",\"status\":%d,\"expect\":%ld", last_status, o.expect);
++		if (!ready)
++			printf(",\"code\":\"%s\"",
++					bb_got_signal ? "CANCELLED" : "TIMEOUT");
++		fputs("}\n", stdout);
++	} else {
++		printf("ready=%s kind=%s target=%s attempts=%ld elapsed_ms=%ld",
++				ready ? "true" : "false",
++				o.kind == 0 ? "file" : o.kind == 1 ? "tcp" :
++				o.kind == 2 ? "unix" : "http",
++				o.target, attempt, elapsed_ms);
++		if (o.kind == 3)
++			printf(" status=%d expect=%ld", last_status, o.expect);
++		if (!ready)
++			printf(" code=%s", bb_got_signal ? "CANCELLED" : "TIMEOUT");
++		putchar('\n');
++	}
++	fflush(stdout);
++	return ready ? 0 : 3;
++}

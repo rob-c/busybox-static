@@ -1,48 +1,48 @@
 ---
-title: "Publishing these binaries requires GPLv2 source+scripts; busybox is v2-only"
+title: "Publishing modified BusyBox with sources is explicitly allowed (GPLv2 §2/§3)"
 kind: "rule"
-summary: "BusyBox here is GPLv2-only; publishing the binaries is allowed but each release must ship the patched source, build scripts and .configs, and never be labelled \"or-later\"."
-tags: [license, gplv2, distribution, github, release, artifacts, compliance]
+summary: "busybox.net confirms modified redistribution is allowed if the whole work is GPLv2 and complete source + build scripts ship with it; the recommended form is a vanilla tarball plus patches — exactly this repo's layout."
+tags: [license, gplv2, busybox.net, redistribution, sources, faq]
 created: "2026-11-20T23:54:30.698Z"
-updated: "2026-11-20T23:54:30.698Z"
+updated: "2026-11-22T02:44:58.549Z"
 ---
-BusyBox is **GPLv2 only** — `src/LICENSE` states "Version 2 is the only version of this license which this version of BusyBox (or modified versions derived from this one) may be distributed under." Label the repository and package metadata `GPL-2.0`, never `GPL-2.0-or-later`.
-
-Publishing the built binaries is permitted, but shipping them (GitHub Releases, containers, tarballs) makes you a distributor of GPLv2 object code, which triggers the source obligation for the **modified** tree.
+Yes — publishing a modified BusyBox together with its complete source is not merely allowed, it is the *expected* way to redistribute it, and busybox.net's own FAQ describes this repo's exact layout (vanilla tarball + a patch) as the recommended form. What is not allowed is shipping a binary without the corresponding source.
 
 ```mermaid
-flowchart LR
-    A["upstream busybox<br/>(GPLv2 only)"] --> B["patched src/<br/>+ patches/"]
-    B --> C["binary artifacts<br/>ELF static / Mach-O"]
-    C --> D{"GPLv2 §3:<br/>source available?"}
-    D -->|yes| E["compliant release"]
-    D -->|no| F["violation"]
-    B -.->|"must accompany"| C
-    G["build.sh, prune/*.txt,<br/>.config per target"] -.->|"§3: scripts used<br/>to control compilation"| C
-    H["LICENSE + BSD/MIT<br/>notices in ash.c, yescrypt"] -.->|"keep verbatim"| B
+flowchart TD
+    A["busybox.net<br/>vanilla busybox-1.39.0.tar.bz2<br/>GPLv2 only"] --> B["+ patches/0001..0005<br/>+ prune/*.txt + .config"]
+    B --> C["patched src/<br/>(the modified tree)"]
+    C --> D["dist/*/bin/busybox<br/>binaries"]
+    D --> E{"GPLv2 §3:<br/>source + build scripts<br/>shipped with them?"}
+    B -. "3(a): accompany" .-> E
+    E -->|yes| F["compliant"]
+    E -->|no| G["violation — even if unmodified"]
 ```
 
-## What must ship with the artifacts
+## What busybox.net actually says
 
-GPLv2 §3 requires the complete corresponding source, and explicitly includes "the scripts used to control compilation and installation". Alongside each release:
+From `https://busybox.net/license.html` (fetched 2026-11-22):
 
-* the full patched `src/` tree — commit it; an uncommitted clone means the release tag does not contain it
-* `patches/`, `prune/*.txt`, and per-target `.config` snapshots
-* `build.sh`, `build-all.sh`
-* `LICENSE` unchanged
+* "BusyBox is licensed under the GNU General Public License version 2."
+* "If you distribute BusyBox without making the source code to the version you distribute available, you violate the license terms... **This requirement applies whether or not you modified BusyBox**."
+* "If you modified the source, you have to distribute the modified source."
+* The options are exactly GPLv2 §3(a)/(b)/(c); 3(a) — "putting exact BusyBox source and .config file you used to build the binary on the same medium... plus the scripts used to control compilation and installation" — is called "the most bullet-proof approach".
+* "It doesn't have to be a single archive. Indeed, most people distribute modified sources in the form of unmodified `busybox-N.N.N.tar.bz2` archive and a set of patches which add features or fix problems."
+* Developer's note: "Version 2 of the GPL is the only version of the GPL which current versions of BusyBox may be distributed under", while "some individual files may have more permissive licenses: 'GPL version 2 or later'".
 
-## Modification notices (§2(a))
+The FAQ's firmware example is literally our layout: publish the upstream tarball URL plus a `.patch`.
 
-`patches/0001` and `patches/0002` modify upstream files, so the publication must state prominently that the files were changed and when. Keeping patches as separate files plus the README section satisfies this.
+## GPLv2 §2(b) — the clause about "the whole codebase"
 
-## Do not strip these
+§2(b) requires that any work "that in whole or in part contains or is derived from the Program... be licensed **as a whole** at no charge to all third parties under the terms of this License", and the next paragraph extends those permissions "to the entire whole, and thus to each and every part regardless of who wrote it". So a modified BusyBox must be distributed *entirely* under GPLv2 — you may not publish the parts you changed under a tighter licence, nor pick and choose.
 
-Permissive third-party notices must survive: `shell/ash.c` keeps its BSD notice; `coreutils/{od,echo,env}.c`, `shell/math.c`, `libbb/yescrypt/*` carry BSD/MIT-style grants. All are GPLv2-compatible and must not be relabelled GPL-only.
+Carve-out: sections that are genuinely separate works are unaffected when distributed separately, but as soon as they ship as part of the whole, the whole must be GPLv2 — unless they are GPL-compatible, which is why the BSD/MIT bits in `shell/ash.c`, `coreutils/od_bloaty.c` and `libbb/yescrypt/` are fine and simply keep their own notices.
 
-## Not distributed by us
+## Two duties that are easy to miss
 
-The Darwin binaries link Apple's `libSystem.B.dylib` and `libresolv.9.dylib` — OS components. The Linux binaries statically contain musl (MIT) and compiler-rt (Apache-2.0 WITH LLVM-exception), both GPL-compatible; note them in a NOTICE. zig and llvm-ar are build tools, not distributed.
+* **§2(a) modification notices.** Changed files must carry prominent notices saying so, with dates. Publishing `patches/` satisfies this in practice, and the README states it too.
+* **§2(c) banner.** An interactive program must announce copyright, warranty and that it may be redistributed. `busybox` with no arguments prints "BusyBox is copyrighted by many authors... Licensed under GPLv2. See source distribution for detailed copyright notices" — do not strip it.
 
-## Enforcement context
+## Verdict for this repo
 
-The Software Freedom Conservancy has pursued BusyBox GPL compliance against distributors, so treat "binaries published, source available" as a hard rule. Do not add further restrictions (non-commercial clauses, extra EULAs) — GPLv2 §6 forbids it.
+Publishing `dist/*/bin/busybox` plus the patched `src/`, `patches/0001..0005`, `prune/*.txt`, the per-target `.config` snapshots and `build.sh`/`build-all.sh` is compliant and is what the project asks for. Publishing the binaries alone is not.

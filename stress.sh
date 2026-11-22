@@ -230,8 +230,12 @@ if true; then
 	# NB: on a fat binary `otool -L` repeats a "<path> (architecture ...):"
 	# header line per slice. Dependencies are the tab-indented lines, so filter
 	# on the tab or the second header is mistaken for a bad dylib.
+	# macOS ships its frameworks in the dyld shared cache, so the object file
+	# (/System/Library/Frameworks/X.framework/Versions/A/X) need not exist on
+	# disk while the load still succeeds. Accept both OS prefixes.
 	bad="$(otool -L "$BB" 2>/dev/null | awk -F'\t' 'NF>1 {print $2}' \
-		| awk '{print $1}' | grep -v '^/usr/lib/' || true)"
+		| awk '{print $1}' \
+		| grep -v -e '^/usr/lib/' -e '^/System/Library/' || true)"
 	if [[ -z "$bad" ]]; then pass=$((pass+1)); else
 		fail=$((fail+1)); FAILED+=("STRUCT non-system dylib: $bad"); echo "STRUCT non-system dylib: $bad"; fi
 fi

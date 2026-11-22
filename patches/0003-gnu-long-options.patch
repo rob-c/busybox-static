@@ -1,0 +1,799 @@
+diff --git a/include/libbb.h b/include/libbb.h
+--- a/include/libbb.h
++++ b/include/libbb.h
+@@ -1547,6 +1547,9 @@
+ extern const char *const bb_argv_dash[]; /* { "-", NULL } */
+ extern uint32_t option_mask32;
+ uint32_t getopt32(char **argv, const char *applet_opts, ...) FAST_FUNC;
++#if ENABLE_FEATURE_GNU_LONG_OPTS
++void bb_expand_gnu_longopts(char **argv, const char *optstring, const char *own_longopts) FAST_FUNC;
++#endif
+ # define No_argument "\0"
+ # define Required_argument "\001"
+ # define Optional_argument "\002"
+diff --git a/include/platform.h b/include/platform.h
+--- a/include/platform.h
++++ b/include/platform.h
+@@ -698,6 +698,10 @@
+ 
+ #ifndef HAVE_STRCASESTR
+ extern char *strcasestr(const char *s, const char *pattern) FAST_FUNC;
++#endif
++
++#ifndef HAVE_STRVERSCMP
++extern int strverscmp(const char *s1, const char *s2) FAST_FUNC;
+ #endif
+ 
+ #ifndef HAVE_STRCHRNUL
+diff --git a/libbb/Kbuild.src b/libbb/Kbuild.src
+--- a/libbb/Kbuild.src
++++ b/libbb/Kbuild.src
+@@ -46,6 +46,8 @@
+ lib-y += get_line_from_file.o
+ lib-y += getpty.o
+ lib-y += get_volsize.o
++# empty translation unit unless CONFIG_FEATURE_GNU_LONG_OPTS (see the file)
++lib-y += gnu_longopts.o
+ lib-y += herror_msg.o
+ lib-y += human_readable.o
+ lib-y += inet_common.o
+diff --git a/Config.in b/Config.in
+index 8955ed3..9189da0 100644
+--- a/Config.in
++++ b/Config.in
+@@ -66,6 +66,23 @@ config LONG_OPTS
+ 	Enable this if you want busybox applets to use the gnu --long-option
+ 	style, in addition to single character -a -b -c style options.
+ 
++config FEATURE_GNU_LONG_OPTS
++	bool "Accept GNU long options for applets that only parse short ones"
++	default n
++	depends on LONG_OPTS
++	help
++	Many applets parse only short options, so "du --max-depth=1" or
++	"grep --line-number" is rejected even though the same applet has the
++	matching short option. This adds a table of GNU long names to short
++	letters (libbb/gnu_longopts.c) and rewrites argv before getopt32()
++	runs, so no applet source changes are needed.
++
++	Costs about 3k of strings and 760 bytes of code, which came to 704
++	bytes of file size on a Mach-O build. No effect on applets that do
++	not parse options. "--" always ends option processing, and names an
++	applet declares itself take priority, so existing behaviour is
++	unchanged.
++
+ config SHOW_USAGE
+ 	bool "Show applet usage messages"
+ 	default y
+diff --git a/coreutils/head.c b/coreutils/head.c
+index ec83a28..5b095b7 100644
+--- a/coreutils/head.c
++++ b/coreutils/head.c
+@@ -183,6 +183,13 @@ int head_main(int argc, char **argv)
+ 	int opt;
+ 	int retval = EXIT_SUCCESS;
+ 
++#if ENABLE_FEATURE_GNU_LONG_OPTS
++	/* This applet parses with getopt() rather than getopt32() (it needs the
++	 * legacy "-N" form and "-n -N"), so the long-option table has to be
++	 * applied here.  Must run before the legacy check below mangles argv. */
++	bb_expand_gnu_longopts(argv, head_opts, NULL);
++#endif
++
+ #if ENABLE_INCLUDE_SUSv2 || ENABLE_FEATURE_FANCY_HEAD
+ 	/* Allow legacy syntax of an initial numeric option without -n. */
+ 	if (argv[1] && argv[1][0] == '-'
+diff --git a/coreutils/ls.c b/coreutils/ls.c
+index 9f52174..dc4825f 100644
+--- a/coreutils/ls.c
++++ b/coreutils/ls.c
+@@ -954,11 +954,9 @@ static int sortcmp(const void *a, const void *b)
+ 	if (opt & OPT_t) { /* sort by time */
+ 		dif = (d2->dn_time - d1->dn_time);
+ 	} else
+-#if defined(HAVE_STRVERSCMP) && HAVE_STRVERSCMP == 1
+ 	if (opt & OPT_v) { /* sort by version */
+ 		dif = strverscmp(d1->name, d2->name);
+ 	} else
+-#endif
+ 	if (opt & OPT_X) { /* sort by extension */
+ 		dif = strcmp(strchrnul(d1->name, '.'), strchrnul(d2->name, '.'));
+ 	}
+diff --git a/coreutils/sort.c b/coreutils/sort.c
+index 1c1b297..e319769 100644
+--- a/coreutils/sort.c
++++ b/coreutils/sort.c
+@@ -307,11 +307,9 @@ static int compare_keys(const void *xarg, const void *yarg)
+ 		default:
+ 			bb_simple_error_msg_and_die("unknown sort type");
+ 			break;
+-#if defined(HAVE_STRVERSCMP) && HAVE_STRVERSCMP == 1
+ 		case FLAG_V:
+ 			retval = strverscmp(x, y);
+ 			break;
+-#endif
+ 		/* Ascii sort */
+ 		case 0:
+ #if ENABLE_LOCALE_SUPPORT
+diff --git a/libbb/getopt32.c b/libbb/getopt32.c
+index 4c05dcb..925730b 100644
+--- a/libbb/getopt32.c
++++ b/libbb/getopt32.c
+@@ -607,6 +607,9 @@ getopt32(char **argv, const char *applet_opts, ...)
+ 	uint32_t opt;
+ 	va_list p;
+ 
++#if ENABLE_FEATURE_GNU_LONG_OPTS
++	bb_expand_gnu_longopts(argv, applet_opts, NULL);
++#endif
+ 	va_start(p, applet_opts);
+ 	opt = vgetopt32(argv, applet_opts, NULL, p);
+ 	va_end(p);
+@@ -621,6 +624,10 @@ getopt32long(char **argv, const char *applet_opts, const char *longopts, ...)
+ 	va_list p;
+ 
+ 	va_start(p, longopts);
++#if ENABLE_FEATURE_GNU_LONG_OPTS
++	/* names this applet already declares are left to its own table */
++	bb_expand_gnu_longopts(argv, applet_opts, longopts);
++#endif
+ 	opt = vgetopt32(argv, applet_opts, longopts, p);
+ 	va_end(p);
+ 	return opt;
+diff --git a/libbb/platform.c b/libbb/platform.c
+index 7913353..0e61e86 100644
+--- a/libbb/platform.c
++++ b/libbb/platform.c
+@@ -128,6 +128,54 @@ char* FAST_FUNC strcasestr(const char *s, const char *pattern)
+ }
+ #endif
+ 
++#ifndef HAVE_STRVERSCMP
++/*
++ * Compare as glibc's strverscmp(3) does, so that "sort -V" / "ls -v"
++ * produce the same order on a platform whose libc lacks it (macOS) as on
++ * one that has it.  Rule: digit runs compare numerically, and a run that
++ * starts with '0' sorts as if the decimal point came first, which is what
++ * gives 000 < 00 < 01 < 010 < 09 < 0 < 1 < 9 < 10.
++ */
++int FAST_FUNC strverscmp(const char *s1, const char *s2)
++{
++	const unsigned char *l = (const void *)s1;
++	const unsigned char *r = (const void *)s2;
++	unsigned i, dp, j;
++	smallint z = 1;
++
++	/* Longest common prefix; dp = start of the current digit run,
++	 * z = that run is still all zeros. */
++	for (dp = i = 0; l[i] == r[i]; i++) {
++		unsigned c = l[i];
++		if (!c)
++			return 0;
++		if (!isdigit(c)) {
++			dp = i + 1;
++			z = 1;
++		} else if (c != '0') {
++			z = 0;
++		}
++	}
++
++	if (l[dp] != '0' && r[dp] != '0') {
++		/* A digit run not starting with '0' is a whole number:
++		 * the longer run is the larger number. */
++		for (j = i; isdigit(l[j]); j++) {
++			if (!isdigit(r[j]))
++				return 1;
++		}
++		if (isdigit(r[j]))
++			return -1;
++	} else if (z && dp < i && (isdigit(l[i]) || isdigit(r[i]))) {
++		/* Common prefix of the run is all zeros: the run compares
++		 * as a fraction, digit by digit. */
++		return (int)(l[i] - '0') - (int)(r[i] - '0');
++	}
++
++	return (int)l[i] - (int)r[i];
++}
++#endif
++
+ #ifndef HAVE_STRSEP
+ /* Copyright (C) 2004 Free Software Foundation, Inc. */
+ char* FAST_FUNC strsep(char **stringp, const char *delim)
+diff --git a/libbb/gnu_longopts.c b/libbb/gnu_longopts.c
+new file mode 100644
+new file mode 100644
+--- /dev/null
++++ b/libbb/gnu_longopts.c
+@@ -0,0 +1,592 @@
++/* vi: set sw=4 ts=4: */
++/*
++ * GNU-style long option aliases.
++ *
++ * Licensed under GPLv2, see file LICENSE in this source tree.
++ */
++#include "libbb.h"
++
++#if ENABLE_FEATURE_GNU_LONG_OPTS
++
++/*
++ * Many applets parse only short options, so a GNU-style command line such as
++ * "du --max-depth=1" or "grep --line-number" is rejected even when the applet
++ * has exactly the right short option.  Rather than adding a getopt32long()
++ * table to every applet (and depending on every applet's optstring layout),
++ * this table maps a long name to the short letter it stands for.  Whether the
++ * letter takes an argument is NOT recorded here: it is looked up in the
++ * applet's own optstring at run time, so a row can never be out of sync with
++ * the applet.
++ *
++ * Rules for adding a row:
++ *  - only where the letter means what the GNU long name means.  "ls -C"
++ *    colorizes here but selects columns in GNU, so --format/--color are not
++ *    rows.  A row that means something slightly different is worse than no row.
++ *  - the long name must be the one GNU documents; agents type GNU names.
++ */
++static const struct gnu_longopt {
++	const char *applet;
++	const char *name;
++	char opt;
++} gnu_longopts[] = {
++	/* ---- coreutils ---- */
++	{ "base32",	"decode",			'd' },
++	{ "base32",	"wrap",				'w' },
++	{ "base64",	"decode",			'd' },
++	{ "base64",	"wrap",				'w' },
++	{ "basename",	"multiple",			'a' },
++	{ "basename",	"suffix",			's' },
++	{ "cat",	"number",			'n' },
++	{ "cat",	"number-nonblank",		'b' },
++	{ "cat",	"show-all",			'A' },
++	{ "cat",	"show-nonprinting",		'v' },
++	{ "cat",	"show-tabs",			't' },
++	{ "chgrp",	"changes",			'c' },
++	{ "chgrp",	"no-dereference",		'h' },
++	{ "chgrp",	"quiet",			'f' },
++	{ "chgrp",	"recursive",			'R' },
++	{ "chgrp",	"silent",			'f' },
++	{ "chgrp",	"verbose",			'v' },
++	{ "chmod",	"changes",			'c' },
++	{ "chmod",	"quiet",			'f' },
++	{ "chmod",	"recursive",			'R' },
++	{ "chmod",	"silent",			'f' },
++	{ "chmod",	"verbose",			'v' },
++	{ "chown",	"changes",			'c' },
++	{ "chown",	"no-dereference",		'h' },
++	{ "chown",	"quiet",			'f' },
++	{ "chown",	"recursive",			'R' },
++	{ "chown",	"silent",			'f' },
++	{ "chown",	"verbose",			'v' },
++	{ "cmp",	"bytes",			'n' },
++	{ "cmp",	"quiet",			's' },
++	{ "cmp",	"silent",			's' },
++	{ "cmp",	"verbose",			'l' },
++	{ "cp",		"archive",			'a' },
++	{ "cp",		"dereference",			'L' },
++	{ "cp",		"dereference-command-line",	'H' },
++	{ "cp",		"force",			'f' },
++	{ "cp",		"interactive",			'i' },
++	{ "cp",		"link",				'l' },
++	{ "cp",		"no-clobber",			'n' },
++	{ "cp",		"no-dereference",		'P' },
++	{ "cp",		"no-target-directory",		'T' },
++	{ "cp",		"preserve",			'p' },
++	{ "cp",		"recursive",			'r' },
++	{ "cp",		"symbolic-link",		's' },
++	{ "cp",		"target-directory",		't' },
++	{ "cp",		"update",			'u' },
++	{ "cut",	"bytes",			'b' },
++	{ "cut",	"characters",			'c' },
++	{ "cut",	"delimiter",			'd' },
++	{ "cut",	"fields",			'f' },
++	{ "cut",	"only-delimited",		's' },
++	{ "cut",	"output-delimiter",		'O' },
++	{ "date",	"date",				'd' },
++	{ "date",	"iso-8601",			'I' },
++	{ "date",	"reference",			'r' },
++	{ "date",	"rfc-2822",			'R' },
++	{ "date",	"set",				's' },
++	{ "date",	"universal",			'u' },
++	{ "date",	"utc",				'u' },
++	{ "df",		"all",				'a' },
++	{ "df",		"block-size",			'B' },
++	{ "df",		"human-readable",		'h' },
++	{ "df",		"inodes",			'i' },
++	{ "df",		"portability",			'P' },
++	{ "df",		"print-type",			'T' },
++	{ "df",		"type",				't' },
++	{ "du",		"all",				'a' },
++	{ "du",		"apparent-size",		'b' },
++	{ "du",		"count-links",			'l' },
++	{ "du",		"dereference",			'L' },
++	{ "du",		"human-readable",		'h' },
++	{ "du",		"max-depth",			'd' },
++	{ "du",		"one-file-system",		'x' },
++	{ "du",		"summarize",			's' },
++	{ "du",		"total",			'c' },
++	{ "env",	"ignore-environment",		'i' },
++	{ "env",	"null",				'0' },
++	{ "env",	"unset",			'u' },
++	{ "ed",		"prompt",			'p' },
++	{ "ed",		"quiet",			's' },
++	{ "ed",		"silent",			's' },
++	{ "expand",	"initial",			'i' },
++	{ "expand",	"tabs",				't' },
++	{ "fold",	"bytes",			'b' },
++	{ "fold",	"spaces",			's' },
++	{ "fold",	"width",			'w' },
++	{ "gzip",	"decompress",			'd' },
++	{ "gzip",	"force",			'f' },
++	{ "gzip",	"keep",				'k' },
++	{ "gzip",	"stdout",			'c' },
++	{ "gzip",	"test",				't' },
++	{ "head",	"bytes",			'c' },
++	{ "head",	"lines",			'n' },
++	{ "head",	"quiet",			'q' },
++	{ "head",	"silent",			'q' },
++	{ "head",	"verbose",			'v' },
++	{ "hostname",	"domain",			'd' },
++	{ "hostname",	"file",				'F' },
++	{ "hostname",	"fqdn",				'f' },
++	{ "hostname",	"ip-address",			'i' },
++	{ "hostname",	"short",			's' },
++	{ "id",		"group",			'g' },
++	{ "id",		"groups",			'G' },
++	{ "id",		"name",				'n' },
++	{ "id",		"real",				'r' },
++	{ "id",		"user",				'u' },
++	{ "install",	"directory",			'd' },
++	{ "install",	"group",			'g' },
++	{ "install",	"mode",				'm' },
++	{ "install",	"owner",			'o' },
++	{ "install",	"preserve-timestamps",		'p' },
++	{ "install",	"strip",			's' },
++	{ "install",	"target-directory",		't' },
++	{ "ln",		"backup",			'b' },
++	{ "ln",		"force",			'f' },
++	{ "ln",		"no-dereference",		'n' },
++	{ "ln",		"no-target-directory",		'T' },
++	{ "ln",		"suffix",			'S' },
++	{ "ln",		"symbolic",			's' },
++	{ "ln",		"verbose",			'v' },
++	{ "logger",	"priority",			'p' },
++	{ "logger",	"stderr",			's' },
++	{ "logger",	"tag",				't' },
++	{ "ls",		"all",				'a' },
++	{ "ls",		"almost-all",			'A' },
++	{ "ls",		"classify",			'F' },
++	{ "ls",		"dereference",			'L' },
++	{ "ls",		"dereference-command-line",	'H' },
++	{ "ls",		"directory",			'd' },
++	{ "ls",		"human-readable",		'h' },
++	{ "ls",		"inode",			'i' },
++	{ "ls",		"numeric-uid-gid",		'n' },
++	{ "ls",		"recursive",			'R' },
++	{ "ls",		"reverse",			'r' },
++	{ "ls",		"size",				'S' },
++	{ "ls",		"width",			'w' },
++	{ "md5sum",	"check",			'c' },
++	{ "md5sum",	"status",			's' },
++	{ "md5sum",	"warn",				'w' },
++	{ "mkdir",	"mode",				'm' },
++	{ "mkdir",	"parents",			'p' },
++	{ "mktemp",	"directory",			'd' },
++	{ "mktemp",	"dry-run",			'u' },
++	{ "mktemp",	"quiet",			'q' },
++	{ "mktemp",	"tmpdir",			't' },
++	{ "mv",		"force",			'f' },
++	{ "mv",		"interactive",			'i' },
++	{ "mv",		"no-clobber",			'n' },
++	{ "mv",		"no-target-directory",		'T' },
++	{ "mv",		"target-directory",		't' },
++	{ "nl",		"body-numbering",		'b' },
++	{ "nl",		"line-increment",		'i' },
++	{ "nl",		"number-separator",		's' },
++	{ "nl",		"number-width",			'w' },
++	{ "nl",		"starting-line-number",		'v' },
++	{ "od",		"address-radix",		'A' },
++	{ "od",		"format",			't' },
++	{ "od",		"read-bytes",			'N' },
++	{ "od",		"skip-bytes",			'j' },
++	{ "od",		"strings",			'S' },
++	{ "od",		"width",			'w' },
++	{ "paste",	"delimiters",			'd' },
++	{ "paste",	"serial",			's' },
++	{ "readlink",	"canonicalize",			'f' },
++	{ "readlink",	"no-newline",			'n' },
++	{ "readlink",	"verbose",			'v' },
++	{ "rm",		"force",			'f' },
++	{ "rm",		"interactive",			'i' },
++	{ "rm",		"recursive",			'r' },
++	{ "rmdir",	"parents",			'p' },
++	{ "sed",	"expression",			'e' },
++	{ "sed",	"file",				'f' },
++	{ "sed",	"in-place",			'i' },
++	{ "sed",	"quiet",			'n' },
++	{ "sed",	"regexp-extended",		'E' },
++	{ "sed",	"silent",			'n' },
++	{ "seq",	"equal-width",			'w' },
++	{ "seq",	"separator",			's' },
++	{ "sha1sum",	"check",			'c' },
++	{ "sha1sum",	"status",			's' },
++	{ "sha1sum",	"warn",				'w' },
++	{ "sha256sum",	"check",			'c' },
++	{ "sha256sum",	"status",			's' },
++	{ "sha256sum",	"warn",				'w' },
++	{ "sha384sum",	"check",			'c' },
++	{ "sha384sum",	"status",			's' },
++	{ "sha384sum",	"warn",				'w' },
++	{ "sha3sum",	"check",			'c' },
++	{ "sha3sum",	"status",			's' },
++	{ "sha3sum",	"warn",				'w' },
++	{ "sha512sum",	"check",			'c' },
++	{ "sha512sum",	"status",			's' },
++	{ "sha512sum",	"warn",				'w' },
++	{ "shred",	"force",			'f' },
++	{ "shred",	"iterations",			'n' },
++	{ "shred",	"remove",			'u' },
++	{ "shred",	"size",				's' },
++	{ "shred",	"zero",				'z' },
++	{ "shuf",	"echo",				'e' },
++	{ "shuf",	"head-count",			'n' },
++	{ "shuf",	"input-range",			'i' },
++	{ "shuf",	"output",			'o' },
++	{ "shuf",	"zero-terminated",		'z' },
++	{ "sort",	"check",			'c' },
++	{ "sort",	"dictionary-order",		'd' },
++	{ "sort",	"field-separator",		't' },
++	{ "sort",	"general-numeric-sort",		'g' },
++	{ "sort",	"human-numeric-sort",		'h' },
++	{ "sort",	"ignore-case",			'f' },
++	{ "sort",	"ignore-leading-blanks",	'b' },
++	{ "sort",	"ignore-nonprinting",		'i' },
++	{ "sort",	"key",				'k' },
++	{ "sort",	"month-sort",			'M' },
++	{ "sort",	"numeric-sort",			'n' },
++	{ "sort",	"output",			'o' },
++	{ "sort",	"reverse",			'r' },
++	{ "sort",	"stable",			's' },
++	{ "sort",	"unique",			'u' },
++	{ "sort",	"version-sort",			'V' },
++	{ "sort",	"zero-terminated",		'z' },
++	{ "split",	"bytes",			'b' },
++	{ "split",	"lines",			'l' },
++	{ "split",	"suffix-length",		'a' },
++	{ "stat",	"filesystem",			'f' },
++	{ "stat",	"follow-links",			'L' },
++	{ "stat",	"format",			'c' },
++	{ "stat",	"terse",			't' },
++	{ "strings",	"bytes",			'n' },
++	{ "strings",	"print-file-name",		'f' },
++	{ "strings",	"radix",			't' },
++	{ "tail",	"bytes",			'c' },
++	{ "tail",	"follow",			'f' },
++	{ "tail",	"lines",			'n' },
++	{ "tail",	"quiet",			'q' },
++	{ "tail",	"retry",			'F' },
++	{ "tail",	"silent",			'q' },
++	{ "tail",	"sleep-interval",		's' },
++	{ "tail",	"verbose",			'v' },
++	{ "tee",	"append",			'a' },
++	{ "tee",	"ignore-interrupts",		'i' },
++	{ "time",	"append",			'a' },
++	{ "time",	"output",			'o' },
++	{ "time",	"posix",			'p' },
++	{ "time",	"verbose",			'v' },
++	{ "timeout",	"kill-after",			'k' },
++	{ "timeout",	"signal",			's' },
++	{ "touch",	"date",				'd' },
++	{ "touch",	"no-create",			'c' },
++	{ "touch",	"no-dereference",		'h' },
++	{ "touch",	"reference",			'r' },
++	{ "tr",		"complement",			'c' },
++	{ "tr",		"delete",			'd' },
++	{ "tr",		"squeeze-repeats",		's' },
++	{ "truncate",	"no-create",			'c' },
++	{ "truncate",	"size",				's' },
++	{ "uname",	"all",				'a' },
++	{ "uname",	"hardware-platform",		'i' },
++	{ "uname",	"kernel-version",		'v' },
++	{ "uname",	"machine",			'm' },
++	{ "uname",	"nodename",			'n' },
++	{ "uname",	"operating-system",		'o' },
++	{ "uname",	"processor",			'p' },
++	{ "uname",	"release",			'r' },
++	{ "uname",	"sysname",			's' },
++	{ "unexpand",	"all",				'a' },
++	{ "unexpand",	"first-only",			'f' },
++	{ "unexpand",	"tabs",				't' },
++	{ "uniq",	"check-chars",			'w' },
++	{ "uniq",	"count",			'c' },
++	{ "uniq",	"ignore-case",			'i' },
++	{ "uniq",	"repeated",			'd' },
++	{ "uniq",	"skip-chars",			's' },
++	{ "uniq",	"skip-fields",			'f' },
++	{ "uniq",	"unique",			'u' },
++	{ "uniq",	"zero-terminated",		'z' },
++	{ "wc",		"bytes",			'c' },
++	{ "wc",		"chars",			'm' },
++	{ "wc",		"lines",			'l' },
++	{ "wc",		"max-line-length",		'L' },
++	{ "wc",		"words",			'w' },
++	{ "which",	"all",				'a' },
++
++	/* ---- findutils / editors ---- */
++	{ "diff",	"brief",			'q' },
++	{ "diff",	"expand-tabs",			't' },
++	{ "diff",	"ignore-all-space",		'w' },
++	{ "diff",	"ignore-blank-lines",		'B' },
++	{ "diff",	"ignore-case",			'i' },
++	{ "diff",	"ignore-space-change",		'b' },
++	{ "diff",	"initial-tab",			'T' },
++	{ "diff",	"label",			'L' },
++	{ "diff",	"minimal",			'd' },
++	{ "diff",	"new-file",			'N' },
++	{ "diff",	"recursive",			'r' },
++	{ "diff",	"report-identical-files",	's' },
++	{ "diff",	"starting-file",		'S' },
++	{ "diff",	"text",				'a' },
++	{ "diff",	"unified",			'U' },
++	{ "grep",	"after-context",		'A' },
++	{ "grep",	"before-context",		'B' },
++	{ "grep",	"context",			'C' },
++	{ "grep",	"count",			'c' },
++	{ "grep",	"dereference-recursive",	'R' },
++	{ "grep",	"extended-regexp",		'E' },
++	{ "grep",	"file",				'f' },
++	{ "grep",	"files-with-matches",		'l' },
++	{ "grep",	"files-without-match",		'L' },
++	{ "grep",	"fixed-strings",		'F' },
++	{ "grep",	"ignore-case",			'i' },
++	{ "grep",	"invert-match",			'v' },
++	{ "grep",	"line-number",			'n' },
++	{ "grep",	"line-regexp",			'x' },
++	{ "grep",	"max-count",			'm' },
++	{ "grep",	"no-filename",			'h' },
++	{ "grep",	"no-messages",			's' },
++	{ "grep",	"only-matching",		'o' },
++	{ "grep",	"quiet",			'q' },
++	{ "grep",	"recursive",			'r' },
++	{ "grep",	"regexp",			'e' },
++	{ "grep",	"silent",			'q' },
++	{ "grep",	"text",				'a' },
++	{ "grep",	"with-filename",		'H' },
++	{ "grep",	"word-regexp",			'w' },
++	{ "patch",	"ed",				'E' },
++	{ "patch",	"forward",			'N' },
++	{ "patch",	"input",			'i' },
++	{ "patch",	"reverse",			'R' },
++	{ "patch",	"strip",			'p' },
++	{ "xargs",	"arg-file",			'a' },
++	{ "xargs",	"eof",				'E' },
++	{ "xargs",	"exit",				'x' },
++	{ "xargs",	"interactive",			'p' },
++	{ "xargs",	"max-args",			'n' },
++	{ "xargs",	"max-chars",			's' },
++	{ "xargs",	"max-procs",			'P' },
++	{ "xargs",	"no-run-if-empty",		'r' },
++	{ "xargs",	"null",				'0' },
++	{ "xargs",	"replace",			'I' },
++	{ "xargs",	"verbose",			't' },
++
++	/* ---- archival / util-linux ---- */
++	/* compressors: bbunzip/bbgzip share BBUNPK_OPTSTR "cfkvq"
++	 * (c=stdout f=force k=keep v=verbose q=quiet), plus d/t where allowed */
++	{ "bunzip2",		"force",			'f' },
++	{ "bunzip2",		"keep",			'k' },
++	{ "bunzip2",		"quiet",			'q' },
++	{ "bunzip2",		"stdout",			'c' },
++	{ "bunzip2",		"test",			't' },
++	{ "bunzip2",		"verbose",			'v' },
++	{ "bzcat",			"force",			'f' },
++	{ "bzcat",			"keep",			'k' },
++	{ "bzcat",			"quiet",			'q' },
++	{ "bzcat",			"stdout",			'c' },
++	{ "bzcat",			"test",			't' },
++	{ "bzcat",			"verbose",			'v' },
++	{ "bzip2",			"decompress",		'd' },
++	{ "bzip2",			"force",			'f' },
++	{ "bzip2",			"keep",			'k' },
++	{ "bzip2",			"quiet",			'q' },
++	{ "bzip2",			"stdout",			'c' },
++	{ "bzip2",			"test",			't' },
++	{ "bzip2",			"verbose",			'v' },
++	{ "gunzip",		"force",			'f' },
++	{ "gunzip",		"keep",			'k' },
++	{ "gunzip",		"quiet",			'q' },
++	{ "gunzip",		"test",			't' },
++	{ "gunzip",		"verbose",			'v' },
++	{ "lzcat",			"force",			'f' },
++	{ "lzcat",			"keep",			'k' },
++	{ "lzcat",			"quiet",			'q' },
++	{ "lzcat",			"stdout",			'c' },
++	{ "lzcat",			"test",			't' },
++	{ "lzcat",			"verbose",			'v' },
++	{ "lzma",			"decompress",		'd' },
++	{ "lzma",			"force",			'f' },
++	{ "lzma",			"keep",			'k' },
++	{ "lzma",			"quiet",			'q' },
++	{ "lzma",			"stdout",			'c' },
++	{ "lzma",			"test",			't' },
++	{ "lzma",			"verbose",			'v' },
++	{ "sync",			"data",			'd' },
++	{ "sync",			"file-system",		'f' },
++	{ "unlzma",		"force",			'f' },
++	{ "unlzma",		"keep",			'k' },
++	{ "unlzma",		"quiet",			'q' },
++	{ "unlzma",		"stdout",			'c' },
++	{ "unlzma",		"test",			't' },
++	{ "unlzma",		"verbose",			'v' },
++	{ "unxz",			"force",			'f' },
++	{ "unxz",			"keep",			'k' },
++	{ "unxz",			"quiet",			'q' },
++	{ "unxz",			"stdout",			'c' },
++	{ "unxz",			"test",			't' },
++	{ "unxz",			"verbose",			'v' },
++	{ "xz",			"decompress",		'd' },
++	{ "xz",			"force",			'f' },
++	{ "xz",			"keep",			'k' },
++	{ "xz",			"quiet",			'q' },
++	{ "xz",			"stdout",			'c' },
++	{ "xz",			"test",			't' },
++	{ "xz",			"verbose",			'v' },
++	{ "xzcat",			"force",			'f' },
++	{ "xzcat",			"keep",			'k' },
++	{ "xzcat",			"quiet",			'q' },
++	{ "xzcat",			"stdout",			'c' },
++	{ "xzcat",			"test",			't' },
++	{ "xzcat",			"verbose",			'v' },
++	{ "cpio",	"create",			'o' },
++	{ "cpio",	"extract",			'i' },
++	{ "cpio",	"file",				'F' },
++	{ "cpio",	"format",			'H' },
++	{ "cpio",	"list",				't' },
++	{ "cpio",	"make-directories",		'd' },
++	{ "cpio",	"owner",			'R' },
++	{ "cpio",	"pass-through",			'p' },
++	{ "cpio",	"preserve-modification-time",	'm' },
++	{ "cpio",	"verbose",			'v' },
++	{ "flock",	"exclusive",			'x' },
++	{ "flock",	"nonblock",			'n' },
++	{ "flock",	"shared",			's' },
++	{ "flock",	"unlock",			'u' },
++	/* "getopt" needs no rows: it declares its own long-option table,
++	 * which already covers --options/--longoptions/--shell/--test/--alternative. */
++};
++
++/* Applets that share another applet's table. */
++static const struct {
++	const char *alias;
++	const char *applet;
++} gnu_longopt_aliases[] = {
++	{ "egrep", "grep" },
++	{ "fgrep", "grep" },
++};
++
++static const char *applet_key(void)
++{
++	const char *name = applet_name;
++	unsigned i;
++
++	if (!name)
++		return NULL;
++	for (i = 0; i < ARRAY_SIZE(gnu_longopt_aliases); i++)
++		if (strcmp(gnu_longopt_aliases[i].alias, name) == 0)
++			return gnu_longopt_aliases[i].applet;
++	return name;
++}
++
++/* Does the applet's own optstring give OPT an argument? */
++static smallint opt_takes_arg(const char *optstring, char opt)
++{
++	if (!optstring)
++		return 0;
++	/* skip bbox extensions: '^', '!', '+', '-' */
++	while (*optstring == '^' || *optstring == '!'
++	    || *optstring == '+' || *optstring == '-'
++	) {
++		optstring++;
++	}
++	while (*optstring) {
++		if (*optstring == opt)
++			return optstring[1] == ':';
++		optstring++;
++	}
++	return 0;
++}
++
++/* Is NAME already declared as a long option by getopt32long's own table? */
++static smallint own_table_has(const char *own, const char *name, unsigned len)
++{
++	while (own && own[0]) {
++		if (strncmp(own, name, len) == 0 && own[len] == '\0')
++			return 1;
++		own += strlen(own) + 3; /* NUL, has_arg, val */
++	}
++	return 0;
++}
++
++/*
++ * Rewrite GNU-style long options in argv in place, before getopt_long sees
++ * them.  "--name=value" and "--name value" both become the short option the
++ * table names, so no applet needs to change.  Unknown names are left alone:
++ * getopt_long then reports them exactly as it does today.
++ *
++ * No allocation: a rewritten argument is always shorter than the original
++ * ("--max-depth=1" -> "-d1"), so it is written over the same buffer.
++ */
++void FAST_FUNC bb_expand_gnu_longopts(char **argv, const char *optstring, const char *own_longopts)
++{
++	const char *key = applet_key();
++	char **av;
++	unsigned i;
++
++	if (!key)
++		return;
++	for (av = argv + 1; av && *av; av++) {
++		char *arg = *av;
++		const char *name;
++		const char *eq;
++		unsigned len;
++		int found = -1;
++		int nmatch = 0;
++
++		if (arg[0] != '-' || arg[1] != '-')
++			continue;
++		if (arg[2] == '\0') /* "--": end of options, argv is not ours */
++			break;
++		name = arg + 2;
++		eq = strchr(name, '=');
++		len = eq ? (unsigned)(eq - name) : (unsigned)strlen(name);
++		if (own_table_has(own_longopts, name, len))
++			continue;
++		for (i = 0; i < ARRAY_SIZE(gnu_longopts); i++) {
++			if (strlen(gnu_longopts[i].name) != len)
++				continue; /* not same length: cannot match */
++			if (strncmp(gnu_longopts[i].name, name, len) != 0)
++				continue;
++			if (strcmp(gnu_longopts[i].applet, key) != 0)
++				continue;
++			found = (int)i;
++			nmatch = 1;
++			break;
++		}
++		if (nmatch == 0) {
++			/* No exact hit; try an unambiguous GNU-style prefix. */
++			for (i = 0; i < ARRAY_SIZE(gnu_longopts); i++) {
++				if (strncmp(gnu_longopts[i].name, name, len) != 0)
++					continue;
++				if (strcmp(gnu_longopts[i].applet, key) != 0)
++					continue;
++				found = (int)i;
++				nmatch++;
++			}
++			if (nmatch > 1)
++				continue; /* ambiguous: let getopt_long complain */
++		}
++		if (found < 0)
++			continue;
++
++		if (!opt_takes_arg(optstring, gnu_longopts[found].opt)) {
++			if (eq) {
++				bb_error_msg_and_die("option '--%s' doesn't allow an argument",
++					gnu_longopts[found].name);
++			}
++			arg[0] = '-';
++			arg[1] = gnu_longopts[found].opt;
++			arg[2] = '\0';
++		} else if (eq) {
++			arg[0] = '-';
++			arg[1] = gnu_longopts[found].opt;
++			overlapping_strcpy(arg + 2, eq + 1);
++		} else {
++			/* "--name value": getopt picks up the next argv element */
++			arg[0] = '-';
++			arg[1] = gnu_longopts[found].opt;
++			arg[2] = '\0';
++		}
++	}
++}
++
++#endif /* FEATURE_GNU_LONG_OPTS */

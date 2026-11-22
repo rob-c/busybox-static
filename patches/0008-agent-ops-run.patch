@@ -1,0 +1,1137 @@
+diff --git a/coreutils/run.c b/coreutils/run.c
+new file mode 100644
+index 0000000..062b88c
+--- /dev/null
++++ b/coreutils/run.c
+@@ -0,0 +1,890 @@
++/* vi: set sw=4 ts=4: */
++/*
++ * run - captured execution with retrievable evidence.
++ * log - bounded retrieval from a previous run's artifacts.
++ *
++ * Licensed under GPLv2, see file LICENSE in this source tree.
++ */
++//config:config RUN
++//config:	bool "run (10 kb)"
++//config:	default y
++//config:	help
++//config:	Execute a command, capture stdout/stderr to artifacts and return
++//config:	a bounded view plus a run id.
++//config:
++//config:config LOG
++//config:	bool "log (5 kb)"
++//config:	default y
++//config:	help
++//config:	Retrieve a previous run's captured output by lines or pattern.
++
++//applet:IF_RUN(APPLET(run, BB_DIR_USR_BIN, BB_SUID_DROP))
++//applet:IF_LOG(APPLET(log, BB_DIR_USR_BIN, BB_SUID_DROP))
++
++//kbuild:lib-$(CONFIG_RUN) += run.o
++//kbuild:lib-$(CONFIG_LOG) += run.o
++
++//usage:#define run_trivial_usage
++//usage:       "[OPTIONS] -- PROG ARGS..."
++//usage:#define run_full_usage "\n\n"
++//usage:       "Run PROG, capture stdout/stderr separately, print a bounded view"
++//usage:     "\n	-T, --timeout SECS	Kill the process group after SECS"
++//usage:     "\n	-k, --kill-after SECS	Grace period before SIGKILL (default 2)"
++//usage:     "\n	-B, --max-bytes N	View budget (default 12000)"
++//usage:     "\n	-C, --capture-limit N	Captured bytes per stream (default 64 MiB)"
++//usage:     "\n	-D, --dir PATH		Artifact root (default $TMPDIR/busybox-run)"
++//usage:     "\n	-d, --cwd DIR		Working directory for the child"
++//usage:     "\n	-s, --shell		Run the rest through sh -c"
++//usage:     "\n	-F, --format FMT	text (default) or json"
++//usage:     "\n"
++//usage:     "\nExit: the child's status when it exits on its own, 3 when this"
++//usage:     "\nwrapper timed out or was cancelled, 1 when the command could not"
++//usage:     "\nbe started. `log RUN' prints the bytes this view left out."
++
++//usage:#define log_trivial_usage
++//usage:       "[-D DIR] RUN [OPTIONS]"
++//usage:#define log_full_usage "\n\n"
++//usage:       "Print part of a captured run's output"
++//usage:     "\n	-l, --lines A:B		Line range, 1-based inclusive"
++//usage:     "\n	-m, --match STR		Lines containing STR (literal)"
++//usage:     "\n	-c, --context N		Context around matches (default 3)"
++//usage:     "\n	-s, --stream WHICH	stdout (default), stderr or both"
++//usage:     "\n	-M, --meta		Print the run metadata only"
++//usage:     "\n	-B, --max-bytes N	Output budget (default 12000)"
++//usage:     "\n	-D, --dir PATH		Artifact root"
++//usage:     "\n	-F, --format FMT	text (default) or json"
++
++#include "libbb.h"
++
++enum {
++	DEFAULT_VIEW = 12000,
++	DEFAULT_CAPTURE = 64 * 1024 * 1024,
++	DEFAULT_CONTEXT = 3,
++	MAX_RANGES = 200,
++};
++
++struct meta {
++	char *cmd;
++	char *cwd;
++	long duration_ms;
++	int exit_code;       /* -1 when killed by a signal */
++	int term_sig;
++	int timed_out;
++	int cancelled;
++	int capture_complete;
++	unsigned long long out_bytes;
++	unsigned long long err_bytes;
++};
++
++struct rng {
++	unsigned first, last;   /* 0-based, inclusive */
++};
++
++static void on_sig(int sig)
++{
++	bb_got_signal = sig;
++}
++
++static void sleep_ms(long ms)
++{
++	if (ms > 0)
++		poll(NULL, 0, (int)ms);
++}
++
++static unsigned long long now_ms(void)
++{
++	return monotonic_us() / 1000ULL;
++}
++
++static void json_write_str(const char *s)
++{
++	putchar('"');
++	for (; *s; s++) {
++		unsigned char c = (unsigned char)*s;
++		switch (c) {
++		case '"':  fputs("\\\"", stdout); break;
++		case '\\': fputs("\\\\", stdout); break;
++		case '\n': fputs("\\n", stdout); break;
++		case '\t': fputs("\\t", stdout); break;
++		case '\r': fputs("\\r", stdout); break;
++		default:
++			if (c < 0x20)
++				printf("\\u%04x", c);
++			else
++				putchar(c);
++		}
++	}
++	putchar('"');
++}
++
++static const char *artifact_root(const char *given)
++{
++	const char *t;
++
++	if (given)
++		return given;
++	t = getenv("TMPDIR");
++	if (t && t[0])
++		return xasprintf("%s/busybox-run", t);
++	return "/tmp/busybox-run";
++}
++
++static unsigned next_run_id(const char *root)
++{
++	DIR *d = opendir(root);
++	struct dirent *de;
++	unsigned max = 0;
++
++	if (!d)
++		return 1;
++	while ((de = readdir(d)) != NULL) {
++		if (de->d_name[0] == 'R' && de->d_name[1] >= '0'
++		 && de->d_name[1] <= '9'
++		) {
++			unsigned v = (unsigned)atoi(de->d_name + 1);
++			if (v > max)
++				max = v;
++		}
++	}
++	closedir(d);
++	return max + 1;
++}
++
++static char *art_path(const char *dir, const char *name)
++{
++	return xasprintf("%s/%s", dir, name);
++}
++
++static void write_meta(const char *dir, const struct meta *m)
++{
++	char *path = art_path(dir, "meta");
++	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
++
++	if (fd >= 0) {
++		char buf[512];
++		int n = snprintf(buf, sizeof(buf),
++				"cmd=%s\ncwd=%s\nduration_ms=%ld\nexit_code=%d\n"
++				"signal=%d\ntimed_out=%d\ncancelled=%d\n"
++				"capture_complete=%d\nstdout_bytes=%llu\nstderr_bytes=%llu\n",
++				m->cmd ? m->cmd : "", m->cwd ? m->cwd : "",
++				m->duration_ms, m->exit_code, m->term_sig,
++				m->timed_out, m->cancelled, m->capture_complete,
++				m->out_bytes, m->err_bytes);
++		if (n > 0)
++			full_write(fd, buf, (size_t)n);
++		close(fd);
++	}
++	free(path);
++}
++
++/* ---------- run: capture ---------- */
++
++static void pump(int fds[2], int arts[2], long deadline_ms, int kill_after_ms,
++		long capture_limit, pid_t pid, struct meta *m)
++{
++	struct pollfd pfd[2];
++	unsigned long long captured = 0, term_at = 0;
++	long quota_used[2] = { 0, 0 };
++	int open_count = 2, phase = 0, i;
++	char buf[16384];
++
++	pfd[0].fd = fds[0];
++	pfd[0].events = POLLIN;
++	pfd[1].fd = fds[1];
++	pfd[1].events = POLLIN;
++
++	while (open_count > 0) {
++		unsigned long long now = now_ms();
++		int rc;
++
++		if (phase == 0 && deadline_ms > 0 && (long)now >= deadline_ms) {
++			m->timed_out = 1;
++			kill(-pid, SIGTERM);
++			kill(pid, SIGTERM);
++			term_at = now;
++			phase = 1;
++		}
++		if (phase == 0 && bb_got_signal) {
++			m->cancelled = 1;
++			kill(-pid, SIGTERM);
++			kill(pid, SIGTERM);
++			term_at = now;
++			phase = 1;
++		}
++		if (phase == 1 && now - term_at >= (unsigned long long)kill_after_ms) {
++			kill(-pid, SIGKILL);
++			kill(pid, SIGKILL);
++			phase = 2;
++		}
++
++		rc = poll(pfd, 2, 100);
++		if (rc < 0) {
++			if (errno == EINTR)
++				continue;
++			break;
++		}
++		if (rc == 0)
++			continue;
++		for (i = 0; i < 2; i++) {
++			ssize_t r, w = 0;
++
++			if (pfd[i].fd < 0)
++				continue;
++			if (!(pfd[i].revents & (POLLIN | POLLHUP | POLLERR)))
++				continue;
++			r = read(pfd[i].fd, buf, sizeof(buf));
++			if (r < 0) {
++				if (errno == EINTR)
++					continue;
++				close(pfd[i].fd);
++				pfd[i].fd = -1;
++				open_count--;
++				continue;
++			}
++			if (r == 0) {
++				close(pfd[i].fd);
++				pfd[i].fd = -1;
++				open_count--;
++				continue;
++			}
++			captured += (unsigned long long)r;
++			if (i == 0)
++				m->out_bytes += (unsigned long long)r;
++			else
++				m->err_bytes += (unsigned long long)r;
++			/* Keep the child unblocked: always drain, record what the
++			 * quota allows, and say so when evidence was dropped. */
++			if (quota_used[i] < capture_limit) {
++				long room = capture_limit - quota_used[i];
++				w = write(arts[i], buf, (size_t)(r < room ? r : room));
++				if (w < 0)
++					w = 0;
++				quota_used[i] += w;
++			}
++			if (quota_used[i] >= capture_limit && (size_t)r > (size_t)w)
++				m->capture_complete = 0;
++		}
++	}
++	(void)captured;
++}
++
++/* Head+tail view of one artifact, bounded. */
++static size_t dump_bounded(const char *path, size_t budget, int json, const char *label)
++{
++	int fd = open(path, O_RDONLY);
++	struct stat st;
++	size_t half = budget / 2, shown = 0;
++	char *b;
++
++	if (fd < 0)
++		return 0;
++	if (fstat(fd, &st) != 0) {
++		close(fd);
++		return 0;
++	}
++	b = xmalloc(half + 1);
++	if ((unsigned long long)st.st_size <= (unsigned long long)budget) {
++		ssize_t r = safe_read(fd, b, half);
++
++		if (r > 0) {
++			if (json) {
++				char *tmp = xstrndup(b, (size_t)r);
++				json_write_str(tmp);
++				free(tmp);
++			} else {
++				fwrite(b, 1, (size_t)r, stdout);
++			}
++			shown += (size_t)r;
++		}
++	} else {
++		ssize_t r = safe_read(fd, b, half);
++
++		if (r > 0) {
++			if (json) {
++				char *tmp = xstrndup(b, (size_t)r);
++				json_write_str(tmp);
++				free(tmp);
++			} else {
++				fwrite(b, 1, (size_t)r, stdout);
++				printf("\n... [%llu bytes total]\n",
++						(unsigned long long)st.st_size);
++			}
++			shown += (size_t)r;
++		}
++		if (lseek(fd, (off_t)(st.st_size > (off_t)half ? st.st_size - (off_t)half : 0),
++				SEEK_SET) >= 0) {
++			r = safe_read(fd, b, half);
++			if (r > 0) {
++				if (json) {
++					char *tmp = xstrndup(b, (size_t)r);
++					json_write_str(tmp);
++					free(tmp);
++				} else {
++					fwrite(b, 1, (size_t)r, stdout);
++				}
++				shown += (size_t)r;
++			}
++		}
++	}
++	free(b);
++	close(fd);
++	(void)label;
++	return shown;
++}
++
++int run_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
++int run_main(int argc UNUSED_PARAM, char **argv)
++{
++	char *opt_timeout = NULL, *opt_kill = NULL, *opt_bytes = NULL;
++	char *opt_capture = NULL, *opt_dir = NULL, *opt_cwd = NULL, *opt_fmt = NULL;
++	unsigned opts;
++	long deadline_ms = 0, budget = DEFAULT_VIEW, capture_limit = DEFAULT_CAPTURE;
++	int kill_after = 2000, json = 0, use_shell = 0;
++	const char *root, *dir;
++	unsigned id;
++	struct meta m;
++	int outp[2], errp[2], art_out, art_err;
++	pid_t pid;
++	int status = 0;
++	unsigned long long started;
++	char *cmdline = NULL;
++	size_t shown;
++
++	static const char run_longopts[] ALIGN1 =
++		"timeout\0"       Required_argument "T"
++		"kill-after\0"    Required_argument "k"
++		"max-bytes\0"     Required_argument "B"
++		"capture-limit\0" Required_argument "C"
++		"dir\0"           Required_argument "D"
++		"cwd\0"           Required_argument "d"
++		"shell\0"         No_argument       "s"
++		"format\0"        Required_argument "F"
++		;
++
++	xfunc_error_retval = 2;
++
++	opts = getopt32long(argv, "T:k:B:C:D:d:sF:", run_longopts,
++			&opt_timeout, &opt_kill, &opt_bytes, &opt_capture,
++			&opt_dir, &opt_cwd, &opt_fmt);
++	use_shell = (opts & (1 << 6)) != 0;   /* s */
++	argv += optind;
++
++	if (opt_fmt) {
++		if (strcmp(opt_fmt, "json") == 0)
++			json = 1;
++		else if (strcmp(opt_fmt, "text") != 0)
++			bb_error_msg_and_die("unknown format \"%s\"", opt_fmt);
++	}
++	if (opt_timeout) {
++		double s = strtod(opt_timeout, NULL);
++		if (!(s > 0))
++			bb_error_msg_and_die("bad timeout");
++		/* absolute: pump() compares against monotonic time */
++		deadline_ms = (long)now_ms() + (long)(s * 1000.0);
++	}
++	if (opt_kill) {
++		double s = strtod(opt_kill, NULL);
++		if (s >= 0)
++			kill_after = (int)(s * 1000.0);
++	}
++	if (opt_bytes)
++		budget = strtol(opt_bytes, NULL, 10);
++	if (opt_capture)
++		capture_limit = strtol(opt_capture, NULL, 10);
++	if (!argv[0])
++		bb_show_usage();
++
++	root = artifact_root(opt_dir);
++	if (mkdir(root, 0700) != 0 && errno != EEXIST)
++		bb_perror_msg_and_die("mkdir %s", root);
++	chmod(root, 0700);              /* captured output may hold secrets */
++	id = next_run_id(root);
++	dir = xasprintf("%s/R%u", root, id);
++	if (mkdir(dir, 0700) != 0 && errno != EEXIST)
++		bb_perror_msg_and_die("mkdir %s", dir);
++
++	art_out = open(art_path(dir, "stdout"), O_WRONLY | O_CREAT | O_TRUNC, 0600);
++	art_err = open(art_path(dir, "stderr"), O_WRONLY | O_CREAT | O_TRUNC, 0600);
++	if (art_out < 0 || art_err < 0)
++		bb_perror_msg_and_die("cannot create artifacts in %s", dir);
++
++	memset(&m, 0, sizeof(m));
++	m.capture_complete = 1;
++	m.cwd = xstrdup(opt_cwd ? opt_cwd : getcwd(NULL, 0));
++	{
++		unsigned i;
++		for (i = 0; argv[i]; i++) {
++			if (i)
++				cmdline = xasprintf("%s %s", cmdline, argv[i]);
++			else
++				cmdline = xstrdup(argv[i]);
++		}
++	}
++	m.cmd = cmdline ? cmdline : xstrdup("");
++	write_meta(dir, &m);
++
++	if (pipe(outp) != 0 || pipe(errp) != 0)
++		bb_perror_msg_and_die("pipe");
++
++	bb_signals((1 << (SIGINT - 1)) | (1 << (SIGTERM - 1)), on_sig);
++
++	started = now_ms();
++	pid = fork();
++	if (pid < 0)
++		bb_perror_msg_and_die("fork");
++	if (pid == 0) {
++		char **shv;
++
++		setpgid(0, 0);          /* own group: one killpg reaches descendants */
++		close(outp[0]);
++		close(errp[0]);
++		xmove_fd(outp[1], 1);
++		xmove_fd(errp[1], 2);
++		if (opt_cwd && chdir(opt_cwd) != 0) {
++			bb_perror_msg("cd %s", opt_cwd);
++			_exit(126);
++		}
++		if (use_shell) {
++			shv = xzalloc(sizeof(char *) * 5);
++			shv[0] = (char *)"sh";
++			shv[1] = (char *)"-c";
++			shv[2] = argv[0];
++			shv[3] = NULL;
++			execv(bb_busybox_exec_path, shv);
++			execvp("sh", shv);
++		} else {
++			execvp(argv[0], argv);
++		}
++		bb_perror_msg("can't execute '%s'", argv[0]);
++		_exit(127);
++	}
++	setpgid(pid, pid);              /* both sides: no window where pgid is unset */
++	close(outp[1]);
++	close(errp[1]);
++	{
++		int fds[2], arts[2];
++
++		fds[0] = outp[0];
++		fds[1] = errp[0];
++		arts[0] = art_out;
++		arts[1] = art_err;
++		pump(fds, arts, deadline_ms, kill_after, capture_limit, pid, &m);
++	}
++	{
++		int killed = 0;
++		unsigned long long reap_start = now_ms();
++
++		for (;;) {
++			pid_t w = waitpid(pid, &status, WNOHANG);
++
++			if (w == pid || w < 0)
++				break;
++			if ((m.timed_out || m.cancelled) && !killed) {
++				kill(-pid, SIGKILL);
++				kill(pid, SIGKILL);
++				killed = 1;
++			}
++			if (now_ms() - reap_start > 10000) {
++				kill(pid, SIGKILL);
++				break;
++			}
++			sleep_ms(10);
++		}
++	}
++	m.duration_ms = (long)(now_ms() - started);
++
++	if (WIFEXITED(status))
++		m.exit_code = WEXITSTATUS(status);
++	else if (WIFSIGNALED(status)) {
++		m.exit_code = -1;
++		m.term_sig = WTERMSIG(status);
++	} else
++		m.exit_code = -1;
++
++	{
++		char *p1 = art_path(dir, "stdout");
++		char *p2 = art_path(dir, "stderr");
++		struct stat st;
++
++		if (stat(p1, &st) == 0)
++			m.out_bytes = (unsigned long long)st.st_size;
++		if (stat(p2, &st) == 0)
++			m.err_bytes = (unsigned long long)st.st_size;
++		close(art_out);
++		close(art_err);
++		write_meta(dir, &m);
++
++		if (json) {
++			printf("{\"schema\":1,\"run\":\"R%u\",\"dir\":", id);
++			json_write_str(dir);
++			printf(",\"exit_code\":%d,\"timed_out\":%s,\"cancelled\":%s,"
++					"\"capture_complete\":%s,\"duration_ms\":%ld,"
++					"\"stdout_bytes\":%llu,\"stderr_bytes\":%llu,"
++					"\"view_truncated\":%s,\"stdout_view\":",
++					m.exit_code, m.timed_out ? "true" : "false",
++					m.cancelled ? "true" : "false",
++					m.capture_complete ? "true" : "false",
++					m.duration_ms, m.out_bytes, m.err_bytes,
++					(m.out_bytes + m.err_bytes) > (unsigned long long)budget
++						? "true" : "false");
++			{
++				size_t shown_out;
++
++				shown_out = dump_bounded(p1, (size_t)budget * 3 / 4, 1, "stdout");
++				if (!shown_out)
++					fputs("\"\"", stdout);
++				fputs(",\"stderr_view\":", stdout);
++				{
++					size_t shown_err = dump_bounded(p2, (size_t)budget / 4, 1,
++							"stderr");
++					if (!shown_err)
++						fputs("\"\"", stdout);
++				}
++			}
++			putchar('}');
++			putchar('\n');
++		} else {
++			printf("run=R%u exit_code=%d timed_out=%s cancelled=%s duration_ms=%ld\n",
++					id, m.exit_code, m.timed_out ? "true" : "false",
++					m.cancelled ? "true" : "false", m.duration_ms);
++			printf("captured_bytes=%llu stdout=%llu stderr=%llu capture_complete=%s "
++					"view_truncated=%s\n",
++					m.out_bytes + m.err_bytes, m.out_bytes, m.err_bytes,
++					m.capture_complete ? "true" : "false",
++					(m.out_bytes + m.err_bytes) > (unsigned long long)budget
++						? "true" : "false");
++			printf("stdout_artifact=%s\nstderr_artifact=%s\n", p1, p2);
++			fputs("--- stdout ---\n", stdout);
++			shown = dump_bounded(p1, (size_t)budget, 0, "stdout");
++			if (!shown)
++				fputs("(empty)\n", stdout);
++			fputs("--- stderr ---\n", stdout);
++			shown = dump_bounded(p2, (size_t)budget / 4, 0, "stderr");
++			if (!shown)
++				fputs("(empty)\n", stdout);
++			if ((m.out_bytes + m.err_bytes) > (unsigned long long)budget)
++				printf("... view truncated; `log R%u --match ...' has the rest\n", id);
++		}
++	}
++	fflush(stdout);
++	if (m.timed_out || m.cancelled)
++		return 3;
++	if (m.exit_code < 0)
++		return 1;
++	return m.exit_code;
++}
++
++/* ---------- log ---------- */
++
++static int read_all(const char *path, char **pdata, size_t *plen)
++{
++	int fd = open(path, O_RDONLY);
++	struct stat st;
++	char *data;
++	size_t len = 0, cap;
++
++	if (fd < 0)
++		return -1;
++	if (fstat(fd, &st) != 0) {
++		close(fd);
++		return -1;
++	}
++	cap = st.st_size > 0 ? (size_t)st.st_size + 1 : 4096;
++	data = xmalloc(cap);
++	for (;;) {
++		ssize_t r;
++
++		if (len == cap - 1) {
++			cap *= 2;
++			data = xrealloc(data, cap);
++		}
++		r = safe_read(fd, data + len, cap - 1 - len);
++		if (r < 0) {
++			if (errno == EINTR)
++				continue;
++			free(data);
++			close(fd);
++			return -1;
++		}
++		if (r == 0)
++			break;
++		len += (size_t)r;
++	}
++	close(fd);
++	data[len] = '\0';
++	*pdata = data;
++	*plen = len;
++	return 0;
++}
++
++static size_t *line_starts(const char *d, size_t len, unsigned *pn)
++{
++	size_t *v;
++	size_t i;
++	unsigned n = 0, cap = 256;
++
++	v = xmalloc(cap * sizeof(*v));
++	v[n++] = 0;
++	for (i = 0; i < len; i++) {
++		if (d[i] != '\n' || i + 1 >= len)
++			continue;
++		if (n == cap) {
++			cap *= 2;
++			v = xrealloc(v, cap * sizeof(*v));
++		}
++		v[n++] = i + 1;
++	}
++	*pn = n;
++	return v;
++}
++
++static size_t line_len(const char *d, const size_t *starts, unsigned n,
++		size_t len, unsigned i)
++{
++	size_t end = (i + 1 < n) ? starts[i + 1] - 1 : len;
++	size_t l;
++
++	if (end > starts[i] && d[end - 1] == '\n')
++		end--;
++	if (end > starts[i] && d[end - 1] == '\r')
++		end--;
++	l = end - starts[i];
++	return l;
++}
++
++static int dump_stream(const char *path, const char *label, const char *match,
++		long first, long last, long ctx, long budget, int json)
++{
++	char *data = NULL;
++	size_t len = 0, *starts, shown = 0;
++	unsigned nlines = 0, i;
++	struct rng r[MAX_RANGES];
++	unsigned nr = 0;
++	int truncated = 0;
++
++	if (read_all(path, &data, &len) != 0) {
++		if (json)
++			printf("{\"schema\":1,\"stream\":\"%s\",\"status\":\"error\","
++					"\"code\":\"NOT_FOUND\"}", label);
++		else
++			fprintf(stderr, "%s: NOT_FOUND\n", path);
++		return 1;
++	}
++	starts = line_starts(data, len, &nlines);
++
++	if (match) {
++		for (i = 0; i < nlines && nr < MAX_RANGES; i++) {
++			size_t l = line_len(data, starts, nlines, len, i);
++			char *line;
++			int hit;
++
++			if (l == 0)
++				continue;
++			line = xstrndup(data + starts[i], l);
++			hit = strstr(line, match) != NULL;
++			free(line);
++			if (!hit)
++				continue;
++			{
++				unsigned lo = (i >= (unsigned)ctx) ? i - (unsigned)ctx : 0;
++				unsigned hi = i + (unsigned)ctx;
++				if (hi >= nlines)
++					hi = nlines - 1;
++				if (nr && lo <= r[nr - 1].last + 1) {
++					if (hi > r[nr - 1].last)
++						r[nr - 1].last = hi;
++				} else {
++					r[nr].first = lo;
++					r[nr].last = hi;
++					nr++;
++				}
++			}
++		}
++		if (nr == 0) {
++			if (json)
++				printf("{\"schema\":1,\"stream\":\"%s\",\"status\":\"error\","
++						"\"code\":\"NOT_FOUND\",\"message\":\"no match\"}", label);
++			else
++				fprintf(stderr, "%s: NOT_FOUND: no match for \"%s\"\n",
++						path, match);
++			free(starts);
++			free(data);
++			return 1;
++		}
++	} else {
++		unsigned lo, hi;
++
++		if (first < 1)
++			first = 1;
++		if (last < first)
++			last = first;
++		if ((unsigned long)last > nlines)
++			last = nlines;
++		lo = (unsigned)first - 1;
++		hi = (unsigned)last - 1;
++		r[0].first = lo;
++		r[0].last = hi;
++		nr = 1;
++	}
++
++	if (json) {
++		printf("{\"schema\":1,\"stream\":\"%s\",\"status\":\"ok\",\"lines\":[",
++				label);
++		for (i = 0; i < nr; i++)
++			printf("%s[%u,%u]", i ? "," : "", r[i].first + 1, r[i].last + 1);
++		fputs("],\"content\":[", stdout);
++	} else {
++		printf("%s lines=", label);
++		for (i = 0; i < nr; i++)
++			printf("%s%u-%u", i ? "," : "", r[i].first + 1, r[i].last + 1);
++		putchar('\n');
++	}
++
++	{
++		unsigned emitted = 0;
++
++		for (i = 0; i < nr && !truncated; i++) {
++			unsigned li;
++
++			if (!json && i > 0)
++				fputs("--\n", stdout);
++			for (li = r[i].first; li <= r[i].last; li++) {
++				size_t l = line_len(data, starts, nlines, len, li);
++				char num[32];
++				int nd = snprintf(num, sizeof(num), "%u | ", li + 1);
++
++				if (shown + (size_t)nd + l + 1 > (size_t)budget) {
++					truncated = 1;
++					break;
++				}
++				if (json) {
++					if (emitted++)
++						putchar(',');
++					printf("{\"n\":%u,\"text\":", li + 1);
++					{
++						char *t = xstrndup(data + starts[li], l);
++						json_write_str(t);
++						free(t);
++					}
++					putchar('}');
++				} else {
++					fwrite(num, 1, (size_t)nd, stdout);
++					fwrite(data + starts[li], 1, l, stdout);
++					putchar('\n');
++				}
++				shown += (size_t)nd + l + 1;
++			}
++		}
++	}
++
++	if (json)
++		printf("],\"shown_bytes\":%u,\"truncated\":%s}",
++				(unsigned)shown, truncated ? "true" : "false");
++	else
++		printf("shown_bytes=%u truncated=%s\n", (unsigned)shown,
++				truncated ? "true" : "false");
++	free(starts);
++	free(data);
++	return 0;
++}
++
++int log_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
++int log_main(int argc UNUSED_PARAM, char **argv)
++{
++	char *opt_lines = NULL, *opt_match = NULL, *opt_ctx = NULL;
++	char *opt_stream = NULL, *opt_bytes = NULL, *opt_dir = NULL, *opt_fmt = NULL;
++	unsigned opts;
++	const char *root, *run, *dir;
++	long budget = DEFAULT_VIEW, ctx = DEFAULT_CONTEXT;
++	long first = 1, last = 0;
++	int json = 0, meta_only = 0, rc = 0;
++
++	static const char log_longopts[] ALIGN1 =
++		"lines\0"     Required_argument "l"
++		"match\0"     Required_argument "m"
++		"context\0"   Required_argument "c"
++		"stream\0"    Required_argument "s"
++		"meta\0"      No_argument       "M"
++		"max-bytes\0" Required_argument "B"
++		"dir\0"       Required_argument "D"
++		"format\0"    Required_argument "F"
++		;
++
++	xfunc_error_retval = 2;
++
++	opts = getopt32long(argv, "l:m:c:s:MB:D:F:", log_longopts,
++			&opt_lines, &opt_match, &opt_ctx, &opt_stream,
++			&opt_bytes, &opt_dir, &opt_fmt);
++	meta_only = (opts & (1 << 4)) != 0;   /* M */
++	argv += optind;
++
++	if (opt_fmt) {
++		if (strcmp(opt_fmt, "json") == 0)
++			json = 1;
++		else if (strcmp(opt_fmt, "text") != 0)
++			bb_error_msg_and_die("unknown format \"%s\"", opt_fmt);
++	}
++	if (opt_ctx)
++		ctx = strtol(opt_ctx, NULL, 10);
++	if (opt_bytes)
++		budget = strtol(opt_bytes, NULL, 10);
++	if (opt_lines) {
++		char *colon = strchr(opt_lines, ':');
++		first = strtol(opt_lines, NULL, 10);
++		last = (colon && colon[1]) ? strtol(colon + 1, NULL, 10) : first;
++	}
++	if (!argv[0])
++		bb_show_usage();
++	run = argv[0];
++	root = artifact_root(opt_dir);
++	dir = xasprintf("%s/%s", root, run);
++
++	if (meta_only) {
++		char *path = art_path(dir, "meta");
++		char *buf = NULL;
++		size_t len = 0;
++
++		if (read_all(path, &buf, &len) != 0) {
++			fprintf(stderr, "%s: NOT_FOUND\n", path);
++			return 1;
++		}
++		if (json) {
++			fputs("{\"schema\":1,\"run\":", stdout);
++			json_write_str(run);
++			fputs(",\"meta\":", stdout);
++			json_write_str(buf);
++			fputs("}\n", stdout);
++		} else {
++			fwrite(buf, 1, len, stdout);
++		}
++		free(buf);
++		fflush(stdout);
++		return 0;
++	}
++
++	{
++		const char *which = opt_stream ? opt_stream : "stdout";
++		int both = (strcmp(which, "both") == 0);
++
++		if (!both && strcmp(which, "stdout") != 0
++		 && strcmp(which, "stderr") != 0)
++			bb_error_msg_and_die("--stream is stdout, stderr or both");
++		if (json && both)
++			fputs("{\"schema\":1,\"results\":[", stdout);
++		if (both || strcmp(which, "stdout") == 0) {
++			rc |= dump_stream(art_path(dir, "stdout"), "stdout", opt_match,
++					first, last, ctx, budget, json && !both);
++			if (both && json)
++				putchar(',');
++		}
++		if (both || strcmp(which, "stderr") == 0)
++			rc |= dump_stream(art_path(dir, "stderr"), "stderr", opt_match,
++					first, last, ctx, budget, json && !both);
++		if (json && both)
++			fputs("]}\n", stdout);
++		else if (json)
++			putchar('\n');
++	}
++	fflush(stdout);
++	return rc;
++}
+diff --git a/miscutils/doctor.c b/miscutils/doctor.c
+new file mode 100644
+index 0000000..55e905e
+--- /dev/null
++++ b/miscutils/doctor.c
+@@ -0,0 +1,235 @@
++/* vi: set sw=4 ts=4: */
++/*
++ * doctor - report the environment an agent-facing busybox is running in.
++ *
++ * Licensed under GPLv2, see file LICENSE in this source tree.
++ */
++//config:config DOCTOR
++//config:	bool "doctor (4 kb)"
++//config:	default y
++//config:	help
++//config:	Report cwd, executable, shell, writable temp storage and the
++//config:	location of a few named tools. Never prints environment values.
++
++//applet:IF_DOCTOR(APPLET(doctor, BB_DIR_USR_BIN, BB_SUID_DROP))
++
++//kbuild:lib-$(CONFIG_DOCTOR) += doctor.o
++
++//usage:#define doctor_trivial_usage
++//usage:       "[-d TOOL,TOOL...] [-F FMT]"
++//usage:#define doctor_full_usage "\n\n"
++//usage:       "Report the runtime environment without dumping secrets"
++//usage:     "\n	-d, --deps LIST	Comma-separated tools to locate"
++//usage:     "\n	-F, --format FMT	text (default) or json"
++
++#if defined(__APPLE__)
++# include <mach-o/dyld.h>
++#endif
++#include "libbb.h"
++
++/* CONFIG_BUSYBOX_EXEC_PATH is "/proc/self/exe" even on Darwin; ask dyld there. */
++static char *self_exe(void)
++{
++#if defined(__APPLE__)
++	uint32_t size = 0;
++	char *buf;
++
++	_NSGetExecutablePath(NULL, &size);
++	buf = xmalloc(size + 1);
++	if (_NSGetExecutablePath(buf, &size) == 0 && buf[0])
++		return buf;
++	free(buf);
++	return NULL;
++#else
++	return realpath("/proc/self/exe", NULL);
++#endif
++}
++
++static void json_write_str(const char *s)
++{
++	putchar('"');
++	for (; *s; s++) {
++		unsigned char c = (unsigned char)*s;
++		if (c == '"' || c == '\\') {
++			putchar('\\');
++			putchar(c);
++		} else if (c >= 0x20) {
++			putchar(c);
++		}
++	}
++	putchar('"');
++}
++
++/* PATH lookup without executing anything. */
++static char *find_tool(const char *name)
++{
++	const char *path = getenv("PATH");
++	const char *p;
++
++	if (!path)
++		path = "/usr/local/bin:/usr/bin:/bin";
++	p = path;
++	while (p && *p) {
++		const char *colon = strchr(p, ':');
++		size_t len = colon ? (size_t)(colon - p) : strlen(p);
++		char *cand;
++		struct stat st;
++
++		cand = len ? xasprintf("%.*s/%s", (int)len, p, name)
++				: xasprintf("./%s", name);
++		if (stat(cand, &st) == 0 && S_ISREG(st.st_mode)
++		 && (st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH))) {
++			char *rp = realpath(cand, NULL);
++			if (rp) {
++				free(cand);
++				return rp;
++			}
++			return cand;
++		}
++		free(cand);
++		if (!colon)
++			break;
++		p = colon + 1;
++	}
++	return NULL;
++}
++
++static int tmp_writable(char **pused)
++{
++	const char *t = getenv("TMPDIR");
++	char *template;
++	int fd;
++
++	if (!t || !t[0])
++		t = "/tmp";
++	template = xasprintf("%s/busybox-doctor-XXXXXX", t);
++	fd = mkstemp(template);
++	if (fd < 0) {
++		free(template);
++		return 0;
++	}
++	close(fd);
++	unlink(template);
++	*pused = xasprintf("%s", t);
++	free(template);
++	return 1;
++}
++
++int doctor_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
++int doctor_main(int argc UNUSED_PARAM, char **argv)
++{
++	char *opt_deps = NULL, *opt_fmt = NULL;
++	unsigned opts;
++	int json = 0;
++	char *cwd, *exe, *tmpdir = NULL;
++	int tmp_ok;
++	const char *deps;
++
++	static const char doctor_longopts[] ALIGN1 =
++		"deps\0"   Required_argument "d"
++		"format\0" Required_argument "F"
++		;
++
++	xfunc_error_retval = 2;
++
++	opts = getopt32long(argv, "d:F:", doctor_longopts, &opt_deps, &opt_fmt);
++	(void)opts;
++	if (opt_fmt) {
++		if (strcmp(opt_fmt, "json") == 0)
++			json = 1;
++		else if (strcmp(opt_fmt, "text") != 0)
++			bb_error_msg_and_die("unknown format \"%s\"", opt_fmt);
++	}
++
++	cwd = getcwd(NULL, 0);
++	exe = self_exe();
++	if (!exe)
++		exe = xstrdup(bb_busybox_exec_path);
++	tmp_ok = tmp_writable(&tmpdir);
++	deps = opt_deps ? opt_deps : "git,make,python3";
++
++	if (json) {
++		printf("{\"schema\":1,\"platform\":\"%s\",\"cwd\":",
++#if defined(__APPLE__)
++				"darwin");
++#elif defined(__linux__)
++				"linux");
++#else
++				"unknown");
++#endif
++		json_write_str(cwd ? cwd : "");
++		fputs(",\"exe\":", stdout);
++		json_write_str(exe);
++		printf(",\"shell\":\"%s\"", bb_busybox_exec_path[0] ? "busybox sh" : "sh");
++		printf(",\"tmp\":");
++		if (tmp_ok) {
++			json_write_str(tmpdir);
++		} else
++			fputs("null", stdout);
++		printf(",\"tmp_writable\":%s,\"deps\":{", tmp_ok ? "true" : "false");
++		{
++			char *copy = xstrdup(deps);
++			char *save = copy, *tok;
++			int first = 1;
++
++			while ((tok = strsep(&save, ",")) != NULL) {
++				char *hit;
++
++				while (*tok == ' ')
++					tok++;
++				if (!*tok)
++					continue;
++				hit = find_tool(tok);
++				if (!first)
++					putchar(',');
++				first = 0;
++				json_write_str(tok);
++				putchar(':');
++				if (hit)
++					json_write_str(hit);
++				else
++					fputs("null", stdout);
++				free(hit);
++			}
++			free(copy);
++		}
++		fputs("}}\n", stdout);
++	} else {
++		printf("platform=%s\n",
++#if defined(__APPLE__)
++				"darwin"
++#elif defined(__linux__)
++				"linux"
++#else
++				"unknown"
++#endif
++		);
++		printf("cwd=%s\n", cwd ? cwd : "(unknown)");
++		printf("exe=%s\n", exe);
++		printf("shell=%s\n", "busybox sh");
++		printf("tmp=%s writable=%s\n", tmp_ok ? tmpdir : "(none)",
++				tmp_ok ? "true" : "false");
++		{
++			char *copy = xstrdup(deps);
++			char *save = copy, *tok;
++
++			while ((tok = strsep(&save, ",")) != NULL) {
++				char *hit;
++
++				while (*tok == ' ')
++					tok++;
++				if (!*tok)
++					continue;
++				hit = find_tool(tok);
++				printf("dep=%s path=%s\n", tok, hit ? hit : "-");
++				free(hit);
++			}
++			free(copy);
++		}
++	}
++	fflush(stdout);
++	free(cwd);
++	free(exe);
++	free(tmpdir);
++	return 0;
++}

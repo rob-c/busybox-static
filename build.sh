@@ -56,6 +56,18 @@ if [[ -n "$ZIGTRIPLE" ]]; then
 	EXTRA_CONFIG=(
 		"CONFIG_STATIC=y"        # -static: real static ELF against musl
 		"CONFIG_STATIC_LIBGCC=n" # no libgcc.a with clang/zig
+		# GNU long options for applets that only parse short ones, so the
+		# same command line works in both the Linux and the Darwin binary.
+		"CONFIG_FEATURE_GNU_LONG_OPTS=y"
+		# agent-facing table formatter (new applet, patch 0004)
+		"CONFIG_COLUMN=y"
+		# agent-facing applets (patch 0006): bounded reads, readiness
+		"CONFIG_PEEK=y"
+		"CONFIG_REPLACE=y"
+		"CONFIG_RUN=y"
+		"CONFIG_LOG=y"
+		"CONFIG_DOCTOR=y"
+		"CONFIG_WAITFOR=y"
 		# tc.c still uses the CBQ qdisc API, removed from Linux kernel headers
 		# (sched_cbq was deleted in Linux 6.x), so it cannot compile here.
 		"CONFIG_TC=n"
@@ -76,15 +88,56 @@ else
 		"CONFIG_STATIC=n"
 		"CONFIG_STATIC_LIBGCC=n"
 		"CONFIG_PIE=n"
+		# Same long-option support as the Linux builds: one command line,
+		# identical behaviour on both platforms.
+		"CONFIG_FEATURE_GNU_LONG_OPTS=y"
+		# agent-facing table formatter (new applet, patch 0004)
+		"CONFIG_COLUMN=y"
+		# agent-facing applets (patch 0006): bounded reads, readiness
+		"CONFIG_PEEK=y"
+		"CONFIG_REPLACE=y"
+		"CONFIG_RUN=y"
+		"CONFIG_LOG=y"
+		"CONFIG_DOCTOR=y"
+		"CONFIG_WAITFOR=y"
+		# Applets ported to macOS in patch 0004.  They must be listed here,
+		# not just edited into build/<target>/.config: build-all.sh wipes the
+		# build dirs, so anything set only in a .config is lost on a clean
+		# release build.  Each of these is pruned out of darwin-off.txt.
+		"CONFIG_TOP=y"
+		"CONFIG_MPSTAT=y"
+		"CONFIG_MOUNT=y"
+		"CONFIG_UMOUNT=y"
+		"CONFIG_IFCONFIG=y"
+		"CONFIG_ROUTE=y"
+		"CONFIG_FDISK=y"
+		"CONFIG_IOSTAT=y"
+		"CONFIG_LSBLK=y"
+		"CONFIG_IP=y"
+		# Only -l (listing) is supported on Darwin: writing needs BLKRRPART and
+		# the DOS/GPT writers, whose ioctls do not exist here.
+		"CONFIG_FEATURE_FDISK_WRITABLE=n"
+		"CONFIG_FEATURE_FDISK_ADVANCED=n"
+		# top's per-CPU and percentage columns are separate symbols that
+		# default to n once TOP was ever disabled; without them top prints
+		# no CPU line and no %CPU column.
+		"CONFIG_FEATURE_TOP_INTERACTIVE=y"
+		"CONFIG_FEATURE_TOP_CPU_USAGE_PERCENTAGE=y"
+		"CONFIG_FEATURE_TOP_CPU_GLOBAL_PERCENTS=y"
+		"CONFIG_FEATURE_TOP_DECIMALS=y"
 	)
 	if [[ "${PURE:-0}" == 1 ]]; then
 		# nslookup is the only applet needing libresolv; without it the binary
 		# depends on libSystem.B.dylib alone.
 		EXTRA_CONFIG+=("CONFIG_NSLOOKUP=n")
+		# iostat needs IOKit, which would add a second dylib
+		EXTRA_CONFIG+=("CONFIG_IOSTAT=n"
+		"CONFIG_LSBLK=n")
 	else
 		# nslookup uses ns_get16/ns_parserr etc, which Darwin's libresolv
 		# only exports as res_9_ns_* (so they must be linked explicitly)
-		EXTRA_CONFIG+=("CONFIG_EXTRA_LDLIBS=\"-lresolv\"")
+		# -framework IOKit: public on every supported macOS, used by iostat
+		EXTRA_CONFIG+=("CONFIG_EXTRA_LDLIBS=\"-lresolv -Wl,-framework,IOKit -Wl,-framework,CoreFoundation\"")
 	fi
 fi
 
