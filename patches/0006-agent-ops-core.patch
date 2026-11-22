@@ -1,9 +1,9 @@
 diff --git a/coreutils/peek.c b/coreutils/peek.c
 new file mode 100644
-index 0000000..f23241c
+index 0000000..5bb5a77
 --- /dev/null
 +++ b/coreutils/peek.c
-@@ -0,0 +1,846 @@
+@@ -0,0 +1,862 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * peek - bounded, numbered and versioned file reads.
@@ -434,33 +434,49 @@ index 0000000..f23241c
 +
 +	/* Decide which lines to show. */
 +	if (rq->lines) {
-+		char *s = xstrdup(rq->lines);
-+		char *colon = strchr(s, ':');
-+		long a = 1, b;
++		/* "5:9", "7" or several ranges: "5:9,40:60" */
++		char *copy = xstrdup(rq->lines);
++		char *save = copy, *part;
 +
-+		if (colon) {
-+			*colon = '\0';
-+			if (s[0])
-+				a = strtol(s, NULL, 10);
-+			b = colon[1] ? strtol(colon + 1, NULL, 10) : (long)nlines;
-+		} else {
-+			a = strtol(s, NULL, 10);
-+			b = a;
++		nranges = 0;
++		while ((part = strsep(&save, ",")) != NULL) {
++			char *colon = strchr(part, ':');
++			long a = 1, b;
++
++			if (!*part)
++				continue;
++			if (colon) {
++				*colon = '\0';
++				if (part[0])
++					a = strtol(part, NULL, 10);
++				b = colon[1] ? strtol(colon + 1, NULL, 10) : (long)nlines;
++			} else {
++				a = strtol(part, NULL, 10);
++				b = a;
++			}
++			if (a < 1)
++				a = 1;
++			if (b < a || (unsigned)a > nlines) {
++				*err_code = (char *)"NOT_FOUND";
++				*err_msg = xasprintf("line range %s is outside 1:%u",
++						rq->lines, nlines);
++				free(copy);
++				goto fail;
++			}
++			if ((unsigned)b > nlines)
++				b = (long)nlines;
++			if (nranges < MAX_WINDOWS) {
++				ranges[nranges].first = (unsigned)a - 1;
++				ranges[nranges].last = (unsigned)b - 1;
++				nranges++;
++			}
 +		}
-+		free(s);
-+		if (a < 1)
-+			a = 1;
-+		if (b < a || (unsigned)a > nlines) {
-+			*err_code = (char *)"NOT_FOUND";
-+			*err_msg = xasprintf("line range %s is outside 1:%u",
-+					rq->lines, nlines);
++		free(copy);
++		if (nranges == 0) {
++			*err_code = (char *)"INVALID_ARGUMENT";
++			*err_msg = xstrdup("--lines needs at least one range");
 +			goto fail;
 +		}
-+		if ((unsigned)b > nlines)
-+			b = (long)nlines;
-+		ranges[0].first = (unsigned)a - 1;
-+		ranges[0].last = (unsigned)b - 1;
-+		nranges = 1;
 +	} else if (rq->around) {
 +		regex_t re;
 +		int have_re = 0;
