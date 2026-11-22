@@ -1,9 +1,9 @@
 diff --git a/miscutils/snapshot.c b/miscutils/snapshot.c
 new file mode 100644
-index 0000000..6e0c883
+index 0000000..6e828d0
 --- /dev/null
 +++ b/miscutils/snapshot.c
-@@ -0,0 +1,275 @@
+@@ -0,0 +1,297 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * snapshot - hash a directory tree and diff two snapshots.
@@ -255,6 +255,28 @@ index 0000000..6e0c883
 +		fflush_stdout_and_exit(added || removed || changed ? 1 : 0);
 +	}
 +
++	{
++		/* a missing or unreadable root must not look like an empty tree */
++		struct stat st;
++		const char *root = opt_dir ? opt_dir : ".";
++
++		if (stat(root, &st) != 0 || !S_ISDIR(st.st_mode)) {
++			int e = errno;
++
++			if (json_out) {
++				printf("{\"schema\":1,\"status\":\"error\","
++						"\"code\":\"NOT_FOUND\",\"message\":");
++				json_str(strerror(e));
++				fputs(",\"dir\":", stdout);
++				json_str(root);
++				fputs("}\n", stdout);
++			} else {
++				errno = e;
++				bb_perror_msg("%s", root);
++			}
++			fflush_stdout_and_exit(1);
++		}
++	}
 +	walk(&l, opt_dir ? opt_dir : ".", "", 0);
 +	qsort(l.v, l.n, sizeof(l.v[0]), cmp_ent);
 +

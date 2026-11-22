@@ -1,9 +1,9 @@
 diff --git a/miscutils/bench.c b/miscutils/bench.c
 new file mode 100644
-index 0000000..a0f83f8
+index 0000000..28da217
 --- /dev/null
 +++ b/miscutils/bench.c
-@@ -0,0 +1,152 @@
+@@ -0,0 +1,153 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * bench - run a command N times and report the timings.
@@ -134,10 +134,11 @@ index 0000000..a0f83f8
 +	qsort(t, n, sizeof(t[0]), cmp_ll);
 +
 +	if (json_out) {
-+		printf("{\"schema\":1,\"status\":\"%s\",\"runs\":%u,\"ok\":%u,\"failed\":%u,"
++		printf("{\"schema\":1,\"status\":\"%s\",\"code\":\"%s\","
++				"\"runs\":%u,\"ok\":%u,\"failed\":%u,"
 +				"\"min_us\":%lld,\"median_us\":%lld,\"max_us\":%lld,\"mean_us\":%lld,"
 +				"\"cmd\":",
-+				rc ? "error" : "ok", n, ok, failed,
++				rc ? "error" : "ok", rc ? "EXIT_NONZERO" : "OK", n, ok, failed,
 +				min, t[n / 2], max, ok ? sum / (long long)ok : 0);
 +		putchar('"');
 +		for (i = 0; argv[i]; i++) {

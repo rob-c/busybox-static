@@ -1351,6 +1351,7 @@ index 0000000..85d8922
 +	fflush(stdout);
 +	return rc;
 +}
+
 diff --git a/miscutils/doctor.c b/miscutils/doctor.c
 new file mode 100644
 index 0000000..5b607d5

@@ -1,9 +1,9 @@
 diff --git a/miscutils/patchcheck.c b/miscutils/patchcheck.c
 new file mode 100644
-index 0000000..e5edcfc
+index 0000000..c58a89f
 --- /dev/null
 +++ b/miscutils/patchcheck.c
-@@ -0,0 +1,221 @@
+@@ -0,0 +1,225 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * patchcheck - structural checks on the patches/ series.
@@ -148,8 +148,12 @@ index 0000000..e5edcfc
 +	d = opendir(opt_dir ? opt_dir : "patches");
 +	if (!d) {
 +		if (json_out) {
++			int e = errno;
++
 +			printf("{\"schema\":1,\"status\":\"error\",\"code\":\"NOT_FOUND\","
-+					"\"dir\":");
++					"\"message\":");
++			put_str(strerror(e));
++			fputs(",\"dir\":", stdout);
 +			put_str(opt_dir);
 +			fputs("}\n", stdout);
 +		} else {

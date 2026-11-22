@@ -30,6 +30,12 @@ ck() { # ck <name> <expected> <actual>
 skipck() { skips=$((skips + 1)); printf 'skip %s\n' "$1"; }
 sec() { printf '== %s ==\n' "$1"; }
 
+# procps wants `args`, BSD/macOS wants `command`; pick whichever works here.
+PSF=""
+if ps -A -o args= >/dev/null 2>&1; then PSF="args"
+elif ps -A -o command= >/dev/null 2>&1; then PSF="command"
+fi
+
 if ! "$BB" --list | "$BB" grep -qx run; then
 	echo "skip: run applet not in this build"
 	exit 0
@@ -41,31 +47,61 @@ jrun() { # jrun ARGS... -> OUT (json payload), RC
 }
 jf() { printf '%s' "$OUT" | sed -n "s/.*\"$1\":\([^,}]*\).*/\1/p" | head -1 | sed 's/^"//; s/"$//'; }
 
-have_ps() { ps -A -o command= >/dev/null 2>&1; }
+have_ps() { [ -d /proc/self ] || [ -n "$PSF" ]; }
 # The harness itself must never look like a guest: filter the shell pipeline,
 # this script, and the ps/awk/grep helpers out of the process list.
-alive() { # alive <marker>
-	ps -A -o command= 2>/dev/null |
-		"$BB" grep -F -- "$1" |
-		"$BB" grep -v -e awk -e grep -e 'ps -A' -e timeout-resilience |
-		"$BB" grep -q .
+# Survivors are tracked by PID FILE: a guest whose final command is `sleep 30`
+# is exec()ed, so its marker leaves argv and a cmdline scan goes blind. Each
+# guest records its own pid (and any child pid) before blocking.
+survivors() { # survivors <pidfile>
+	local p n=0
+	[ -f "$1" ] || { echo 0; return; }
+	while read -r p; do
+		[ -n "$p" ] || continue
+		if kill -0 "$p" 2>/dev/null; then
+			if [ -r "/proc/$p/stat" ]; then
+				case "$(cut -d' ' -f3 "/proc/$p/stat" 2>/dev/null)" in
+				Z) continue ;;
+				esac
+			fi
+			n=$((n + 1))
+		fi
+	done < "$1"
+	echo "$n"
 }
-sweep() { # kill leftovers so one failure cannot poison the next check
+sweep() { # sweep <pidfile>
 	local p
-	ps -A -o pid=,command= 2>/dev/null |
-		"$BB" grep -F -- "$1" |
-		"$BB" grep -v -e awk -e grep -e 'ps -A' -e timeout-resilience |
-		"$BB" awk -v self="$$" '{ if ($1 != self) print $1 }' |
-		while read -r p; do kill -9 "$p" 2>/dev/null; done
+	[ -f "$1" ] || return 0
+	while read -r p; do
+		[ -n "$p" ] && kill -9 "$p" 2>/dev/null
+	done < "$1"
+	return 0
 }
-orphan_ck() { # orphan_ck <name> <marker>
+pidf_for() { # pidf_for <tag> -> prints a fresh pid file path (removed)
+	rm -f "$T/pids.$1"
+	printf '%s' "$T/pids.$1"
+}
+orphan_ck() { # orphan_ck <name> <pidfile>
 	if have_ps; then
-		sweep "$2"; sleep 0.4
-		ck "$1" "false" "$(alive "$2" && echo true || echo false)"
+		ck "$1" "0" "$(survivors "$2")"
+		sweep "$2"
 	else
 		skipck "$1"
 	fi
 }
+
+# Integrity guard: leak a process on purpose and refuse to run unless the
+# survivor check sees it. Without this a blind check looks like a passing one.
+probe="$T/probe.pids"
+( sh -c "echo \$\$ > $probe; exec sleep 3" & ) 2>/dev/null
+sleep 0.3
+seen=$(survivors "$probe")
+sweep "$probe"
+if [ "$seen" != 1 ]; then
+	echo "abort: the survivor check cannot see a leaked process (saw [$seen])" >&2
+	exit 1
+fi
+echo "survivor check verified: a leaked pid is detected"
 
 # ------------------------------------------------------- A. baseline
 sec "A. baseline deadline"
@@ -80,14 +116,15 @@ jrun --timeout 1 --kill-after 1 -- sh -c 'echo up; sleep 30'
 
 # ------------------------------- B. the guest refuses to die politely
 sec "B. guest traps TERM and keeps running"
-MARK=$(printf 'tb%s' 1)
-jrun --timeout 1 -- sh -c "trap '' TERM; echo $MARK; echo start; while :; do sleep 1; done"
+PIDF=$(pidf_for b1)
+jrun --timeout 1 -- sh -c "PIDF=$PIDF; echo \$\$ >> \$PIDF; trap '' TERM; echo start; while :; do sleep 1; done"
 ck "trap-term.rc"                "3"     "$RC"
 ck "trap-term.timed_out"         "true"  "$(jf timed_out)"
 ck "trap-term.capture"           "true"  "$(jf capture_complete)"
 ck "trap-term.early_output_kept" "start" "$(printf '%s' "$(jf stdout_view)" | tr -d '\\n' | tail -c 5)"
 ck "trap-term.killed_by_signal"  "true"  "$([ "$(jf exit_code)" -lt 0 ] && echo true || echo false)"
-orphan_ck "trap-term.no_orphan" "$MARK"
+sleep 0.2
+orphan_ck "trap-term.no_orphan" "$PIDF"
 
 sec "B2. guest traps TERM and exits 0"
 jrun --timeout 1 -- sh -c "trap 'exit 0' TERM; sleep 30; echo tail"
@@ -97,19 +134,21 @@ ck "trap-exit0.not_success"      "true"  "$([ "$RC" = 0 ] && echo false || echo 
 ck "trap-exit0.no_tail"          "0"     "$(printf '%s' "$(jf stdout_view)" | "$BB" grep -c tail)"
 
 sec "B3. guest ignores TERM, INT and HUP"
-MARK=$(printf 'tb%s' 3)
-jrun --timeout 1 -- sh -c "trap '' TERM INT HUP; echo $MARK; sleep 30"
+PIDF=$(pidf_for b3)
+jrun --timeout 1 -- sh -c "PIDF=$PIDF; echo \$\$ >> \$PIDF; trap '' TERM INT HUP; sleep 30"
 ck "ignore3.rc"                  "3"     "$RC"
 ck "ignore3.timed_out"           "true"  "$(jf timed_out)"
-orphan_ck "ignore3.no_orphan"    "$MARK"
+sleep 0.2
+orphan_ck "ignore3.no_orphan"    "$PIDF"
 
 # ------------------------------------- C. grandchildren resist as well
 sec "C. grandchild ignores TERM"
-MARK=$(printf 'tc%s' 1)
-jrun --timeout 1 -- sh -c "sh -c 'trap \"\" TERM; echo $MARK; sleep 30' & sleep 30"
+PIDF=$(pidf_for c1)
+jrun --timeout 1 -- sh -c "PIDF=$PIDF; echo \$\$ >> \$PIDF; sh -c 'trap \"\" TERM; echo \$\$ >> \$PIDF; sleep 30' & echo \$! >> \$PIDF; sleep 30"
 ck "grandchild.rc"               "3"     "$RC"
 ck "grandchild.timed_out"        "true"  "$(jf timed_out)"
-orphan_ck "grandchild.no_orphan" "$MARK"
+sleep 0.2
+orphan_ck "grandchild.no_orphan" "$PIDF"
 
 sec "C2. --kill-after tightens the grace window"
 jrun --timeout 1 --kill-after 0.2 -- sh -c "trap '' TERM; sleep 30"

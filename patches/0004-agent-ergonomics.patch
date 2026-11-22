@@ -3917,7 +3917,7 @@ index 6cdd641..5c0252f 100644
  {
  #if FIXED_HEADER
 diff --git a/shell/ash.c b/shell/ash.c
-index 9afeaed..1b5fd70 100644
+index 9afeaed..aad7c06 100644
 --- a/shell/ash.c
 +++ b/shell/ash.c
 @@ -906,8 +906,8 @@ out2str(const char *p)
@@ -4372,7 +4372,7 @@ index 9afeaed..1b5fd70 100644
  			case '%':
  			case '#':
  				subtype = (c == '#' ? VSTRIMLEFT : VSTRIMRIGHT);
-@@ -15173,6 +15507,164 @@ extern int etext();
+@@ -15173,6 +15507,225 @@ extern int etext();
   * exception occurs.  When an exception occurs the variable "state"
   * is used to figure out how far we had gotten.
   */
@@ -4381,6 +4381,9 @@ index 9afeaed..1b5fd70 100644
 +static char *ash_brief_which;
 +static int ash_brief_json;
 +static char *ash_timeout_opt;
++static char *ash_format_opt;        /* --format text|json   */
++static char *ash_max_bytes_opt;     /* --max-bytes N        */
++static char *ash_capture_limit_opt; /* --capture-limit N    */
 +
 +#if ENABLE_BRIEF
 +int brief_main_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
@@ -4394,29 +4397,46 @@ index 9afeaed..1b5fd70 100644
 + * output identical to a plain shell, and the run's artifacts stay available
 + * through `log`.
 + */
-+static void ash_dispatch_timeout(char **argv)
++static void ash_dispatch_run(char **argv)
 +{
 +	char **av;
 +	int i, k, n = 0;
 +	int applet;
++	int quiet = !ash_format_opt;
 +
 +	if (!argv[1]) {
 +		xfunc_error_retval = 2;
-+		bb_error_msg_and_die("--timeout needs -c CMD or a script");
++		bb_error_msg_and_die("--timeout/--format need -c CMD or a script");
 +	}
 +	applet = find_applet_by_name("run");
 +	if (applet < 0) {
 +		xfunc_error_retval = 2;
-+		bb_error_msg_and_die("--timeout needs the run applet");
++		bb_error_msg_and_die("--timeout/--format need the run applet");
 +	}
 +	for (i = 1; argv[i]; i++)
 +		n++;
-+	av = xzalloc(sizeof(char *) * (n + 12));
-+	av[0] = (char *)"run";
-+	av[1] = (char *)"--timeout";
-+	av[2] = ash_timeout_opt;
-+	av[3] = (char *)"--quiet";
-+	k = 4;
++	av = xzalloc(sizeof(char *) * (n + 16));
++	k = 0;
++	av[k++] = (char *)"run";
++	if (ash_timeout_opt) {
++		av[k++] = (char *)"--timeout";
++		av[k++] = ash_timeout_opt;
++	}
++	if (ash_format_opt) {
++		av[k++] = (char *)"--format";
++		av[k++] = ash_format_opt;
++	}
++	if (ash_max_bytes_opt) {
++		av[k++] = (char *)"--max-bytes";
++		av[k++] = ash_max_bytes_opt;
++	}
++	if (ash_capture_limit_opt) {
++		av[k++] = (char *)"--capture-limit";
++		av[k++] = ash_capture_limit_opt;
++	}
++	/* --quiet keeps the plain-shell output when nothing else was asked for */
++	if (quiet)
++		av[k++] = (char *)"--quiet";
 +	if (ash_brief_which) {
 +		av[k++] = (char *)"--brief";
 +		av[k++] = ash_brief_which;
@@ -4434,8 +4454,42 @@ index 9afeaed..1b5fd70 100644
 +static void ash_strip_agent_opts(char **argv)
 +{
 +	int i, j = 1;
++	int done = 0;   /* past -c CMD, a script name or --: copy verbatim */
 +
 +	for (i = 1; argv[i]; i++) {
++		if (done) {
++			argv[j++] = argv[i];
++			continue;
++		}
++		if (strcmp(argv[i], "--") == 0) {
++			argv[j++] = argv[i];
++			done = 1;
++			continue;
++		}
++		if (strcmp(argv[i], "-c") == 0) {
++			argv[j++] = argv[i];
++			if (argv[i + 1])
++				argv[j++] = argv[++i];   /* the command is not ours */
++			done = 1;
++			continue;
++		}
++		if (argv[i][0] != '-') {
++			argv[j++] = argv[i];
++			done = 1;                        /* a script path */
++			continue;
++		}
++		if (strcmp(argv[i], "--format") == 0 && argv[i + 1]) {
++			ash_format_opt = argv[++i];
++			continue;
++		}
++		if (strcmp(argv[i], "--max-bytes") == 0 && argv[i + 1]) {
++			ash_max_bytes_opt = argv[++i];
++			continue;
++		}
++		if (strcmp(argv[i], "--capture-limit") == 0 && argv[i + 1]) {
++			ash_capture_limit_opt = argv[++i];
++			continue;
++		}
 +		if (strcmp(argv[i], "--timeout") == 0 && argv[i + 1]) {
 +			ash_timeout_opt = argv[i + 1];
 +			i++;
@@ -4453,6 +4507,13 @@ index 9afeaed..1b5fd70 100644
 +		argv[j++] = argv[i];
 +	}
 +	argv[j] = NULL;
++	if (ash_format_opt
++	 && strcmp(ash_format_opt, "text") != 0
++	 && strcmp(ash_format_opt, "json") != 0
++	) {
++		xfunc_error_retval = 2;
++		bb_error_msg_and_die("--format is text or json");
++	}
 +	if (ash_brief_which
 +	 && strcmp(ash_brief_which, "stdout") != 0
 +	 && strcmp(ash_brief_which, "stderr") != 0
@@ -4537,18 +4598,21 @@ index 9afeaed..1b5fd70 100644
  int ash_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
  #if NUM_SCRIPTS > 0
  int ash_main(int argc, char **argv)
-@@ -15187,6 +15679,10 @@ int ash_main(int argc UNUSED_PARAM, char **argv)
+@@ -15187,6 +15740,13 @@ int ash_main(int argc UNUSED_PARAM, char **argv)
  
  	dbg_show_dirtymem("dirtymem at main start");
  
 +	ash_strip_agent_opts(argv);
-+	if (ash_timeout_opt)
-+		ash_dispatch_timeout(argv);   /* does not return */
++	if (ash_timeout_opt || ash_format_opt
++	 || ash_max_bytes_opt || ash_capture_limit_opt
++	) {
++		ash_dispatch_run(argv);       /* does not return */
++	}
 +
  	/* Initialize global data */
  	INIT_G_misc();
  	INIT_G_memstack();
-@@ -15241,6 +15737,7 @@ int ash_main(int argc UNUSED_PARAM, char **argv)
+@@ -15241,6 +15801,7 @@ int ash_main(int argc UNUSED_PARAM, char **argv)
  		minusc = get_script_content(-argc - 1);
  #endif
  	login_sh = procargs(argv);
@@ -4556,6 +4620,7 @@ index 9afeaed..1b5fd70 100644
  #if DEBUG
  	TRACE(("Shell args: "));
  	trace_puts_args(argv);
+
 diff --git a/shell/hush.c b/shell/hush.c
 index afed0b5..6e337e7 100644
 --- a/shell/hush.c
@@ -4592,10 +4657,10 @@ index afed0b5..6e337e7 100644
  	exp_saveptr = arg[1] ? (char*)strchr(VAR_ENCODED_SUBST_OPS, arg[1]) : NULL;
 diff --git a/util-linux/column.c b/util-linux/column.c
 new file mode 100644
-index 0000000..3a6bf34
+index 0000000..84b0e4f
 --- /dev/null
 +++ b/util-linux/column.c
-@@ -0,0 +1,150 @@
+@@ -0,0 +1,200 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * column - format input into columns
@@ -4622,6 +4687,18 @@ index 0000000..3a6bf34
 +
 +#include "libbb.h"
 +
++static void json_escape(const char *s)
++{
++	for (; s && *s; s++) {
++		if (*s == '"' || *s == '\\')
++			printf("\\%c", *s);
++		else if ((unsigned char)*s < 0x20)
++			printf("\\u%04x", (unsigned char)*s);
++		else
++			putchar(*s);
++	}
++}
++
 +int column_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
 +int column_main(int argc UNUSED_PARAM, char **argv)
 +{
@@ -4629,6 +4706,8 @@ index 0000000..3a6bf34
 +	const char *in_sep = NULL;
 +	const char *out_sep = "  ";
 +	llist_t *lines = NULL;
++	const char *opt_fmt = NULL;
++	int json_out;
 +	llist_t *lp;
 +	FILE *fp;
 +	char *line;
@@ -4641,17 +4720,37 @@ index 0000000..3a6bf34
 +
 +	/* bits: t = 1, s = 2, o = 4 */
 +	xfunc_error_retval = 2;
-+	opts = getopt32long(argv, "^" "ts:o:" "\0" "?1",
++	opts = getopt32long(argv, "^" "ts:o:" "F:" "\0" "?1",
 +		"table\0"          No_argument       "t"
 +		"separator\0"      Required_argument "s"
 +		"output-separator\0" Required_argument "o"
-+		, &in_sep, &out_sep
++		"format\0"         Required_argument "F"
++		, &in_sep, &out_sep, &opt_fmt
 +	);
++	json_out = opt_fmt && strcmp(opt_fmt, "json") == 0;
++	if (opt_fmt && !json_out && strcmp(opt_fmt, "text") != 0) {
++		xfunc_error_retval = 2;
++		bb_error_msg("unknown format %s", opt_fmt);
++		return 2;
++	}
 +	xfunc_error_retval = 1;   /* past option parsing: failures are operational */
 +
 +	argv += optind;
-+	if (argv[0]) {
-+		fp = xfopen_stdin(argv[0]);
++	if (argv[0] && strcmp(argv[0], "-") != 0) {
++		fp = fopen(argv[0], "r");
++		if (!fp) {
++			int e = errno;
++
++			if (json_out) {
++				printf("{\"schema\":1,\"status\":\"error\",\"code\":\"NOT_FOUND\","
++						"\"message\":");
++				json_escape(strerror(e));
++				fputs("}\n", stdout);
++				fflush_stdout_and_exit(1);
++			}
++			errno = e;
++			bb_perror_msg_and_die("%s", argv[0]);
++		}
 +	} else {
 +		fp = stdin;
 +	}
@@ -4713,6 +4812,22 @@ index 0000000..3a6bf34
 +		r++;
 +	}
 +
++	if (json_out) {
++		/* the parsed table, so an agent never has to guess column widths */
++		printf("{\"schema\":1,\"rows\":%u,\"cols\":%u,\"data\":[", nrows, maxcols);
++		for (r = 0; r < nrows; r++) {
++			printf("%s[", r ? "," : "");
++			for (c = 0; c < ncells[r]; c++) {
++				printf("%s\"", c ? "," : "");
++				json_escape(cells[r][c]);
++				putchar('"');
++			}
++			putchar(']');
++		}
++		fputs("]}\n", stdout);
++		return EXIT_SUCCESS;
++	}
++
 +	if (maxcols == 0)
 +		return EXIT_SUCCESS;
 +
@@ -4746,6 +4861,7 @@ index 0000000..3a6bf34
 +
 +	return EXIT_SUCCESS;
 +}
+
 diff --git a/util-linux/fallocate.c b/util-linux/fallocate.c
 index d5c2589..58e1db8 100644
 --- a/util-linux/fallocate.c

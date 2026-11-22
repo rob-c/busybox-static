@@ -467,9 +467,18 @@ Runnable against any built binary:
 ./test.sh                  dist/darwin-arm64/bin/busybox   # 198 smoke checks
 ./tests/agent-ops.sh       dist/darwin-arm64/bin/busybox   # 1299 agent-applet checks
 ./tests/timeout-resilience.sh dist/darwin-arm64/bin/busybox # 50 deadline checks
+./tests/timeout-resilience-matrix.sh dist/darwin-arm64/bin/busybox # 200 more
 ./stress.sh                dist/darwin-arm64/bin/busybox   # per-applet stability
 ./adversarial.sh           dist/darwin-arm64/bin/busybox   # ~1270 hostile-input checks
 ```
+
+`tests/timeout-resilience-matrix.sh` multiplies the same idea: 10 hostile guests
+(trap-and-loop, trap-and-exit-0, trap-and-exit-3, ignore TERM/INT/HUP/QUIT,
+trap that blocks inside the handler, child that ignores, subshell that ignores,
+looping sleeps, CPU spin) × 4 invocation paths (`run --timeout`,
+`run --kill-after`, `sh --timeout`, `run --brief`) × 5 assertions (exit 3, never
+124, never 128+N, no survivor, inside the grace window) = 200 checks, run on
+darwin-arm64 and in `almalinux:9`.
 
 `tests/timeout-resilience.sh` is the one that matters for deadlines: every guest
 either traps `TERM` and keeps running, traps it and exits 0, ignores

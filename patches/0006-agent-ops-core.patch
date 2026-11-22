@@ -1,6 +1,6 @@
 diff --git a/coreutils/peek.c b/coreutils/peek.c
 new file mode 100644
-index 0000000..62f48d8
+index 0000000..1a1b177
 --- /dev/null
 +++ b/coreutils/peek.c
 @@ -0,0 +1,1039 @@
@@ -36,7 +36,7 @@ index 0000000..62f48d8
 +//usage:     "\n	-M N		Refuse files larger than N bytes (default 33554432)"
 +//usage:     "\n	-R FILE		Batch request (JSON)"
 +//usage:     "\n	-p		Hex preview of binary files"
-+//usage:     "\n	-f FMT		Output format: text (default) or json"
++//usage:     "\n	-f, --format FMT	Output format: text (default) or json"
 +//usage:     "\n"
 +//usage:     "\nExit: 0 ok, 1 operation failed, 2 usage error"
 +//usage:     "\n\"truncated=true\" comes with next=--from-byte N; nothing is skipped."
@@ -1043,6 +1043,7 @@ index 0000000..62f48d8
 +	}
 +	return exitcode;
 +}
+
 diff --git a/include/json_read.h b/include/json_read.h
 new file mode 100644
 index 0000000..15c6aee
@@ -2277,10 +2278,10 @@ index 0000000..4dd231e
 +}
 diff --git a/miscutils/why.c b/miscutils/why.c
 new file mode 100644
-index 0000000..b8ec300
+index 0000000..594f3ab
 --- /dev/null
 +++ b/miscutils/why.c
-@@ -0,0 +1,232 @@
+@@ -0,0 +1,237 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * why - explain why an applet is, or is not, in this build.
@@ -2508,8 +2509,13 @@ index 0000000..b8ec300
 +		free(state);
 +		free(pruned);
 +	}
-+	if (json)
-+		fputs("]}\n", stdout);
++	if (json) {
++		/* one envelope for every applet: status first, code when it failed */
++		printf("],\"status\":\"%s\"", rc ? "error" : "ok");
++		if (rc)
++			fputs(",\"code\":\"NOT_FOUND\"", stdout);
++		fputs("}\n", stdout);
++	}
 +	fflush(stdout);
 +	return rc;
 +}

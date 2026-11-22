@@ -621,5 +621,148 @@ ck "run json schema unchanged" "1" "$("$BB" grep -c '"schema":1' "$T/j")"
 ck "run text has no cmd field" "0" \
 	"$("$BB" run -- "$BB" true 2>/dev/null | "$BB" grep -c '"cmd"')"
 
+
+sec "21. output-format conformance: every direct call speaks schema 1"
+# ok-cmd / bad-cmd pairs, each with the JSON flag that applet documents
+printf '{"a":1}' > "$T/cf.json"
+printf 'a\nb\n' > "$T/cf.txt"
+printf 'ready\n' > "$T/cf.ready"
+mkdir -p "$T/cf.tree"; printf 'x\n' > "$T/cf.tree/f"
+mkdir -p "$T/cf.pat"; printf 'diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n' > "$T/cf.pat/0001-a.patch"
+printf 'one | true | 0 |\n' > "$T/cf.tbl"
+conf() { # conf <name> <ok-cmd> <bad-cmd>
+	name=$1; okc=$2; bad=$3
+	# shellcheck disable=SC2086
+	"$BB" $okc > "$T/c1" 2> "$T/e1"; r1=$?
+	# shellcheck disable=SC2086
+	"$BB" $bad > "$T/c2" 2> "$T/e2"; r2=$?
+	ck "$name: ok names a schema" "1" "$("$BB" grep -c '"schema":1' "$T/c1")"
+	ck "$name: ok is one line" "1" "$("$BB" wc -l < "$T/c1" | "$BB" tr -d ' ')"
+	ck "$name: bad exit in table" "1" "$(is_ok_code "$r2")"
+	ck "$name: bad carries status=error" "1" "$("$BB" grep -c '"status":"error"' "$T/c2")"
+	ck "$name: bad carries a code" "1" "$("$BB" grep -c '"code":"[A-Z_]*"' "$T/c2")"
+	ck "$name: bad is one line" "1" "$("$BB" wc -l < "$T/c2" | "$BB" tr -d ' ')"
+	ck "$name: bad says nothing on stderr" "0" "$("$BB" wc -c < "$T/e2" | "$BB" tr -d ' ' | "$BB" sed 's/^0$/0/;s/^[1-9][0-9]*$/1/')"
+}
+conf peek     "peek -f json -l 1:1 $T/cf.txt"        "peek -f json /nope"
+conf replace  "replace $T/cf.txt --old a --new A -x 1 -N --format json" "replace /nope --old a --new b --format json"
+conf waitfor  "waitfor -f $T/cf.ready -T 1 -F json"  "waitfor -f /nope -T 1 -F json"
+conf run      "run -F json -- $BB true"              "run -F json -- /nope"
+conf log      "log -D $T/art -F json $R"             "log -D $T/art -F json R999999"
+conf why      "why -C /dev/null -p /dev/null -F json peek" "why -C /dev/null -p /dev/null -F json nosuchthing"
+conf json     "json -f $T/cf.json --format json -g .a" "json -f /nope --format json"
+conf patchcheck "patchcheck -d $T/cf.pat --format json" "patchcheck -d /nope --format json"
+conf bench    "bench -n 1 -w 0 -F json -- $BB true"  "bench -n 1 -w 0 -F json -- $BB false"
+conf snapshot "snapshot -d $T/cf.tree -F json"       "snapshot -d /nope -F json"
+conf check    "check -f $T/cf.tbl --format json"     "check -f /nope --format json"
+conf brief    "brief -F json $T/cf.txt"              "brief -F json /nope"
+conf column   "column -F json $T/cf.txt"             "column -F json /nope"
+
+sec "22. column --format json: the parsed table, not the rendered one"
+printf 'a b c\nd ee f\n' > "$T/tb.txt"
+"$BB" column -F json "$T/tb.txt" > "$T/c1" 2>/dev/null
+ck "column json schema" "1" "$("$BB" grep -c '"schema":1' "$T/c1")"
+ck "column json rows" "2" "$(jv rows "$T/c1")"
+ck "column json cols" "3" "$(jv cols "$T/c1")"
+ck "column json data" "1" "$("$BB" grep -c '"data":\[\[' "$T/c1")"
+ck "column json keeps empty cells short" "1" "$("$BB" grep -c '"d","ee","f"' "$T/c1")"
+printf 'a  b\n' > "$T/tb2.txt"
+ck "column json one row" "1" "$("$BB" column -F json "$T/tb2.txt" 2>/dev/null | "$BB" grep -c '"rows":1')"
+printf 'x\ty\n' > "$T/tb3.txt"
+ck "column -s splits on a separator" "1" "$("$BB" column -s "$("$BB" printf '\t')" -F json "$T/tb3.txt" 2>/dev/null | "$BB" grep -c '"x","y"')"
+ck "column text mode unchanged" "2" "$("$BB" column "$T/tb.txt" 2>/dev/null | "$BB" wc -l | "$BB" tr -d ' ')"
+ck "column bad --format exits 2" "2" "$("$BB" column -F xml "$T/tb.txt" >/dev/null 2>&1; echo $?)"
+"$BB" printf 'a"b c\n' > "$T/tb4.txt"
+"$BB" column -F json "$T/tb4.txt" > "$T/c4" 2>/dev/null
+ck "column json escapes a quote and still parses" "0" \
+	"$("$BB" json -f "$T/c4" -c >/dev/null 2>&1; echo $?)"
+ck "column json keeps the quote in the value" "1" "$("$BB" grep -c 'a\\"b' "$T/c4")"
+
+sec "23. snapshot and patchcheck no longer report a missing path as success"
+"$BB" snapshot -d /nope -F json > "$T/c1" 2>/dev/null
+ck "snapshot missing dir exits 1" "1" "$("$BB" snapshot -d /nope -F json >/dev/null 2>&1; echo $?)"
+ck "snapshot missing dir is not ok" "0" "$("$BB" grep -c '"status":"ok"' "$T/c1")"
+ck "snapshot missing dir names the code" "1" "$("$BB" grep -c '"code":"NOT_FOUND"' "$T/c1")"
+ck "patchcheck missing dir exits 1" "1" "$("$BB" patchcheck -d /nope --format json >/dev/null 2>&1; echo $?)"
+ck "patchcheck error has a message" "1" "$("$BB" patchcheck -d /nope --format json 2>/dev/null | "$BB" grep -c '"message":')"
+ck "bench failure carries a code" "1" "$("$BB" bench -n 1 -w 0 -F json -- $BB false 2>/dev/null | "$BB" grep -c '"code":"EXIT_NONZERO"')"
+ck "waitfor timeout has a status" "1" "$("$BB" waitfor -f /nope -T 1 -F json 2>/dev/null | "$BB" grep -c '"status":"error"')"
+ck "waitfor ready has a status" "1" "$("$BB" waitfor -f "$T/cf.ready" -T 1 -F json 2>/dev/null | "$BB" grep -c '"status":"ok"')"
+
+
+sec "24. run/sh --timestamps: one interleaved, stamped stream"
+# every stamped line: [  sec.usec out|err] text
+STAMP='^\[ *[0-9]+\.[0-9][0-9][0-9][0-9][0-9][0-9] (out|err)\] '
+"$BB" run -t -- "$BB" sh -c 'echo one; echo two >&2; echo three' > "$T/tl" 2>/dev/null
+ck "run -t rc" "0" "$?"
+ck "run -t prints a timeline header" "1" "$("$BB" grep -c '^--- timeline ---$' "$T/tl")"
+ck "run -t stamps every body line" "3" \
+	"$("$BB" grep -Ec '^\[ *[0-9]+\.([0-9]{6}) (out|err)\] ' "$T/tl")"
+ck "run -t keeps the stdout lines" "1" "$("$BB" grep -c 'out\] one$' "$T/tl")"
+ck "run -t keeps the stderr lines" "1" "$("$BB" grep -c 'err\] two$' "$T/tl")"
+ck "run -t counts the lines" "1" "$("$BB" grep -c '^timeline_lines=3' "$T/tl")"
+ck "run -t has no separate stream sections" "0" "$("$BB" grep -c '^--- stdout ---' "$T/tl")"
+ck "run -t keeps the run header" "1" "$("$BB" grep -c '^run=R[0-9]* exit_code=0' "$T/tl")"
+# timestamps must be non-decreasing, in read order
+"$BB" sed -n 's/^\[ *\([0-9]*\.[0-9]*\) .*/\1/p' "$T/tl" > "$T/st"
+ck "run -t timestamps are non-decreasing" "1" \
+	"$("$BB" sort -n -c "$T/st" 2>/dev/null && echo 1)"
+ck "run -t prints three stamps" "3" "$("$BB" wc -l < "$T/st" | "$BB" tr -d ' ')"
+# stderr written first must be stamped first
+"$BB" run -t -- "$BB" sh -c 'echo E >&2; sleep 0.05; echo O' > "$T/tl2" 2>/dev/null
+ck "run -t preserves cross-stream order" "1" \
+	"$("$BB" grep -n 'err\] E' "$T/tl2" | "$BB" cut -d: -f1 | "$BB" head -1 | "$BB" sed 's/^4$/1/')"
+ck "run -t ordered pair has O after E" "1" \
+	"$("$BB" awk '/err\] E/{e=NR} /out\] O/{o=NR} END{print (e<o)?1:0}' "$T/tl2")"
+# artifacts stay byte-exact: the timeline must not contaminate evidence
+rm -rf "$T/art"
+"$BB" run -t -D "$T/art" -- "$BB" printf 'no-newline-tail' > "$T/tl3" 2>/dev/null
+ck "run -t artifact is byte-exact" "1" \
+	"$([ "$(cat "$T"/art/R*/stdout)" = "no-newline-tail" ] && echo 1)"
+ck "run -t flushes a line with no newline" "1" "$("$BB" grep -c 'out\] no-newline-tail$' "$T/tl3")"
+# json
+"$BB" run -t -F json -- "$BB" sh -c 'echo hi' > "$T/tj" 2>/dev/null
+ck "run -t json has a timeline" "1" "$("$BB" grep -c '"timeline":\[' "$T/tj")"
+ck "run -t json stamps a record" "1" "$("$BB" grep -c '"us":[0-9]*,"stream":"out","text":"hi"' "$T/tj")"
+ck "run -t json flags truncation" "1" "$("$BB" grep -c '"timeline_truncated":false' "$T/tj")"
+ck "run -t json keeps the schema" "1" "$("$BB" grep -c '"schema":1' "$T/tj")"
+ck "run -t json is one line" "1" "$("$BB" wc -l < "$T/tj" | "$BB" tr -d ' ')"
+ck "run without -t has no timeline key" "0" \
+	"$("$BB" run -F json -- "$BB" true 2>/dev/null | "$BB" grep -c '"timeline"')"
+# budget bounds the timeline and says so
+"$BB" run -t -B 8 -- "$BB" sh -c 'for i in 1 2 3 4 5; do echo line$i; done' > "$T/tl4" 2>/dev/null
+ck "run -t small budget truncates" "1" "$("$BB" grep -c 'truncated=true' "$T/tl4")"
+ck "run -t truncation is announced" "1" "$("$BB" grep -c 'timeline truncated' "$T/tl4")"
+ck "run -t truncated body stays small" "1" \
+	"$([ "$("$BB" grep -Ec '^\[ ' "$T/tl4")" -lt 5 ] && echo 1)"
+# binary and long lines
+printf 'a\000b\nc\n' > "$T/tb.bin"
+ck "run -t survives binary output" "0" "$("$BB" run -t -- "$BB" cat "$T/tb.bin" >/dev/null 2>&1; echo $?)"
+"$BB" awk 'BEGIN{for(i=0;i<5000;i++)printf "x"; printf "\n"}' > "$T/tlong"
+# 5000 bytes of payload plus the "[  s.uuuuuu out] " prefix and the newline
+"$BB" run -t -B 20000 -- "$BB" cat "$T/tlong" > "$T/tl5" 2>/dev/null
+ck "run -t keeps a long line whole" "1" \
+	"$("$BB" awk '/\] x/ {print (length($0) >= 5000) ? 1 : 0; exit}' "$T/tl5")"
+ck "run -t does not split a long line" "1" "$("$BB" grep -c '^timeline_lines=1' "$T/tl5")"
+ck "run -t long line keeps its bytes" "5000" \
+	"$("$BB" sed -n 's/^\[ *[0-9]*\.[0-9]* out\] //p' "$T/tl5" | "$BB" wc -c | "$BB" tr -d ' ' | "$BB" awk '{print $1-1}')"
+# sh forwarding
+"$BB" sh --timestamps -c 'echo via-sh' > "$T/ts" 2>/dev/null
+ck "sh --timestamps rc" "0" "$?"
+ck "sh --timestamps prints a timeline" "1" "$("$BB" grep -c '^--- timeline ---$' "$T/ts")"
+ck "sh --timestamps stamps the line" "1" "$("$BB" grep -Ec '^\[ *[0-9]+\.[0-9]{6} out\] via-sh$' "$T/ts")"
+ck "sh --timestamps keeps the exit code" "7" \
+	"$("$BB" sh --timestamps -c 'exit 7' >/dev/null 2>&1; echo $?)"
+"$BB" sh --timestamps --format json -c 'echo j' > "$T/tsj" 2>/dev/null
+ck "sh --timestamps with --format json" "1" "$("$BB" grep -c '"timeline":\[' "$T/tsj")"
+ck "sh -c keeps --timestamps inside the command" "1" \
+	"$("$BB" sh -c 'echo --timestamps' 2>/dev/null | "$BB" grep -c '^--timestamps$')"
+# composition with the other capture options
+ck "run -t --brief rc" "0" "$("$BB" run -t --brief stdout -- "$BB" sh -c 'echo x' >/dev/null 2>&1; echo $?)"
+ck "run -t --quiet still shows the timeline" "1" \
+	"$("$BB" run -t --quiet -- "$BB" sh -c 'echo q' 2>/dev/null | "$BB" grep -c '\[ *[0-9]*\.[0-9]* out\] q')"
+ck "run -t with --timeout still exits 3" "3" \
+	"$("$BB" run -t -T 1 -- "$BB" sleep 5 >/dev/null 2>&1; echo $?)"
+
 printf '\n%d passed, %d failed, %d skipped\n' "$pass" "$fail" "$skips"
 [ "$fail" -eq 0 ]

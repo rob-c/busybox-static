@@ -1,9 +1,9 @@
 diff --git a/coreutils/json.c b/coreutils/json.c
 new file mode 100644
-index 0000000..7fad4ce
+index 0000000..944030b
 --- /dev/null
 +++ b/coreutils/json.c
-@@ -0,0 +1,261 @@
+@@ -0,0 +1,273 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * json - query or validate a JSON document from the shell.
@@ -165,8 +165,20 @@ index 0000000..7fad4ce
 +
 +	len = (size_t)-1;   /* maxsz_p is an upper bound, not an out-param */
 +	buf = xmalloc_open_read_close(opt_file ? opt_file : "/dev/stdin", &len);
-+	if (!buf)
-+		bb_perror_msg_and_die("%s", opt_file ? opt_file : "stdin");
++	if (!buf) {
++		int e = errno;
++
++		if (json_out) {
++			printf("{\"schema\":1,\"status\":\"error\",\"code\":\"NOT_FOUND\","
++					"\"message\":");
++			put_json_string(strerror(e));
++			fputs("}\n", stdout);
++		} else {
++			errno = e;
++			bb_perror_msg("%s", opt_file ? opt_file : "stdin");
++		}
++		return 1;
++	}
 +	len = strlen(buf);
 +
 +	doc = json_parse(buf, len, &err);

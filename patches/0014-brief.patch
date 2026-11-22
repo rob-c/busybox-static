@@ -1,9 +1,9 @@
 diff --git a/miscutils/brief.c b/miscutils/brief.c
 new file mode 100644
-index 0000000..da08407
+index 0000000..18a98c6
 --- /dev/null
 +++ b/miscutils/brief.c
-@@ -0,0 +1,1142 @@
+@@ -0,0 +1,1148 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * brief - structure-preserving reduction of line-oriented tool output.
@@ -68,7 +68,7 @@ index 0000000..da08407
 +//usage:     "\n	-B N	Output budget in bytes (default 8000)"
 +//usage:     "\n	-n N	Maximum distinct records kept (default 2000)"
 +//usage:     "\n	-a N	Samples shown per group, 1-8 (default 1)"
-+//usage:     "\n	-F FMT	text (default) or json (schema 1)"
++//usage:     "\n	-F, --format FMT	text (default) or json (schema 1)"
 +//usage:     "\n"
 +//usage:     "\nA group prints as \"Nx <first line>\"; further -a samples print"
 +//usage:     "\nwith a \"+ \" prefix so they cannot be read as repeats."
@@ -870,10 +870,16 @@ index 0000000..da08407
 +
 +		/* fopen_or_warn_stdin() is not NULL-safe in this tree: it tests
 +		 * filename[0] == '-' before it tests filename != NULL. */
-+		fp = from_stdin ? stdin : fopen_or_warn(*argv, "r");
++		fp = from_stdin ? stdin
++				: (json_out ? fopen(*argv, "r") : fopen_or_warn(*argv, "r"));
 +		if (!fp) {
 +			if (json_out) {
-+				printf("{\"schema\":1,\"status\":\"error\",\"code\":\"NOT_FOUND\"}\n");
++				int e = errno;
++
++				printf("{\"schema\":1,\"status\":\"error\",\"code\":\"NOT_FOUND\","
++						"\"message\":");
++				put_json_str(strerror(e), strlen(strerror(e)));
++				fputs("}\n", stdout);
 +				fflush_stdout_and_exit(1);
 +			}
 +			return 1;
