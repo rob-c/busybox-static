@@ -52,7 +52,7 @@ The two smaller rtk numbers are the two lossy ones: `rtk log` prints a count and
 
 ## Cost and tests
 
-`brief.o` 8,264 → 13,464 B, `__text` +2,064 B, `__cstring` +251 B: +0.26% of an 890 KB binary, inside the 5% budget of `AGENT-FEATURES.md` §7. `./tests/brief.sh <busybox>`: 879 checks (39 sections), of which 63 are invariant assertions across 30 option sets on three binary corpora.
+`brief.o` 8,264 → 13,488 B, `__text` +2,080 B, `__cstring` +251 B: +0.26% of an 890 KB binary, inside the 5% budget of `AGENT-FEATURES.md` §7. A `-R` record is capped at 4 MB, so an input that never matches the start pattern yields several records instead of holding the stream in memory. `./tests/brief.sh <busybox>`: 879 checks (39 sections), of which 63 are invariant assertions across 30 option sets on three binary corpora.
 
 ```mermaid
 flowchart LR

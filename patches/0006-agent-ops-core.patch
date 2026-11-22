@@ -1,9 +1,9 @@
 diff --git a/coreutils/peek.c b/coreutils/peek.c
 new file mode 100644
-index 0000000..52edd5f
+index 0000000..62f48d8
 --- /dev/null
 +++ b/coreutils/peek.c
-@@ -0,0 +1,1001 @@
+@@ -0,0 +1,1039 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * peek - bounded, numbered and versioned file reads.
@@ -358,6 +358,37 @@ index 0000000..52edd5f
 +	return 1;
 +}
 +
++/* The same hex view hex_preview() prints, as a string for JSON consumers. */
++static char *hex_preview_text(const char *d, size_t len)
++{
++	size_t i, n = len < 64 ? len : 64, cap, off = 0;
++	char *out;
++
++	cap = 64 + ((n / 16) + 1) * 96;
++	out = xzalloc(cap);
++	for (i = 0; i < n; i += 16) {
++		size_t j, k = (n - i < 16) ? n - i : 16;
++
++		off += snprintf(out + off, cap - off, "%06x  ", (unsigned)i);
++		for (j = 0; j < 16; j++) {
++			if (j < k)
++				off += snprintf(out + off, cap - off, "%02x ",
++						(unsigned char)d[i + j]);
++			else
++				off += snprintf(out + off, cap - off, "   ");
++		}
++		off += snprintf(out + off, cap - off, " ");
++		for (j = 0; j < k; j++) {
++			unsigned char c = (unsigned char)d[i + j];
++
++			out[off++] = (c >= 0x20 && c < 0x7f) ? (char)c : '.';
++		}
++		out[off++] = '\n';
++	}
++	out[off] = '\0';
++	return out;
++}
++
 +static void hex_preview(const char *d, size_t len)
 +{
 +	size_t i, n = len < 64 ? len : 64;
@@ -566,6 +597,13 @@ index 0000000..52edd5f
 +		json_member_str("path", rq->path);
 +		printf(",\"status\":\"ok\",\"binary\":%s,\"version\":\"sha256:%s\"",
 +				bin ? "true" : "false", hex);
++		if (bin && preview) {
++			char *pv = hex_preview_text(data, len);
++
++			fputs(",\"guessed_type\":\"binary\",\"preview\":", stdout);
++			json_write_str(pv, strlen(pv));
++			free(pv);
++		}
 +		fputs(",\"lines\":[", stdout);
 +		for (i = 0; i < nranges; i++)
 +			printf("%s[%u,%u]", i ? "," : "",
