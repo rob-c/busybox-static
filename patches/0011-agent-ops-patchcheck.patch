@@ -1,9 +1,9 @@
 diff --git a/miscutils/patchcheck.c b/miscutils/patchcheck.c
 new file mode 100644
-index 0000000..3de4c2f
+index 0000000..e5edcfc
 --- /dev/null
 +++ b/miscutils/patchcheck.c
-@@ -0,0 +1,215 @@
+@@ -0,0 +1,221 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * patchcheck - structural checks on the patches/ series.
@@ -135,8 +135,14 @@ index 0000000..3de4c2f
 +	unsigned n = 0, bad = 0, i, expect = 0;
 +	int json_out, rc = 0;
 +
++	xfunc_error_retval = 2;
 +	getopt32long(argv, "d:F:", pc_longopts, &opt_dir, &opt_fmt);
++	xfunc_error_retval = 1;   /* past option parsing: failures are operational */
 +	json_out = opt_fmt && strcmp(opt_fmt, "json") == 0;
++	if (opt_fmt && strcmp(opt_fmt, "json") != 0 && strcmp(opt_fmt, "text") != 0) {
++		bb_error_msg("unknown format %s", opt_fmt);
++		return 2;
++	}
 +	opt_dir = opt_dir ? opt_dir : "patches";
 +
 +	d = opendir(opt_dir ? opt_dir : "patches");

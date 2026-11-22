@@ -1,9 +1,9 @@
 diff --git a/coreutils/peek.c b/coreutils/peek.c
 new file mode 100644
-index 0000000..5bb5a77
+index 0000000..8f57751
 --- /dev/null
 +++ b/coreutils/peek.c
-@@ -0,0 +1,862 @@
+@@ -0,0 +1,919 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * peek - bounded, numbered and versioned file reads.
@@ -61,6 +61,7 @@ index 0000000..5bb5a77
 +	int context;
 +	long from_byte;      /* -1 when unset */
 +	int has_from;
++	char *diff_hash;     /* --diff: expected sha256 hex, or NULL */
 +};
 +
 +struct peek_range {
@@ -430,6 +431,7 @@ index 0000000..5bb5a77
 +	}
 +
 +	sha256_hex(data, len, hex);
++
 +	starts = build_line_starts(data, len, &nlines);
 +
 +	/* Decide which lines to show. */
@@ -644,6 +646,52 @@ index 0000000..5bb5a77
 +	putchar('}');
 +}
 +
++/* peek --diff HASH FILE: did the file change since that version was seen? */
++static int peek_diff(const char *path, const char *want, int json)
++{
++	char *data = NULL;
++	size_t len = 0, maxsz = (size_t)-1;
++	char hex[65];
++	int same, fd;
++
++	fd = open(path, O_RDONLY);
++	if (fd < 0) {
++		if (json) {
++			fputs("{\"schema\":1,\"status\":\"error\",\"code\":\"NOT_FOUND\",\"message\":", stdout);
++			json_member_str("message", strerror(errno));
++			fputs("}\n", stdout);
++		} else {
++			fprintf(stderr, "peek: %s: %s\n", path, strerror(errno));
++		}
++		return 1;
++	}
++	{
++		struct stat st;
++
++		fstat(fd, &st);
++		data = xzalloc((size_t)st.st_size + 1);
++		len = full_read(fd, data, (size_t)st.st_size);
++	}
++	close(fd);
++	(void)maxsz;
++	sha256_hex(data, len, hex);
++	free(data);
++
++	if (strncmp(want, "sha256:", 7) == 0)
++		want += 7;
++	same = (strcasecmp(want, hex) == 0);
++	if (json) {
++		fputs("{\"schema\":1,", stdout);
++		json_member_str("path", path);
++		printf(",\"status\":\"ok\",\"changed\":%s,\"version\":\"sha256:%s\"}\n",
++				same ? "false" : "true", hex);
++	} else {
++		printf("%s changed=%s version=sha256:%s\n", path,
++				same ? "false" : "true", hex);
++	}
++	return same ? 0 : 1;
++}
++
 +int peek_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
 +int peek_main(int argc UNUSED_PARAM, char **argv)
 +{
@@ -655,6 +703,7 @@ index 0000000..5bb5a77
 +	char *opt_from = NULL;
 +	char *opt_fmt = NULL;
 +	char *opt_req = NULL;
++	char *opt_diff = NULL;
 +	unsigned opts;
 +	int json = 0;
 +	int regex_mode = 0;
@@ -675,14 +724,15 @@ index 0000000..5bb5a77
 +		"request\0"    Required_argument "R"
 +		"preview\0"    No_argument       "p"
 +		"format\0"     Required_argument "f"
++		"diff\0"       Required_argument "d"
 +		;
 +
 +	xfunc_error_retval = 2;   /* usage errors exit 2 */
 +
-+	opts = getopt32long(argv, "l:a:c:rF:B:M:R:pf:",
++	opts = getopt32long(argv, "l:a:c:rF:B:M:R:pf:d:",
 +			peek_longopts, &opt_lines, &opt_around, &opt_ctx,
 +			&opt_from, &opt_budget, &opt_maxfile, &opt_req,
-+			&opt_fmt);
++			&opt_fmt, &opt_diff);
 +	(void)opts;
 +	argv += optind;
 +
@@ -703,6 +753,12 @@ index 0000000..5bb5a77
 +	memset(&out, 0, sizeof(out));
 +	out.json = json;
 +	out.budget = budget;
++
++	if (opt_diff && !opt_req) {
++		if (!argv[0])
++			bb_show_usage();
++		fflush_stdout_and_exit(peek_diff(argv[0], opt_diff, json));
++	}
 +
 +	if (opt_req) {
 +		char *data = NULL;
@@ -828,6 +884,7 @@ index 0000000..5bb5a77
 +
 +			memset(&rq, 0, sizeof(rq));
 +			rq.path = *ap;
++			rq.diff_hash = opt_diff;
 +			rq.lines = opt_lines;
 +			rq.around = opt_around;
 +			rq.context = opt_ctx ? (int)strtol(opt_ctx, NULL, 10) : DEFAULT_CONTEXT;

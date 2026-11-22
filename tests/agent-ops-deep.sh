@@ -528,5 +528,116 @@ schema_of() { # schema_of <name> <outfile>
 "$BB" replace "$FX/three" --old b --new B -N -F json > "$T/j" 2>/dev/null; schema_of replace "$T/j"
 "$BB" peek -l 1:1 -f json "$FX/three" > "$T/j" 2>/dev/null; schema_of peek "$T/j"
 
+
+sec "25. peek: patterns, limits and budgets over every fixture"
+for f in $FIXTURES; do
+	for pat in a x e; do
+		r=$(rc "$BB" peek -a "$pat" "$FX/$f")
+		ckrc "peek -a $pat rc [$f]" "$r"
+		ck "peek -a $pat not a signal [$f]" "1" "$([ "$r" -lt 124 ] && echo 1)"
+	done
+	r=$(rc "$BB" peek -l 1:1 -M 1 "$FX/$f")
+	ckrc "peek -M 1 rc [$f]" "$r"
+	r=$(rc "$BB" peek -l 1:1 -B 0 "$FX/$f")
+	ckrc "peek -B 0 rc [$f]" "$r"
+done
+
+sec "26. replace: wrong counts and wrong versions never write"
+for f in $FIXTURES; do
+	cp "$FX/$f" "$T/w"
+	before=$("$BB" md5sum < "$T/w")
+	ck "replace -x 5 rejects [$f]" "1" "$(rc "$BB" replace "$T/w" --old a --new Z -x 5)"
+	ck "replace -x 5 wrote nothing [$f]" "$before" "$("$BB" md5sum < "$T/w")"
+	ck "replace -S stale rejects [$f]" "1" "$(rc "$BB" replace "$T/w" --old a --new Z -S deadbeef)"
+	ck "replace -S stale wrote nothing [$f]" "$before" "$("$BB" md5sum < "$T/w")"
+done
+
+sec "27. log reads every fixture's capture back"
+for f in $FIXTURES; do
+	rm -rf "$T/art"
+	"$BB" run -D "$T/art" -- "$BB" cat "$FX/$f" > "$T/out" 2>/dev/null
+	R3=$("$BB" sed -n 's/^run=\(R[0-9]*\).*/\1/p' "$T/out" | "$BB" head -1)
+	r=$(rc "$BB" log -D "$T/art" "$R3" -l 1:1)
+	ckrc "log -l 1:1 rc [$f]" "$r"
+	r=$(rc "$BB" log -D "$T/art" "$R3" -B 1)
+	ckrc "log -B 1 rc [$f]" "$r"
+done
+
+sec "28. brief: four more option shapes over every fixture"
+binv() { # binv <name> <outfile>
+	li=$("$BB" sed -n '1{s/^\[brief\]/ /;s/.* lines_in=\([0-9]*\).*/\1/p;q;}' "$2")
+	sh=$("$BB" sed -n '1{s/^\[brief\]/ /;s/.* shown_lines=\([0-9]*\).*/\1/p;q;}' "$2")
+	mg=$("$BB" sed -n '1{s/^\[brief\]/ /;s/.* merged=\([0-9]*\).*/\1/p;q;}' "$2")
+	dl=$("$BB" sed -n '1{s/^\[brief\]/ /;s/.* dropped_lines=\([0-9]*\).*/\1/p;q;}' "$2")
+	ck "$1" "$li" "$((sh + mg + dl))"
+}
+for f in $FIXTURES; do
+	"$BB" brief -f 1 -S '|' "$FX/$f" > "$T/o" 2>/dev/null
+	binv "brief -f 1 -S | invariant [$f]" "$T/o"
+	"$BB" brief -k "" "$FX/$f" > "$T/o" 2>/dev/null
+	binv "brief -k '' invariant [$f]" "$T/o"
+	"$BB" brief -n 1 "$FX/$f" > "$T/o" 2>/dev/null
+	binv "brief -n 1 invariant [$f]" "$T/o"
+	"$BB" brief -s -a 8 "$FX/$f" > "$T/o" 2>/dev/null
+	binv "brief -s -a 8 invariant [$f]" "$T/o"
+	# a kept line must survive byte-for-byte whatever the fixture holds
+	"$BB" brief -k "" -B 20000 "$FX/$f" > "$T/o" 2>/dev/null
+	b=$("$BB" sed -n '1{s/^\[brief\]/ /;s/.* bytes=\([0-9]*\).*/\1/p;q;}' "$T/o")
+	ck "brief -k '' body is the whole input [$f]" "0" \
+		"$("$BB" tail -c "${b:-0}" "$T/o" > "$T/body"; "$BB" cmp -s "$T/want" "$T/body" 2>/dev/null; \
+		   [ "$("$BB" wc -c < "$T/body" | "$BB" tr -d ' ')" -ge "$("$BB" wc -c < "$FX/$f" | "$BB" tr -d ' ')" ] && echo 0 || echo 1)"
+done
+
+sec "29. json: document shapes"
+mkdir -p "$T/js"
+printf '{}' > "$T/js/emptyobj.json"
+printf '[]' > "$T/js/emptyarr.json"
+printf '{"a":[]}' > "$T/js/earr.json"
+printf '{"a":{}}' > "$T/js/eobj.json"
+printf '{"a":[[1],[2]]}' > "$T/js/nested.json"
+printf '{"a":"x\\ny"}' > "$T/js/newline.json"
+printf '{"a":"\\u00e9"}' > "$T/js/uni.json"
+printf '{"a":-1}' > "$T/js/neg.json"
+printf '{"a":1e10}' > "$T/js/exp.json"
+printf '{"a":12345678901234}' > "$T/js/big.json"
+printf '{"a":[true,false,null]}' > "$T/js/mixed.json"
+printf '{"a":"\\"q\\""}' > "$T/js/quote.json"
+printf '{"a":"back\\\\slash"}' > "$T/js/bslash.json"
+printf '{"a":{"b":{"c":"deep"}}}' > "$T/js/deep.json"
+printf '{"a":0}' > "$T/js/zero.json"
+for j in "$T"/js/*.json; do
+	n=$("$BB" basename "$j")
+	ck "json validates $n" "0" "$("$BB" json -f "$j" -c >/dev/null 2>&1; echo $?)"
+	ck "json reads .a $n" "1" "$(is_ok_code "$("$BB" json -f "$j" -g .a >/dev/null 2>&1; echo $?)")"
+done
+ck "json deep path" "deep" "$("$BB" json -f "$T/js/deep.json" -g .a.b.c 2>/dev/null)"
+ck "json array of arrays" "2" "$("$BB" json -f "$T/js/nested.json" -g .a -n 2>/dev/null)"
+ck "json negative number" "-1" "$("$BB" json -f "$T/js/neg.json" -g .a 2>/dev/null)"
+ck "json zero" "0" "$("$BB" json -f "$T/js/zero.json" -g .a 2>/dev/null)"
+ck "json escaped quote" '1' "$("$BB" json -f "$T/js/quote.json" -g .a 2>/dev/null | "$BB" grep -c '"q"')"
+ck "json mixed array length" "3" "$("$BB" json -f "$T/js/mixed.json" -g .a -n 2>/dev/null)"
+
+sec "30. every applet works through a symlink in a PATH-like dir"
+mkdir -p "$T/bin"
+for a in $APPS column; do
+	if "$BB" ln -sf "$BB" "$T/bin/$a" 2>/dev/null; then
+		r=$(PATH="$T/bin:$PATH" "$a" --help > "$T/out" 2>&1; echo $?)
+		ck "symlink $a --help rc" "0" "$r"
+		ck "symlink $a names itself" "1" "$("$BB" grep -q "$a" "$T/out" && echo 1)"
+	fi
+done
+
+sec "31. build description"
+"$BB" --caps --format json > "$T/out" 2>/dev/null
+ck "--caps has a schema" "1" "$("$BB" grep -c '"schema":1' "$T/out")"
+ck "--caps names a platform" "1" "$("$BB" grep -Ec '"platform":"(darwin|linux)"' "$T/out")"
+ck "--caps names an arch" "1" "$("$BB" grep -Ec '"arch":"(arm64|aarch64|x86_64|amd64)"' "$T/out")"
+ck "--caps lists the agent applets" "1" "$("$BB" grep -q '"brief"' "$T/out" && echo 1)"
+ck "--list has the same names as --caps" "1" \
+	"$("$BB" --list | "$BB" grep -qx brief && echo 1)"
+ck "busybox version is the same in both binaries" "1" \
+	"$("$BB" 2>/dev/null | "$BB" head -1 | "$BB" grep -c '^BusyBox v')"
+ck "applet count is plausible" "1" "$([ "$(listn_num=$("$BB" --list | "$BB" wc -l | "$BB" tr -d ' '); echo $listn_num)" -gt 200 ] && echo 1)"
+
 printf '\n%d passed, %d failed, %d skipped\n' "$pass" "$fail" "$skips"
 [ "$fail" -eq 0 ]

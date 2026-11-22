@@ -1,9 +1,9 @@
 diff --git a/miscutils/snapshot.c b/miscutils/snapshot.c
 new file mode 100644
-index 0000000..d5fcfb1
+index 0000000..6e0c883
 --- /dev/null
 +++ b/miscutils/snapshot.c
-@@ -0,0 +1,269 @@
+@@ -0,0 +1,275 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * snapshot - hash a directory tree and diff two snapshots.
@@ -181,8 +181,14 @@ index 0000000..d5fcfb1
 +	unsigned i;
 +	FILE *out;
 +
++	xfunc_error_retval = 2;
 +	getopt32long(argv, "d:o:D:F:", snap_longopts, &opt_dir, &opt_out, &opt_diff, &opt_fmt);
++	xfunc_error_retval = 1;   /* past option parsing: failures are operational */
 +	json_out = opt_fmt && strcmp(opt_fmt, "json") == 0;
++	if (opt_fmt && strcmp(opt_fmt, "json") != 0 && strcmp(opt_fmt, "text") != 0) {
++		bb_error_msg("unknown format %s", opt_fmt);
++		return 2;
++	}
 +
 +	if (opt_diff) {
 +		/* --diff A B: opt_diff holds A, argv[optind] holds B */

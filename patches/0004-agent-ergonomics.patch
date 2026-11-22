@@ -4806,10 +4806,10 @@ index 337d718..f0af1df 100644
  // TODO: This does not belong here.
 diff --git a/util-linux/column.c b/util-linux/column.c
 new file mode 100644
-new file mode 100644
+index 0000000..3a6bf34
 --- /dev/null
 +++ b/util-linux/column.c
-@@ -0,0 +1,148 @@
+@@ -0,0 +1,150 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * column - format input into columns
@@ -4854,12 +4854,14 @@ new file mode 100644
 +	unsigned r, c;
 +
 +	/* bits: t = 1, s = 2, o = 4 */
++	xfunc_error_retval = 2;
 +	opts = getopt32long(argv, "^" "ts:o:" "\0" "?1",
 +		"table\0"          No_argument       "t"
 +		"separator\0"      Required_argument "s"
 +		"output-separator\0" Required_argument "o"
 +		, &in_sep, &out_sep
 +	);
++	xfunc_error_retval = 1;   /* past option parsing: failures are operational */
 +
 +	argv += optind;
 +	if (argv[0]) {
@@ -4958,6 +4960,7 @@ new file mode 100644
 +
 +	return EXIT_SUCCESS;
 +}
+
 diff --git a/include/sysinfo_compat.h b/include/sysinfo_compat.h
 new file mode 100644
 new file mode 100644

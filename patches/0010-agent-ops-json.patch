@@ -1,9 +1,9 @@
 diff --git a/coreutils/json.c b/coreutils/json.c
 new file mode 100644
-index 0000000..b702045
+index 0000000..7fad4ce
 --- /dev/null
 +++ b/coreutils/json.c
-@@ -0,0 +1,255 @@
+@@ -0,0 +1,261 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * json - query or validate a JSON document from the shell.
@@ -153,9 +153,15 @@ index 0000000..b702045
 +	size_t len = 0;
 +	int opts, json_out, rc;
 +
++	xfunc_error_retval = 2;
 +	opts = getopt32long(argv, "f:g:ktnc" "F:", json_longopts,
 +			&opt_file, &opt_path, &opt_fmt);
++	xfunc_error_retval = 1;   /* past option parsing: failures are operational */
 +	json_out = opt_fmt && strcmp(opt_fmt, "json") == 0;
++	if (opt_fmt && strcmp(opt_fmt, "json") != 0 && strcmp(opt_fmt, "text") != 0) {
++		bb_error_msg("unknown format %s", opt_fmt);
++		return 2;
++	}
 +
 +	len = (size_t)-1;   /* maxsz_p is an upper bound, not an out-param */
 +	buf = xmalloc_open_read_close(opt_file ? opt_file : "/dev/stdin", &len);
