@@ -3917,7 +3917,7 @@ index 6cdd641..5c0252f 100644
  {
  #if FIXED_HEADER
 diff --git a/shell/ash.c b/shell/ash.c
-index 9afeaed..bf72d01 100644
+index 9afeaed..1b5fd70 100644
 --- a/shell/ash.c
 +++ b/shell/ash.c
 @@ -906,8 +906,8 @@ out2str(const char *p)
@@ -4372,13 +4372,14 @@ index 9afeaed..bf72d01 100644
  			case '%':
  			case '#':
  				subtype = (c == '#' ? VSTRIMLEFT : VSTRIMRIGHT);
-@@ -15173,6 +15507,155 @@ extern int etext();
+@@ -15173,6 +15507,164 @@ extern int etext();
   * exception occurs.  When an exception occurs the variable "state"
   * is used to figure out how far we had gotten.
   */
 +/* ---------- agent-facing hooks: --timeout and --brief ---------- */
 +
 +static char *ash_brief_which;
++static int ash_brief_json;
 +static char *ash_timeout_opt;
 +
 +#if ENABLE_BRIEF
@@ -4419,6 +4420,8 @@ index 9afeaed..bf72d01 100644
 +	if (ash_brief_which) {
 +		av[k++] = (char *)"--brief";
 +		av[k++] = ash_brief_which;
++		if (ash_brief_json)
++			av[k++] = (char *)"--brief-json";
 +	}
 +	av[k++] = (char *)"--";
 +	av[k++] = (char *)"sh";
@@ -4436,6 +4439,10 @@ index 9afeaed..bf72d01 100644
 +		if (strcmp(argv[i], "--timeout") == 0 && argv[i + 1]) {
 +			ash_timeout_opt = argv[i + 1];
 +			i++;
++			continue;
++		}
++		if (strcmp(argv[i], "--brief-json") == 0) {
++			ash_brief_json = 1;
 +			continue;
 +		}
 +		if (strcmp(argv[i], "--brief") == 0) {
@@ -4473,7 +4480,7 @@ index 9afeaed..bf72d01 100644
 +#if ENABLE_BRIEF
 +	pid = fork();
 +	if (pid == 0) {
-+		char *av[3];
++		char *av[5];
 +
 +		/* The reducer's own output goes to the real streams, not the other pipe. */
 +		if (orig_out >= 0)
@@ -4487,8 +4494,10 @@ index 9afeaed..bf72d01 100644
 +			close(p[1]);
 +		av[0] = (char *)"brief";
 +		av[1] = (char *)"-d";
-+		av[2] = NULL;
-+		brief_main_main(2, av);
++		av[2] = (char *)"-F";
++		av[3] = ash_brief_json ? (char *)"json" : (char *)"text";
++		av[4] = NULL;
++		brief_main_main(4, av);
 +		_exit(0);
 +	}
 +	if (pid < 0) {
@@ -4528,7 +4537,7 @@ index 9afeaed..bf72d01 100644
  int ash_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
  #if NUM_SCRIPTS > 0
  int ash_main(int argc, char **argv)
-@@ -15187,6 +15670,10 @@ int ash_main(int argc UNUSED_PARAM, char **argv)
+@@ -15187,6 +15679,10 @@ int ash_main(int argc UNUSED_PARAM, char **argv)
  
  	dbg_show_dirtymem("dirtymem at main start");
  
@@ -4539,7 +4548,7 @@ index 9afeaed..bf72d01 100644
  	/* Initialize global data */
  	INIT_G_misc();
  	INIT_G_memstack();
-@@ -15241,6 +15728,7 @@ int ash_main(int argc UNUSED_PARAM, char **argv)
+@@ -15241,6 +15737,7 @@ int ash_main(int argc UNUSED_PARAM, char **argv)
  		minusc = get_script_content(-argc - 1);
  #endif
  	login_sh = procargs(argv);
