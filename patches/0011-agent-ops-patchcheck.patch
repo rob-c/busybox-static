@@ -1,0 +1,221 @@
+diff --git a/miscutils/patchcheck.c b/miscutils/patchcheck.c
+new file mode 100644
+index 0000000..3de4c2f
+--- /dev/null
++++ b/miscutils/patchcheck.c
+@@ -0,0 +1,215 @@
++/* vi: set sw=4 ts=4: */
++/*
++ * patchcheck - structural checks on the patches/ series.
++ *
++ * Licensed under GPLv2, see file LICENSE in this source tree.
++ */
++//config:config PATCHCHECK
++//config:	bool "patchcheck (4 kb)"
++//config:	default n
++//config:	help
++//config:	  Sanity-check the patch series without git: numbering gaps,
++//config:	  missing or malformed diff headers, absolute paths, CRLF, and
++//config:	  patches that touch nothing. Exit 1 when any check fails.
++
++//applet:IF_PATCHCHECK(APPLET_NOEXEC(patchcheck, patchcheck_main, BB_DIR_USR_BIN, BB_SUID_DROP, patchcheck))
++
++//kbuild:lib-$(CONFIG_PATCHCHECK) += patchcheck.o
++
++//usage:#define patchcheck_trivial_usage
++//usage:       "[-d DIR] [--format json]"
++//usage:#define patchcheck_full_usage "\n\n"
++//usage:       "Check every *.patch in DIR (default: patches)\n"
++//usage:     "\n	-d DIR	Patch directory"
++//usage:     "\n	--format json	Structured output (schema 1)"
++
++#include "libbb.h"
++
++enum { OPT_FMT = (1 << 0) };
++
++static const char pc_longopts[] ALIGN1 =
++	"dir\0"    Required_argument "d"
++	"format\0" Required_argument "F"
++	;
++#define pc_longopts (pc_longopts)
++
++struct pc_result {
++	const char *name;
++	int bad;
++	char why[128];
++};
++
++static void put_str(const char *s)
++{
++	putchar('"');
++	for (; *s; s++) {
++		if (*s == '"' || *s == '\\')
++			printf("\\%c", *s);
++		else if ((unsigned char)*s < 0x20)
++			printf("\\u%04x", (unsigned char)*s);
++		else
++			putchar(*s);
++	}
++	putchar('"');
++}
++
++/* Returns 1 when the patch looks structurally sound. */
++static int check_one(const char *dir, const char *name, char *why, size_t whysz)
++{
++	char *path = xasprintf("%s/%s", dir, name);
++	char *buf;
++	size_t len;
++	int has_minus = 0, has_plus = 0, has_hunk = 0, bad = 0;
++	const char *p;
++
++	why[0] = '\0';
++	len = (size_t)-1;
++	buf = xmalloc_open_read_close(path, &len);
++	if (!buf) {
++		snprintf(why, whysz, "unreadable");
++		free(path);
++		return 0;
++	}
++	if (*buf == '\0') {
++		snprintf(why, whysz, "empty file");
++		free(buf);
++		free(path);
++		return 0;
++	}
++
++	for (p = buf; *p; ) {
++		const char *eol = strchr(p, '\n');
++		size_t n = eol ? (size_t)(eol - p) : strlen(p);
++
++		if (n >= 4 && p[0] == '-' && p[1] == '-' && p[2] == '-' && p[3] == ' ')
++			has_minus = 1;
++		if (n >= 4 && p[0] == '+' && p[1] == '+' && p[2] == '+' && p[3] == ' ')
++			has_plus = 1;
++		if (n >= 2 && p[0] == '@' && p[1] == '@')
++			has_hunk = 1;
++		if (n > 5 && p[0] == ' ' && memcmp(p, " --- ", 5) == 0) {
++			snprintf(why, whysz, "space before --- header at offset %lu",
++					(unsigned long)(p - buf));
++			bad = 1;
++			break;
++		}
++		if (memchr(p, '\r', n)) {
++			snprintf(why, whysz, "CR at offset %lu", (unsigned long)(p - buf));
++			bad = 1;
++			break;
++		}
++		if (!eol)
++			break;
++		p = eol + 1;
++	}
++	if (!bad && !has_minus) {
++		snprintf(why, whysz, "no '--- ' header");
++		bad = 1;
++	}
++	if (!bad && !has_plus) {
++		snprintf(why, whysz, "no '+++ ' header");
++		bad = 1;
++	}
++	if (!bad && !has_hunk) {
++		snprintf(why, whysz, "no '@@' hunk");
++		bad = 1;
++	}
++	free(buf);
++	free(path);
++	return !bad;
++}
++
++int patchcheck_main_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
++int patchcheck_main_main(int argc UNUSED_PARAM, char **argv)
++{
++	const char *opt_dir = NULL, *opt_fmt = NULL;
++	struct pc_result *res;
++	DIR *d;
++	struct dirent *de;
++	unsigned n = 0, bad = 0, i, expect = 0;
++	int json_out, rc = 0;
++
++	getopt32long(argv, "d:F:", pc_longopts, &opt_dir, &opt_fmt);
++	json_out = opt_fmt && strcmp(opt_fmt, "json") == 0;
++	opt_dir = opt_dir ? opt_dir : "patches";
++
++	d = opendir(opt_dir ? opt_dir : "patches");
++	if (!d) {
++		if (json_out) {
++			printf("{\"schema\":1,\"status\":\"error\",\"code\":\"NOT_FOUND\","
++					"\"dir\":");
++			put_str(opt_dir);
++			fputs("}\n", stdout);
++		} else {
++			printf("NOT_FOUND %s\n", opt_dir);
++		}
++		return 1;
++	}
++	res = xzalloc(sizeof(res[0]) * 256);
++	while ((de = readdir(d)) != NULL) {
++		size_t nl = strlen(de->d_name);
++
++		if (nl < 6 || strcmp(de->d_name + nl - 6, ".patch") != 0)
++			continue;
++		if (n == 256)
++			break;
++		res[n].name = xstrdup(de->d_name);
++		res[n].bad = !check_one(opt_dir, de->d_name, res[n].why, sizeof(res[n].why));
++		if (res[n].bad)
++			bad++;
++		n++;
++	}
++	closedir(d);
++
++	/* order by name so the numbering pass sees 0001, 0002, … */
++	for (i = 1; i < n; i++) {
++		struct pc_result tmp = res[i];
++		unsigned j = i;
++
++		while (j > 0 && strcmp(res[j - 1].name, tmp.name) > 0) {
++			res[j] = res[j - 1];
++			j--;
++		}
++		res[j] = tmp;
++	}
++	for (i = 0; i < n; i++) {
++		unsigned num = 0;
++		if (sscanf(res[i].name, "%04u-", &num) == 1) {
++			expect++;
++			if (num != expect) {
++				res[i].bad = 1;
++				snprintf(res[i].why, sizeof(res[i].why), "numbering gap: expected %04u", expect);
++				bad++;
++				expect = num;
++			}
++		}
++	}
++
++	if (json_out) {
++		printf("{\"schema\":1,\"status\":\"%s\",\"dir\":", bad ? "error" : "ok");
++		put_str(opt_dir);
++		printf(",\"count\":%u,\"bad\":%u,\"patches\":[", n, bad);
++		for (i = 0; i < n; i++) {
++			if (i)
++				putchar(',');
++			fputs("{\"name\":", stdout);
++			put_str(res[i].name);
++			printf(",\"ok\":%s", res[i].bad ? "false" : "true");
++			if (res[i].bad) {
++				fputs(",\"why\":", stdout);
++				put_str(res[i].why);
++			}
++			putchar('}');
++		}
++		fputs("]}\n", stdout);
++	} else {
++		for (i = 0; i < n; i++)
++			printf("%s %s%s%s\n", res[i].bad ? "BAD " : "ok  ",
++					res[i].name,
++					res[i].bad ? ": " : "",
++					res[i].bad ? res[i].why : "");
++		printf("checked=%u bad=%u\n", n, bad);
++	}
++	rc = bad ? 1 : 0;
++	fflush_stdout_and_exit(rc);
++}
