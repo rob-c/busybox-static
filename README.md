@@ -461,13 +461,23 @@ vacuously — is written up in [docs/](docs/), indexed in
 
 ## Testing
 
-Two suites, both runnable against any built binary:
+Runnable against any built binary:
 
 ```
-./test.sh        dist/darwin-arm64/bin/busybox     # 168 smoke checks
-./stress.sh      dist/darwin-arm64/bin/busybox     # per-applet stability
-./adversarial.sh dist/darwin-arm64/bin/busybox     # ~1270 hostile-input checks
+./test.sh                  dist/darwin-arm64/bin/busybox   # 198 smoke checks
+./tests/agent-ops.sh       dist/darwin-arm64/bin/busybox   # 1299 agent-applet checks
+./tests/timeout-resilience.sh dist/darwin-arm64/bin/busybox # 50 deadline checks
+./stress.sh                dist/darwin-arm64/bin/busybox   # per-applet stability
+./adversarial.sh           dist/darwin-arm64/bin/busybox   # ~1270 hostile-input checks
 ```
+
+`tests/timeout-resilience.sh` is the one that matters for deadlines: every guest
+either traps `TERM` and keeps running, traps it and exits 0, ignores
+`TERM`/`INT`/`HUP`, or leaves a grandchild doing the same. All 50 checks assert
+that `run --timeout` and `sh --timeout` still exit **3** on time, that the guest
+is killed rather than merely signalled, and that no process survives — the checks
+have teeth because the same `ps` scan is verified to see a deliberately leaked
+process.
 
 `adversarial.sh` attacks every applet with bad options, 4 KiB of random stdin and
 oversized arguments, then works through filename hostility (embedded newlines,

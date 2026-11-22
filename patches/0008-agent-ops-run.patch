@@ -1,9 +1,9 @@
 diff --git a/coreutils/run.c b/coreutils/run.c
 new file mode 100644
-index 0000000..b12e2bd
+index 0000000..85d8922
 --- /dev/null
 +++ b/coreutils/run.c
-@@ -0,0 +1,1319 @@
+@@ -0,0 +1,1347 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * run - captured execution with retrievable evidence.
@@ -515,6 +515,26 @@ index 0000000..b12e2bd
 +	return removed;
 +}
 +
++static char *json_join_argv(char **argv)
++{
++		size_t len = 0;
++	int i;
++	char *out, *p;
++
++	for (i = 0; argv[i]; i++)
++		len += strlen(argv[i]) + 1;
++	out = xzalloc(len + 1);
++	p = out;
++	for (i = 0; argv[i]; i++) {
++		size_t n = strlen(argv[i]);
++		if (i)
++			*p++ = ' ';
++		memcpy(p, argv[i], n);
++		p += n;
++	}
++	return out;
++}
++
 +int run_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
 +int run_main(int argc UNUSED_PARAM, char **argv)
 +{
@@ -605,7 +625,8 @@ index 0000000..b12e2bd
 +	}
 +	if (opt_timeout) {
 +		double s = strtod(opt_timeout, NULL);
-+		if (!(s > 0))
++		/* 0 = deadline already passed: report the timeout immediately. */
++		if (!(s >= 0))
 +			bb_error_msg_and_die("bad timeout");
 +		/* absolute: pump() compares against monotonic time */
 +		deadline_ms = (long)now_ms() + (long)(s * 1000.0);
@@ -792,7 +813,14 @@ index 0000000..b12e2bd
 +		write_meta(dir, &m);
 +
 +		if (json) {
-+			printf("{\"schema\":1,\"run\":\"R%u\",\"dir\":", id);
++			printf("{\"schema\":1,\"run\":\"R%u\",\"cmd\":", id);
++			{
++				char *cs = json_join_argv(argv);
++
++				json_write_str(cs);
++				free(cs);
++			}
++			fputs(",\"dir\":", stdout);
 +			json_write_str(dir);
 +			printf(",\"pgid\":%ld", child_pgid);
 +			printf(",\"exit_code\":%d,\"timed_out\":%s,\"cancelled\":%s,"

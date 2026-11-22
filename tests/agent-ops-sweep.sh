@@ -550,5 +550,76 @@ for f in $FIXTURES; do
 	ckrc "peek -B 1 rc [$f]" "$r"
 done
 
+
+sec "19. sh --format json: one object with streams, status and timing"
+shjson() { # shjson <outfile> <args...>
+	o=$1; shift
+	"$BB" sh --format json "$@" > "$o" 2>/dev/null
+	echo $?
+}
+jit() { jv "$@"; }
+r=$(shjson "$T/j" -c 'echo out; echo err >&2; exit 3')
+ck "sh --format json exit is the child's" "3" "$r"
+ck "sh json has a schema" "1" "$("$BB" grep -c '"schema":1' "$T/j")"
+ck "sh json reports exit_code" "3" "$(jv exit_code "$T/j")"
+ck "sh json reports stdout_view" 'out\n' "$(jv stdout_view "$T/j" | "$BB" tr -d '"')"
+ck "sh json reports stderr_view" 'err\n' "$(jv stderr_view "$T/j" | "$BB" tr -d '"')"
+ck "sh json reports stdout_bytes" "4" "$(jv stdout_bytes "$T/j")"
+ck "sh json reports stderr_bytes" "4" "$(jv stderr_bytes "$T/j")"
+ck "sh json reports capture_complete" "true" "$(jv capture_complete "$T/j")"
+ck "sh json reports view_truncated" "false" "$(jv view_truncated "$T/j")"
+ck "sh json reports timed_out" "false" "$(jv timed_out "$T/j")"
+ck "sh json names the command" "1" "$("$BB" grep -c '"cmd":' "$T/j")"
+ck "sh json has a run id" "1" "$("$BB" grep -c '"run":"R' "$T/j")"
+ck "sh json is one line" "1" "$("$BB" wc -l < "$T/j" | "$BB" tr -d ' ')"
+r=$(shjson "$T/j" -c 'exit 0')
+ck "sh json exit 0" "0" "$r"
+ck "sh json exit 0 reported" "0" "$(jv exit_code "$T/j")"
+r=$(shjson "$T/j" -c 'exit 42')
+ck "sh json exit 42 passthrough" "42" "$r"
+ck "sh json exit 42 reported" "42" "$(jv exit_code "$T/j")"
+r=$(shjson "$T/j" --max-bytes 2 -c 'echo abcdefgh')
+# --max-bytes bounds the *view*; the capture keeps everything
+ck "sh json capture keeps all bytes under a small view" "9" "$(jv stdout_bytes "$T/j")"
+# too small a budget yields an explicit marker, never a silent cut
+ck "sh json view is bounded by --max-bytes" "1" \
+	"$(jv stdout_view "$T/j" | "$BB" grep -c '9 bytes')"
+ck "sh json --max-bytes flags truncation" "true" "$(jv view_truncated "$T/j")"
+r=$(shjson "$T/j" -c 'echo aaaaaaaaaaaaaaaaaaaa')
+ck "sh json default budget keeps small output" "1" "$("$BB" grep -c '"view_truncated":false' "$T/j")"
+r=$(shjson "$T/j" --timeout 1 -c 'sleep 5')
+ck "sh json timeout exits 3" "3" "$r"
+ck "sh json timeout says timed_out" "true" "$(jv timed_out "$T/j")"
+ck "sh json timeout keeps the object valid" "1" "$("$BB" grep -c '^{"schema":1' "$T/j")"
+r=$(shjson "$T/j" --capture-limit 2 -c 'echo abcdefgh')
+ck "sh json --capture-limit marks incomplete" "false" "$(jv capture_complete "$T/j")"
+r=$(shjson "$T/j" --brief stdout --brief-json -c 'for i in 1 2 3; do echo same; done')
+ck "sh json --brief rc" "0" "$r"
+ck "sh json --brief keeps a schema" "1" "$("$BB" grep -c '"schema":1' "$T/j")"
+# the plain text form must stay a text summary, not JSON
+r=$(shjson "$T/j" -c 'echo hi' ) ; true
+ck "sh --format text rc" "0" "$("$BB" sh --format text -c 'echo hi' > "$T/o2" 2>/dev/null; echo $?)"
+ck "sh --format text is not json" "0" "$("$BB" grep -c '^{"schema"' "$T/o2")"
+ck "sh --format text shows the stream" "1" "$("$BB" grep -c 'hi' "$T/o2")"
+# arg peeling must stop at -c: the command string is the user's
+ck "sh -c keeps --format inside the command" "1" \
+	"$("$BB" sh -c 'echo --format json' 2>/dev/null | "$BB" grep -c '^--format json$')"
+ck "sh --format xml is a usage error" "2" "$("$BB" sh --format xml -c 'echo x' >/dev/null 2>&1; echo $?)"
+ck "sh --format json needs a command" "2" "$("$BB" sh --format json >/dev/null 2>&1; echo $?)"
+# a script file argument works too
+printf 'echo from-script\nexit 5\n' > "$T/s.sh"
+r=$(shjson "$T/j" "$T/s.sh")
+ck "sh json script exit" "5" "$r"
+ck "sh json script captured output" "1" "$("$BB" grep -c 'from-script' "$T/j")"
+
+sec "20. run --format json also names the command"
+"$BB" run -F json -- "$BB" sh -c 'echo x' > "$T/j" 2>/dev/null
+ck "run json has cmd" "1" "$("$BB" grep -c '"cmd":' "$T/j")"
+ck "run json cmd names the program" "1" "$("$BB" grep -c 'busybox' "$T/j")"
+ck "run json still has exit_code" "0" "$(jv exit_code "$T/j")"
+ck "run json schema unchanged" "1" "$("$BB" grep -c '"schema":1' "$T/j")"
+ck "run text has no cmd field" "0" \
+	"$("$BB" run -- "$BB" true 2>/dev/null | "$BB" grep -c '"cmd"')"
+
 printf '\n%d passed, %d failed, %d skipped\n' "$pass" "$fail" "$skips"
 [ "$fail" -eq 0 ]
