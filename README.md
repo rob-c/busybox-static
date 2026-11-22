@@ -468,6 +468,7 @@ Runnable against any built binary:
 ./tests/agent-ops.sh       dist/darwin-arm64/bin/busybox   # 1299 agent-applet checks
 ./tests/timeout-resilience.sh dist/darwin-arm64/bin/busybox # 50 deadline checks
 ./tests/timeout-resilience-matrix.sh dist/darwin-arm64/bin/busybox # 200 more
+./tests/wrapper-signals.sh dist/darwin-arm64/bin/busybox # 21 kill-the-wrapper checks
 ./stress.sh                dist/darwin-arm64/bin/busybox   # per-applet stability
 ./adversarial.sh           dist/darwin-arm64/bin/busybox   # ~1270 hostile-input checks
 ```

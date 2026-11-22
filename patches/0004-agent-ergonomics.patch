@@ -3917,7 +3917,7 @@ index 6cdd641..5c0252f 100644
  {
  #if FIXED_HEADER
 diff --git a/shell/ash.c b/shell/ash.c
-index 9afeaed..cfbbb0d 100644
+index 9afeaed..f97a57f 100644
 --- a/shell/ash.c
 +++ b/shell/ash.c
 @@ -906,8 +906,8 @@ out2str(const char *p)
@@ -4372,7 +4372,7 @@ index 9afeaed..cfbbb0d 100644
  			case '%':
  			case '#':
  				subtype = (c == '#' ? VSTRIMLEFT : VSTRIMRIGHT);
-@@ -15173,6 +15507,242 @@ extern int etext();
+@@ -15173,6 +15507,305 @@ extern int etext();
   * exception occurs.  When an exception occurs the variable "state"
   * is used to figure out how far we had gotten.
   */
@@ -4597,8 +4597,71 @@ index 9afeaed..cfbbb0d 100644
 +		close(keep);
 +}
 +
++/*
++ * Watchdog: a child in its own process group that kills this shell's group when
++ * the shell disappears for any reason, SIGKILL included. Shells normally leave
++ * their children running when the shell is killed; a tool harness that kills
++ * busybox expects the whole command to stop.
++ */
++static void ash_reaper(pid_t target_group) NORETURN;
++static void ash_reaper(pid_t target_group)
++{
++	pid_t me = getppid();
++	int fd, i;
++
++	setpgid(0, 0);
++	fd = open("/dev/null", O_RDWR);
++	if (fd >= 0) {
++		dup2(fd, 0);
++		dup2(fd, 1);
++		dup2(fd, 2);
++		if (fd > 2)
++			close(fd);
++	}
++	for (i = 3; i < 256; i++)
++		close(i);
++	for (;;) {
++		if (kill(me, 0) != 0)
++			break;
++		usleep(100 * 1000);
++	}
++	kill(-target_group, SIGKILL);
++	_exit(0);
++}
++
++/* Only for a non-interactive shell: an interactive one shares the terminal's
++ * process group, and moving it would break job control. */
++static pid_t ash_reaper_pid;
++
++/* Stop the watchdog on the way out: it is only needed while we are alive. */
++static void ash_stop_reaper(void)
++{
++	if (ash_reaper_pid > 0) {
++		kill(ash_reaper_pid, SIGKILL);
++		waitpid(ash_reaper_pid, NULL, 0);
++		ash_reaper_pid = 0;
++	}
++}
++
++static void ash_install_reaper(void)
++{
++	pid_t r, group;
++
++	if (iflag)
++		return;
++	if (getpgrp() != getpid())
++		setpgid(0, 0);          /* our own group, so the kill covers children */
++	group = getpid();
++	r = fork();
++	if (r == 0)
++		ash_reaper(group);      /* the group, not the reaper's own pid */
++	ash_reaper_pid = r;
++	atexit(ash_stop_reaper);
++}
++
 +static void ash_agent_setup(void)
 +{
++	ash_install_reaper();
 +	if (ash_brief_which) {
 +		int orig_out = dup(1);
 +		int orig_err = dup(2);
@@ -4615,7 +4678,7 @@ index 9afeaed..cfbbb0d 100644
  int ash_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
  #if NUM_SCRIPTS > 0
  int ash_main(int argc, char **argv)
-@@ -15187,6 +15757,13 @@ int ash_main(int argc UNUSED_PARAM, char **argv)
+@@ -15187,6 +15820,13 @@ int ash_main(int argc UNUSED_PARAM, char **argv)
  
  	dbg_show_dirtymem("dirtymem at main start");
  
@@ -4629,7 +4692,7 @@ index 9afeaed..cfbbb0d 100644
  	/* Initialize global data */
  	INIT_G_misc();
  	INIT_G_memstack();
-@@ -15241,6 +15818,7 @@ int ash_main(int argc UNUSED_PARAM, char **argv)
+@@ -15241,6 +15881,7 @@ int ash_main(int argc UNUSED_PARAM, char **argv)
  		minusc = get_script_content(-argc - 1);
  #endif
  	login_sh = procargs(argv);

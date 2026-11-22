@@ -4,6 +4,20 @@ Project releases of `busybox-static` on top of upstream busybox
 (`1.39.0.git`). The upstream applet set is unchanged except where noted; the
 `patches/` series is the record of every local change.
 
+## Unreleased — child cleanup when the wrapper is killed
+
+- `run` and `sh` now start a watchdog in its own process group that kills the
+  command's group when the wrapper disappears for **any** reason, `SIGKILL`
+  included (which cannot be caught). `kill -9` of busybox now stops the work it
+  started instead of orphaning it.
+- `sh` becomes its own process-group leader when non-interactive, so one group
+  kill reaches every child; interactive shells are left alone (job control).
+- New `tests/wrapper-signals.sh` — 21 checks: TERM/INT/HUP/KILL against `run`
+  and `sh`, guests that ignore TERM, grandchildren, and that ordinary exit
+  codes, output and process hygiene are unchanged.
+- The watchdog is stopped before the wrapper returns, so it is never visible to
+  a process scan of a completed run.
+
 ## 0.4.0 — deadline control, output reduction, contract audit
 
 Second agent-facing release. Everything below is carried in `patches/`
