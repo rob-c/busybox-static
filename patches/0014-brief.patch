@@ -1,9 +1,9 @@
 diff --git a/miscutils/brief.c b/miscutils/brief.c
 new file mode 100644
-index 0000000..a247196
+index 0000000..47e946f
 --- /dev/null
 +++ b/miscutils/brief.c
-@@ -0,0 +1,766 @@
+@@ -0,0 +1,954 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * brief - structure-preserving reduction of line-oriented tool output.
@@ -47,40 +47,51 @@ index 0000000..a247196
 +//kbuild:lib-$(CONFIG_BRIEF) += brief.o
 +
 +//usage:#define brief_trivial_usage
-+//usage:       "[-dsq] [-c LIST] [-t N] [-m N] [-k STR] [-f LIST] [-S SEP]"
-+//usage:       " [-B BYTES] [-n N] [-a N] [-F FMT] [FILE]..."
++//usage:       "[-dsq] [-c LIST] [-t N] [-m N] [-o STR] [-x STR] [-R STR]"
++//usage:       " [-k STR] [-f LIST] [-i SEP] [-S SEP] [-B BYTES] [-n N] [-a N]"
 +//usage:#define brief_full_usage "\n\n"
 +//usage:       "Reduce line-oriented output to a bounded view, preserving every byte shown"
 +//usage:     "\n"
-+//usage:     "\n	-d	Group identical lines and count them"
-+//usage:     "\n	-s	Group lines equal after masking digits (implies -d)"
++//usage:     "\n	-d	Group identical records and count them"
++//usage:     "\n	-s	Group records equal after masking digits (implies -d)"
 +//usage:     "\n	-c LIST	Group by these fields (1,3-4) and show them"
 +//usage:     "\n	-t N	Order groups by count, highest first (implies -d)"
 +//usage:     "\n	-m N	Show only groups seen at least N times (implies -d)"
++//usage:     "\n	-o STR	Show only records containing STR (repeatable, OR)"
++//usage:     "\n	-x STR	Drop records containing STR (repeatable, OR)"
++//usage:     "\n	-R STR	A record starts at each line containing STR"
 +//usage:     "\n	-q	Bare records: no \"Nx \" and no \"+ \" prefix"
-+//usage:     "\n	-k STR	Keep lines containing STR verbatim, never merged"
++//usage:     "\n	-k STR	Keep records containing STR verbatim, never merged"
 +//usage:     "\n	-f LIST	Show only these 1-based fields (1,3-4); input may be reformatted"
++//usage:     "\n	-i SEP	Field separators for -f/-c (default: space and tab)"
 +//usage:     "\n	-S SEP	Join -f fields with SEP (default: one space)"
 +//usage:     "\n	-B N	Output budget in bytes (default 8000)"
 +//usage:     "\n	-n N	Maximum distinct records kept (default 2000)"
-+//usage:     "\n	-a N	Sample lines shown per group, 1-8 (default 1)"
++//usage:     "\n	-a N	Samples shown per group, 1-8 (default 1)"
 +//usage:     "\n	-F FMT	text (default) or json (schema 1)"
 +//usage:     "\n"
 +//usage:     "\nA group prints as \"Nx <first line>\"; further -a samples print"
 +//usage:     "\nwith a \"+ \" prefix so they cannot be read as repeats."
 +//usage:     "\n"
-+//usage:     "\nGrouping is on the original line, so -f can never merge two"
++//usage:     "\nA record is one line, or - with -R - every line up to the next"
++//usage:     "\nmatch, so a commit, a test failure or a stack trace is one record."
++//usage:     "\nRecords are shown whole or not at all: the budget never cuts one."
++//usage:     "\n"
++//usage:     "\nGrouping is on the original record, so -f can never merge two"
 +//usage:     "\nrecords that differ only outside the shown fields. -c groups on"
-+//usage:     "\nthe projected line instead, which is what makes it an aggregate."
++//usage:     "\nthe projected record instead, which is what makes it an aggregate."
 +//usage:     "\n"
 +//usage:     "\nRecords are bytes: an embedded NUL is kept, not treated as a line"
 +//usage:     "\nbreak, and the marker reports nul=<n> when any record held one."
 +//usage:     "\n"
-+//usage:     "\n-c is the aggregation: \"brief -c 2 -t 10\" is the ten commonest"
-+//usage:     "\nvalues of field 2, with their counts, from one process and no"
-+//usage:     "\nforks. -m drops the singletons that make a first page useless."
-+//usage:     "\n-q prints the reduced records themselves, so the output can be"
-+//usage:     "\npiped into grep and still match the input byte for byte."
++//usage:     "\n-o and -x are the selection: \"brief -o error -o warning\" is the"
++//usage:     "\nfailures of any tool, without a format registry. Combined with -c"
++//usage:     "\nand -t it counts instead of listing: -o error -c 1 -t 10 is the ten"
++//usage:     "\nfiles with the most errors. -i : makes that work on colon-delimited"
++//usage:     "\noutput such as grep -n or a compiler diagnostic."
++//usage:     "\n"
++//usage:     "\nThe marker carries in_bytes and bytes, so the saving of every call"
++//usage:     "\nis measurable without a ledger file."
 +
 +#include "libbb.h"
 +
@@ -101,6 +112,10 @@ index 0000000..a247196
 +	OPT_t = (1 << 10),
 +	OPT_m = (1 << 11),
 +	OPT_q = (1 << 12),
++	OPT_o = (1 << 13),
++	OPT_x = (1 << 14),
++	OPT_R = (1 << 15),
++	OPT_i = (1 << 16),
 +};
 +
 +static const char brief_longopts[] ALIGN1 =
@@ -117,16 +132,24 @@ index 0000000..a247196
 +	"top\0"     Required_argument "t"
 +	"min-count\0" Required_argument "m"
 +	"bare\0"    No_argument       "q"
++	"only\0"    Required_argument "o"
++	"without\0" Required_argument "x"
++	"record\0"  Required_argument "R"
++	"in-sep\0"  Required_argument "i"
 +	;
 +
 +struct fw {
 +	unsigned lo, hi;
 +};
 +
-+/* One stored line: a pointer and a length, never a C string. */
++/* One stored record: its bytes and how many lines they hold. In the default
++ * mode a record is one line (nl == 1); with -R a record is every line up to
++ * the next start pattern, so a record can be a whole commit, test failure or
++ * stack trace. The bytes are never a C string. */
 +struct sample {
 +	char *p;
 +	size_t n;
++	unsigned nl;
 +};
 +
 +struct item {
@@ -135,6 +158,7 @@ index 0000000..a247196
 +	struct sample smp[BRIEF_MAX_SAMPLES];
 +	unsigned nsmp;
 +	unsigned count;            /* occurrences in the input */
++	unsigned long lines;       /* lines across all occurrences (for the books) */
 +	int shown;                 /* selected for output */
 +	int is_kept;               /* -k matched: printed verbatim, never merged */
 +};
@@ -263,6 +287,23 @@ index 0000000..a247196
 +	return 0;
 +}
 +
++/* Which bytes separate fields. Default is any run of space or tab, but most
++ * tool output that matters is colon-delimited ("path:line: message", grep -n,
++ * compiler diagnostics), so -i lets the caller say so. A 256-entry map keeps
++ * the split O(1) per byte and byte-transparent: no byte is ever rewritten. */
++static unsigned char is_sep[256];
++
++static void set_in_sep(const char *s)
++{
++	memset(is_sep, 0, sizeof(is_sep));
++	if (!s || !*s) {
++		is_sep[' '] = is_sep['\t'] = 1;
++		return;
++	}
++	while (*s)
++		is_sep[(unsigned char)*s++] = 1;
++}
++
 +/* Rebuild the line from the selected fields. Out-of-range fields are simply
 + * absent; the caller reports that -f was used, so the reader knows the record
 + * was reformatted. Field bytes are copied as bytes. */
@@ -277,12 +318,12 @@ index 0000000..a247196
 +		unsigned i;
 +		int want = 0;
 +
-+		while (p < end && (*p == ' ' || *p == '\t'))
++		while (p < end && is_sep[(unsigned char)*p])
 +			p++;
 +		if (p == end)
 +			break;
 +		start = p;
-+		while (p < end && *p != ' ' && *p != '\t')
++		while (p < end && !is_sep[(unsigned char)*p])
 +			p++;
 +		field++;
 +		for (i = 0; i < nfr; i++) {
@@ -455,24 +496,212 @@ index 0000000..a247196
 +	return 0;
 +}
 +
++/* ---- ingest state -------------------------------------------------------
++ * The reader produces *records*: one line by default, or every line up to the
++ * next -R match. Selection (-o/-x), grouping (-d/-s/-c), the record cap (-n),
++ * the threshold (-m) and the budget (-B) all work on whole records, so both
++ * modes share one code path and the accounting stays per line.
++ */
++struct istate {
++	struct sbuf cur;          /* the record being assembled */
++	unsigned cur_nl;
++
++	unsigned long lines_in, lines_shown, lines_merged;
++	unsigned long dropped_records, dropped_lines;
++	unsigned long kept, nul_lines, matched, projected;
++	size_t in_bytes;
++
++	unsigned budget, max_recs, max_samples, top_n, min_count;
++	int dedupe, skeleton, bare;
++	const char *sep;
++	const char *keep, *record_pat;
++	llist_t *only, *without;
++	const struct fw *fr;
++	unsigned nfr;
++	const struct fw *cbfr;
++	unsigned ncb;
++};
++
++static struct istate st;
++
++/* 1 when any pattern in the list occurs in the record. Substrings, not regex:
++ * a pattern that has to be escaped is a pattern an agent gets wrong. */
++static int pat_hit(llist_t *list, const char *h, size_t hn)
++{
++	for (; list; list = list->link) {
++		if (list->data && mem_contains(h, hn, list->data))
++			return 1;
++	}
++	return 0;
++}
++
++/* Project every line of a record, joined with '\n': the key for -c. */
++static void project_record(struct sbuf *out, const char *p, size_t n,
++		const struct fw *fr, unsigned nfr, const char *sep)
++{
++	const char *end = p + n;
++
++	for (;;) {
++		const char *nl = memchr(p, '\n', (size_t)(end - p));
++		size_t l = nl ? (size_t)(nl - p) : (size_t)(end - p);
++
++		project_into(out, p, l, fr, nfr, sep);
++		if (!nl)
++			break;
++		sb_addch(out, '\n');
++		p = nl + 1;
++	}
++}
++
++/* Copy the record into the item's sample list, subject to -a. The bytes are
++ * copied, never referenced: the assembly buffer is reused for the next record. */
++static void take_sample(struct item *it, const char *p, size_t n, unsigned nl)
++{
++	struct sample *sm;
++
++	it->lines += nl;
++	if (it->nsmp >= st.max_samples)
++		return;
++	sm = &it->smp[it->nsmp];
++	sm->p = xmalloc(n + 1);
++	if (n)
++		memcpy(sm->p, p, n);
++	sm->p[n] = '\0';
++	sm->n = n;
++	sm->nl = nl;
++	it->nsmp++;
++}
++
++/* Close the record being assembled: select it, group it, store it. Everything
++ * that is not stored is counted, so the marker can always close the books. */
++static void flush_record(void)
++{
++	struct item *it;
++	size_t keylen = 0;
++	char *key = NULL;
++	unsigned nl = st.cur_nl;
++	const char *p = st.cur.p ? st.cur.p : "";
++	size_t n = st.cur.len;
++	int kept;
++
++	if (nl == 0)
++		return;
++	st.cur.len = 0;
++	st.cur_nl = 0;
++
++	/* -o/-x act before the table, so -n cannot fill up with records the
++	 * caller did not ask for and hide the ones it did. */
++	if (st.only && !pat_hit(st.only, p, n)) {
++		st.dropped_records++;
++		st.dropped_lines += nl;
++		return;
++	}
++	if (st.without && pat_hit(st.without, p, n)) {
++		st.dropped_records++;
++		st.dropped_lines += nl;
++		return;
++	}
++	st.matched++;
++
++	kept = st.keep && mem_contains(p, n, st.keep);
++	if (kept) {
++		/* -k: printed verbatim, never merged with another record */
++		if (nitems >= st.max_recs) {
++			st.dropped_records++;
++			st.dropped_lines += nl;
++			return;
++		}
++		it = item_new();
++		it->is_kept = 1;
++		it->count = 1;
++		take_sample(it, p, n, nl);
++		st.kept++;
++		return;
++	}
++
++	if (st.dedupe) {
++		if (st.ncb) {
++			struct sbuf kb = { 0 };
++
++			project_record(&kb, p, n, st.cbfr, st.ncb, st.sep);
++			key = norm_key(kb.p ? kb.p : "", kb.len, st.skeleton, &keylen);
++			free(kb.p);
++		} else {
++			key = norm_key(p, n, st.skeleton, &keylen);
++		}
++		it = item_find(key, keylen, nitems < st.max_recs);
++		free(key);
++		if (!it) {
++			st.dropped_records++;
++			st.dropped_lines += nl;
++			return;
++		}
++	} else {
++		if (nitems >= st.max_recs) {
++			st.dropped_records++;
++			st.dropped_lines += nl;
++			return;
++		}
++		it = item_new();
++	}
++	if (it->count == 0) {
++		it->count = 1;
++		take_sample(it, p, n, nl);
++	} else {
++		it->count++;
++		take_sample(it, p, n, nl);
++	}
++}
++
++/* Render one stored sample: the count prefix on its first line, then the
++ * record's lines, each projected if -f/-c asked. Records are never split. */
++static void render_record(struct sbuf *out, const struct sample *sm,
++		unsigned count, int first)
++{
++	const char *p = sm->p, *end = sm->p + sm->n;
++
++	if (!st.bare) {
++		if (count > 1 && first) {
++			char num[32];
++
++			sprintf(num, "%ux ", count);
++			sb_addstr(out, num);
++		} else if (!first) {
++			sb_addstr(out, "+ ");
++		}
++	}
++	for (;;) {
++		const char *nl = memchr(p, '\n', (size_t)(end - p));
++		size_t l = nl ? (size_t)(nl - p) : (size_t)(end - p);
++
++		if (st.nfr) {
++			project_into(out, p, l, st.fr, st.nfr, st.sep);
++			st.projected++;
++		} else {
++			sb_add(out, p, l);
++		}
++		sb_addch(out, '\n');
++		if (!nl)
++			break;
++		p = nl + 1;
++	}
++}
++
 +/* ---- main -------------------------------------------------------------- */
 +
 +int brief_main_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
 +int brief_main_main(int argc UNUSED_PARAM, char **argv)
 +{
-+	const char *opt_keep = NULL, *opt_fields = NULL, *opt_sep = NULL;
-+	const char *opt_bytes = NULL, *opt_recs = NULL, *opt_samples = NULL;
-+	const char *opt_fmt = NULL, *opt_countby = NULL;
-+	const char *opt_top = NULL, *opt_min = NULL;
++	const char *opt_fields = NULL, *opt_sep = NULL, *opt_bytes = NULL;
++	const char *opt_recs = NULL, *opt_samples = NULL, *opt_fmt = NULL;
++	const char *opt_countby = NULL, *opt_top = NULL, *opt_min = NULL;
++	const char *opt_insep = NULL;
 +	struct fw fr[BRIEF_MAX_FRANGES], cbfr[BRIEF_MAX_FRANGES];
 +	unsigned nfr = 0, ncb = 0, i, oi;
 +	unsigned budget = 8000, max_recs = 2000, max_samples = 1;
 +	unsigned top_n = 0, min_count = 1;
-+	int dedupe, skeleton, json_out, bare;
-+	unsigned lines_in = 0, lines_shown = 0, lines_merged = 0;
-+	unsigned kept = 0, dropped_records = 0, dropped_lines = 0;
-+	unsigned nul_lines = 0, shown_groups = 0, projected = 0;
-+	unsigned *order;
++	int json_out;
++	unsigned *order, shown_groups = 0;
 +	char *body = NULL;
 +	size_t body_len = 0;
 +	int truncated = 0;
@@ -480,10 +709,11 @@ index 0000000..a247196
 +	unsigned flags;
 +
 +	xfunc_error_retval = 2; /* usage errors, until input is opened */
-+	flags = getopt32long(argv, "dsk:f:S:B:n:a:F:c:t:m:q", brief_longopts,
-+			&opt_keep, &opt_fields, &opt_sep,
++	flags = getopt32long(argv, "dsk:f:S:B:n:a:F:c:t:m:q|o:*x:*R:i:", brief_longopts,
++			&st.keep, &opt_fields, &opt_sep,
 +			&opt_bytes, &opt_recs, &opt_samples, &opt_fmt,
-+			&opt_countby, &opt_top, &opt_min);
++			&opt_countby, &opt_top, &opt_min,
++			&st.only, &st.without, &st.record_pat, &opt_insep);
 +	argv += optind;
 +
 +	if (opt_bytes)
@@ -494,15 +724,11 @@ index 0000000..a247196
 +		max_samples = xatoul_range(opt_samples, 1, BRIEF_MAX_SAMPLES);
 +	if (!opt_sep)
 +		opt_sep = " ";
++	set_in_sep(opt_insep);
 +	if (opt_fields) {
 +		nfr = parse_fields(opt_fields, fr);
 +		if (!nfr)
 +			return xfunc_error_retval;
-+	}
-+	json_out = opt_fmt && strcmp(opt_fmt, "json") == 0;
-+	if (opt_fmt && !json_out && strcmp(opt_fmt, "text") != 0) {
-+		bb_error_msg("unknown format %s", opt_fmt);
-+		return 2;
 +	}
 +	if (opt_countby) {
 +		ncb = parse_fields(opt_countby, cbfr);
@@ -513,17 +739,33 @@ index 0000000..a247196
 +		top_n = xatoul_range(opt_top, 1, INT_MAX);
 +	if (opt_min)
 +		min_count = xatoul_range(opt_min, 1, INT_MAX);
-+	bare = (flags & OPT_q) != 0;
++	json_out = opt_fmt && strcmp(opt_fmt, "json") == 0;
++	if (opt_fmt && !json_out && strcmp(opt_fmt, "text") != 0) {
++		bb_error_msg("unknown format %s", opt_fmt);
++		return 2;
++	}
 +	/* -c decides grouping and, unless -f says otherwise, display: a caller
 +	 * can aggregate on one field and print another. */
 +	if (!nfr && ncb) {
 +		memcpy(fr, cbfr, sizeof(cbfr[0]) * ncb);
 +		nfr = ncb;
 +	}
-+	skeleton = (flags & OPT_s) != 0;
++
++	st.budget = budget;
++	st.max_recs = max_recs;
++	st.max_samples = max_samples;
++	st.top_n = top_n;
++	st.min_count = min_count;
++	st.sep = opt_sep;
++	st.fr = fr;
++	st.nfr = nfr;
++	st.cbfr = cbfr;
++	st.ncb = ncb;
++	st.skeleton = (flags & OPT_s) != 0;
++	st.bare = (flags & OPT_q) != 0;
 +	/* -c, -t and -m are grouping requests in their own right: asking for an
 +	 * aggregate without -d must not silently produce a pass-through. */
-+	dedupe = skeleton || (flags & OPT_d) != 0 || ncb || top_n || min_count > 1;
++	st.dedupe = st.skeleton || (flags & OPT_d) != 0 || ncb || top_n || min_count > 1;
 +
 +	xfunc_error_retval = 1;
 +
@@ -543,79 +785,23 @@ index 0000000..a247196
 +		for (;;) {
 +			size_t len = 0;
 +			char *line = brief_readline(fp, &len);
-+			struct item *it;
 +
 +			if (!line)
 +				break;
-+			lines_in++;
++			st.lines_in++;
++			st.in_bytes += len + 1;
 +			if (memchr(line, 0, len))
-+				nul_lines++;
-+			if (opt_keep && mem_contains(line, len, opt_keep)) {
-+				/* Kept lines are never merged: one record each. */
-+				if (nitems < max_recs) {
-+					it = item_new();
-+					it->is_kept = 1;
-+					it->count = 1;
-+					it->smp[0].p = line;
-+					it->smp[0].n = len;
-+					it->nsmp = 1;
-+					kept++;
-+				} else {
-+					dropped_records++;
-+					dropped_lines++;
-+					free(line);
-+				}
-+				continue;
-+			}
-+			if (dedupe) {
-+				size_t keylen = 0;
-+				char *key;
-+
-+				if (ncb) {
-+					/* -c: equality is on the projected record, so two
-+					 * lines that differ only outside the counted fields
-+					 * belong to the same group - which is the point. */
-+					struct sbuf kb = { 0 };
-+
-+					project_into(&kb, line, len, cbfr, ncb, opt_sep);
-+					key = norm_key(kb.p ? kb.p : "", kb.len, skeleton, &keylen);
-+					free(kb.p);
-+				} else {
-+					key = norm_key(line, len, skeleton, &keylen);
-+				}
-+				it = item_find(key, keylen, nitems < max_recs);
-+				free(key);
-+				if (!it) {
-+					dropped_records++;
-+					dropped_lines++;
-+					free(line);
-+					continue;
-+				}
-+			} else {
-+				/* no grouping requested: every line is its own record */
-+				if (nitems >= max_recs) {
-+					dropped_records++;
-+					dropped_lines++;
-+					free(line);
-+					continue;
-+				}
-+				it = item_new();
-+			}
-+			if (it->count == 0) {   /* fresh from item_find() */
-+				it->count = 1;
-+				it->smp[0].p = line;
-+				it->smp[0].n = len;
-+				it->nsmp = 1;
-+			} else {
-+				it->count++;
-+				if (it->nsmp < max_samples) {
-+					it->smp[it->nsmp].p = line;
-+					it->smp[it->nsmp].n = len;
-+					it->nsmp++;
-+				} else {
-+					free(line);
-+				}
-+			}
++				st.nul_lines++;
++			/* A new line opens a new record: always without -R, and
++			 * only when it matches the start pattern with -R. */
++			if (st.cur_nl && (!st.record_pat
++					|| mem_contains(line, len, st.record_pat)))
++				flush_record();
++			if (st.cur_nl)
++				sb_addch(&st.cur, '\n');
++			sb_add(&st.cur, line, len);
++			st.cur_nl++;
++			free(line);
 +		}
 +		if (!from_stdin)
 +			fclose(fp);
@@ -625,6 +811,7 @@ index 0000000..a247196
 +		if (!*argv)
 +			break;          /* last named file done */
 +	}
++	flush_record();
 +
 +	/* The table's own order unless -t asked for a frequency order. */
 +	order = xmalloc((nitems ? nitems : 1) * sizeof(order[0]));
@@ -635,98 +822,101 @@ index 0000000..a247196
 +
 +	for (oi = 0; oi < nitems; oi++) {
 +		struct item *it = &items[order[oi]];
-+		unsigned k, emitted;
++		unsigned k;
++		unsigned long emitted;
 +
-+		/* -m: below the threshold the group is not a record at all */
-+		if (it->count < min_count) {
-+			dropped_records++;
-+			dropped_lines += it->count;
++		/* -m: below the threshold the record is not shown at all */
++		if (it->count < st.min_count) {
++			st.dropped_records++;
++			st.dropped_lines += it->lines;
 +			continue;
 +		}
 +		it->shown = 1;
 +		emitted = 0;
 +		for (k = 0; k < it->nsmp; k++) {
-+			struct sbuf line = { 0 };
-+			size_t shown_len;
++			struct sbuf rec = { 0 };
 +
-+			if (!bare) {
-+				if (it->count > 1 && k == 0) {
-+					char num[32];
-+
-+					/* ASCII, so the output survives any locale: "3x line" */
-+					sprintf(num, "%ux ", it->count);
-+					sb_addstr(&line, num);
-+				} else if (k > 0) {
-+					/* another variant of the same group, not a repeat */
-+					sb_addstr(&line, "+ ");
-+				}
-+			}
-+			if (nfr)
-+				project_into(&line, it->smp[k].p, it->smp[k].n, fr, nfr, opt_sep);
-+			else
-+				sb_add(&line, it->smp[k].p, it->smp[k].n);
-+			shown_len = line.len + 1;
-+			if (body_len + shown_len > (size_t)budget) {
-+				it->shown = 0;
-+				truncated = 1;
-+				free(line.p);
++			render_record(&rec, &it->smp[k], it->count, k == 0);
++			/* A record is shown whole or not at all: a budget that
++			 * cuts inside a commit or a stack trace produces output
++			 * that no longer means anything. */
++			if (rec.len > (size_t)budget) {
++				/* Too big to fit under ANY budget. That is a drop,
++				 * not a truncation: dropping it must not hide every
++				 * record after it - a 12 KB banner would otherwise
++				 * empty the whole view. */
++				it->shown = -1;
++				truncated = 1;   /* the view is incomplete, by size */
++				free(rec.p);
 +				break;
 +			}
-+			body = xrealloc(body, body_len + shown_len + 1);
-+			if (line.len)
-+				memcpy(body + body_len, line.p, line.len);
-+			body_len += line.len;
-+			body[body_len++] = '\n';
-+			free(line.p);
-+			lines_shown++;
-+			if (nfr)
-+				projected++;
-+			emitted++;
++			if (body_len + rec.len > (size_t)budget) {
++				it->shown = 0;
++				truncated = 1;
++				free(rec.p);
++				break;
++			}
++			body = xrealloc(body, body_len + rec.len + 1);
++			memcpy(body + body_len, rec.p, rec.len);
++			body_len += rec.len;
++			free(rec.p);
++			st.lines_shown += it->smp[k].nl;
++			emitted += it->smp[k].nl;
 +		}
 +		/* Invariant: lines_in == lines_shown + lines_merged + dropped_lines.
 +		 * A record counts as merged only for the occurrences it did not
 +		 * display, so -a cannot double-count them. */
-+		if (it->shown) {
-+			shown_groups++;
-+			if (it->count > emitted)
-+				lines_merged += it->count - emitted;
++		if (it->shown < 0) {
++			st.dropped_records++;
++			st.dropped_lines += it->lines;
 +			continue;
 +		}
-+		/* The budget is spent. Occurrences of THIS group that were not
-+		 * printed are merges into the record that was printed; everything
-+		 * after it in the chosen order is dropped whole. Adding the whole
-+		 * count here, as this loop once did, double-counted a group that -a
-+		 * had already started printing. */
-+		if (emitted) {
++		if (it->shown) {
 +			shown_groups++;
-+			lines_merged += it->count - emitted;
-+			dropped_records += nitems - oi - 1;
++			if (it->lines > emitted)
++				st.lines_merged += it->lines - emitted;
++			continue;
++		}
++		/* The budget is spent. Lines of THIS record that were not printed
++		 * are merges into the record that was; everything after it in the
++		 * chosen order is dropped whole. */
++		if (emitted) {
++			st.lines_merged += it->lines - emitted;
++			st.dropped_records += nitems - oi - 1;
 +		} else {
-+			dropped_lines += it->count;
-+			dropped_records += nitems - oi;
++			st.dropped_lines += it->lines;
++			st.dropped_records += nitems - oi;
 +		}
 +		for (i = oi + 1; i < nitems; i++)
-+			dropped_lines += items[order[i]].count;
++			st.dropped_lines += items[order[i]].lines;
 +		break;
 +	}
 +
 +	if (json_out) {
 +		int first = 1;
 +
-+		printf("{\"schema\":1,\"lines_in\":%u,\"records\":%u,\"kept\":%u,"
-+				"\"lines_shown\":%u,\"lines_merged\":%u,"
-+				"\"dropped_records\":%u,\"dropped_lines\":%u,"
-+				"\"nul_lines\":%u,\"bytes\":%u,\"truncated\":%s,\"fields\":%s,"
-+				"\"shown_groups\":%u,\"projected\":%u,\"bare\":%s,"
-+				"\"top\":%u,\"min_count\":%u,\"grouped_by\":",
-+				lines_in, nitems, kept, lines_shown, lines_merged,
-+				dropped_records, dropped_lines, nul_lines, (unsigned)body_len,
++		printf("{\"schema\":1,\"lines_in\":%lu,\"records\":%u,\"kept\":%lu,"
++				"\"lines_shown\":%lu,\"lines_merged\":%lu,"
++				"\"dropped_records\":%lu,\"dropped_lines\":%lu,"
++				"\"nul_lines\":%lu,\"bytes\":%lu,\"truncated\":%s,\"fields\":%s,"
++				"\"shown_groups\":%u,\"projected\":%lu,\"bare\":%s,"
++				"\"top\":%u,\"min_count\":%u,\"matched\":%lu,\"in_bytes\":%lu,"
++				"\"grouped_by\":",
++				st.lines_in, nitems, st.kept,
++				st.lines_shown, st.lines_merged,
++				st.dropped_records, st.dropped_lines,
++				st.nul_lines, (unsigned long)body_len,
 +				truncated ? "true" : "false",
 +				nfr ? "true" : "false",
-+				shown_groups, projected, bare ? "true" : "false",
-+				top_n, min_count);
++				shown_groups, st.projected, st.bare ? "true" : "false",
++				top_n, min_count, st.matched, (unsigned long)st.in_bytes);
 +		if (ncb)
 +			put_json_str(opt_countby, strlen(opt_countby));
++		else
++			fputs("null", stdout);
++		fputs(",\"record_start\":", stdout);
++		if (st.record_pat)
++			put_json_str(st.record_pat, strlen(st.record_pat));
 +		else
 +			fputs("null", stdout);
 +		fputs(",\"items\":[", stdout);
@@ -734,21 +924,18 @@ index 0000000..a247196
 +			struct item *it = &items[order[oi]];
 +			unsigned k;
 +
-+			if (!it->shown)
++			if (it->shown != 1)
 +				continue;
 +			for (k = 0; k < it->nsmp; k++) {
-+				struct sbuf line = { 0 };
++				struct sbuf rec = { 0 };
 +
-+				if (nfr)
-+					project_into(&line, it->smp[k].p, it->smp[k].n, fr, nfr, opt_sep);
-+				else
-+					sb_add(&line, it->smp[k].p, it->smp[k].n);
-+				printf("%s{\"n\":%u,\"kept\":%s,\"line\":",
++				render_record(&rec, &it->smp[k], it->count, k == 0);
++				printf("%s{\"n\":%u,\"kept\":%s,\"lines\":%u,\"line\":",
 +						first ? "" : ",", it->count,
-+						it->is_kept ? "true" : "false");
-+				put_json_str(line.p, line.len);
++						it->is_kept ? "true" : "false", it->smp[k].nl);
++				put_json_str(rec.p ? rec.p : "", rec.len);
 +				putchar('}');
-+				free(line.p);
++				free(rec.p);
 +				first = 0;
 +			}
 +		}
@@ -757,14 +944,15 @@ index 0000000..a247196
 +		/* The marker comes first: a reader knows the shape of what follows
 +		 * before reading it, and can never mistake a reduced view for the
 +		 * whole output. */
-+		printf("[brief] lines_in=%u records=%u kept=%u shown_lines=%u"
-+				" merged=%u dropped_records=%u dropped_lines=%u"
-+				" nul=%u bytes=%u truncated=%d shown_groups=%u projected=%u"
-+				" bare=%d top=%u min=%u\n",
-+				lines_in, nitems, kept, lines_shown,
-+				lines_merged, dropped_records, dropped_lines,
-+				nul_lines, (unsigned)body_len, truncated,
-+				shown_groups, projected, bare, top_n, min_count);
++		printf("[brief] lines_in=%lu records=%u kept=%lu shown_lines=%lu"
++				" merged=%lu dropped_records=%lu dropped_lines=%lu"
++				" nul=%lu bytes=%lu truncated=%d shown_groups=%u projected=%lu"
++				" bare=%d top=%u min=%u matched=%lu in_bytes=%lu\n",
++				st.lines_in, nitems, st.kept, st.lines_shown,
++				st.lines_merged, st.dropped_records, st.dropped_lines,
++				st.nul_lines, (unsigned long)body_len, truncated,
++				shown_groups, st.projected, st.bare, top_n, min_count,
++				st.matched, (unsigned long)st.in_bytes);
 +		if (body && body_len)
 +			fwrite(body, 1, body_len, stdout);
 +	}

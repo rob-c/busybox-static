@@ -1765,10 +1765,10 @@ index 0000000..ed6ae04
 +}
 diff --git a/miscutils/waitfor.c b/miscutils/waitfor.c
 new file mode 100644
-index 0000000..9c16ba8
+index 0000000..4dd231e
 --- /dev/null
 +++ b/miscutils/waitfor.c
-@@ -0,0 +1,467 @@
+@@ -0,0 +1,468 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * waitfor - bounded readiness polling.
@@ -2083,7 +2083,8 @@ index 0000000..9c16ba8
 +		o.expect = strtol(opt_expect, NULL, 10);
 +	if (opt_timeout) {
 +		double s = strtod(opt_timeout, NULL);
-+		if (!(s > 0))
++		/* 0 means: one attempt, no deadline. */
++		if (!(s >= 0))
 +			bb_error_msg_and_die("bad timeout \"%s\"", opt_timeout);
 +		o.timeout_ms = (long)(s * 1000.0);
 +	}

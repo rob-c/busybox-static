@@ -516,7 +516,8 @@ for corpus in c1 c2 c3; do
 	for opts in "" "-d" "-s" "-k error" "-s -a 8" "-d -a 2" "-n 1" "-n 3 -s" \
 		"-B 1" "-B 100" "-f 1" "-f 2,4" "-S , -f 1,2" "-f 1 -k A" \
 		"-c 1" "-c 2 -f 1" "-t 3" "-m 2" "-q" "-s -c 1" "-c 1 -m 3 -t 2" \
-		"-o e" "-x e" "-o e -x b" "-R e" "-R e -d" "-R e -a 2 -B 60"; do
+		"-o e" "-x e" "-o e -x b" "-R e" "-R e -d" "-R e -a 2 -B 60" \
+		"-i : -c 1" "-i : -f 1,2" "-i \t -f 1"; do
 		# shellcheck disable=SC2086
 		"$BB" brief $opts "$T/$corpus" > "$T/o" 2>/dev/null
 		ck "exit 0 [$corpus $opts]" "0" "$?"
@@ -837,7 +838,7 @@ inv "-R -d: invariant" "$T/o"
 # a record is shown whole or not at all: no half a commit
 "$BB" brief -R commit -B 40 sec.txt > "$T/o" 2>/dev/null
 ck "-B 40 shows the banner only" "1" "$(mfo shown_lines < "$T/o")"
-ck "-B 40 shows no partial record" "1x banner line" \
+ck "-B 40 shows no partial record" "0" \
 	"$(body "$T/o" "$T/b"; "$BB" grep -c commit "$T/b")"
 inv "-R tight budget: invariant" "$T/o"
 ck "-R tight budget truncates" "1" "$(mfo truncated < "$T/o")"
@@ -875,6 +876,39 @@ ck "record_start null without -R" "1" \
 	"$("$BB" brief -F json errs.txt 2>/dev/null | "$BB" grep -c '"record_start":null')"
 ck "json item carries its line count" "1" \
 	"$("$BB" brief -R commit -F json sec.txt 2>/dev/null | "$BB" grep -c '"lines":3')"
+
+sec "39. -i: colon-delimited output is field-structured too"
+
+printf '%s\n' "src/a.c:12: error: bad" "src/a.c:13: error: bad" \
+	"src/b.c:7: warning: unused" > diag.txt
+"$BB" brief -i : -f 1 diag.txt > "$T/o" 2>/dev/null
+ck "-i : splits on the colon" "src/a.c|src/a.c|src/b.c" \
+	"$(body "$T/o" "$T/b"; "$BB" sed -n '1,3p' "$T/b" | tr '\n' '|' | sed 's/|$//')"
+"$BB" brief -i : -c 1 -t 3 diag.txt > "$T/o" 2>/dev/null
+ck "-i : -c groups by path" "2x src/a.c" "$(body "$T/o" "$T/b"; "$BB" sed -n '1p' "$T/b")"
+ck "-i : -c counts the other path" "2" "$(mfo shown_groups < "$T/o")"
+inv "-i : -c: invariant" "$T/o"
+
+# several separators at once
+printf 'a/b:12/x\nc/d:13/x\n' > "$T/fx"
+"$BB" brief -i ':/' -f 1 "$T/fx" > "$T/o" 2>/dev/null
+ck "-i takes several separators" "a|c" \
+	"$(body "$T/o" "$T/b"; "$BB" sed -n '1,2p' "$T/b" | tr '\n' '|' | sed 's/|$//')"
+
+# the default is still space and tab, and a NUL is never a separator
+printf 'p q\np r\n' > "$T/fx"
+"$BB" brief -c 1 "$T/fx" > "$T/o" 2>/dev/null
+ck "default splitter is still whitespace" "2x p" "$(body "$T/o" "$T/b"; "$BB" sed -n '1p' "$T/b")"
+printf 'a\000b:c\n' > "$T/fx"
+printf 'a\000b\n' > "$T/exp"
+"$BB" brief -i : -f 1 "$T/fx" > "$T/o" 2>/dev/null
+byteck "-i never splits on NUL" "$T/exp" "$T/o"
+
+# nothing selected is still nothing, not a crash
+printf 'abc\n' > "$T/fx"
+"$BB" brief -i : -f 9 "$T/fx" > "$T/o" 2>/dev/null
+ck "-i with every field out of range exits 0" "0" "$?"
+inv "-i out of range: invariant" "$T/o"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

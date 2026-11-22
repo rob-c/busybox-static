@@ -1,9 +1,9 @@
 diff --git a/editors/replace.c b/editors/replace.c
 new file mode 100644
-index 0000000..688be30
+index 0000000..0fb0b2d
 --- /dev/null
 +++ b/editors/replace.c
-@@ -0,0 +1,857 @@
+@@ -0,0 +1,863 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * replace - guarded, all-or-nothing literal file editing.
@@ -741,7 +741,7 @@ index 0000000..688be30
 +		int fd;
 +		json_value_t *doc;
 +		const json_value_t *edits;
-+		unsigned n, i;
++		unsigned n, i, nitems __attribute__((unused)) = 0, skipped = 0;
 +
 +		fd = read_locked(opt_req, &data, &len, &st);
 +		if (fd < 0) {
@@ -772,6 +772,7 @@ index 0000000..688be30
 +		free(err);
 +		edits = json_get(doc, "edits");
 +		n = json_len(edits);
++		nitems = n;
 +		if (e.json)
 +			fputs("{\"schema\":1,\"results\":[", stdout);
 +		for (i = 0; i < n; i++) {
@@ -814,10 +815,13 @@ index 0000000..688be30
 +				report_text(&sub, &o, failed);
 +			if (failed) {
 +				exitcode = 1;
-+				if (o.code) {
++				/* INVALID_ARGUMENT rejects only this entry: report the rest.
++				 * A stale or missing file invalidates every later edit to it. */
++				if (o.code && strcmp(o.code, "INVALID_ARGUMENT") != 0) {
 +					free(o.msg);
 +					free(o.diff.p);
-+					break;   /* later edits would build on a bad state */
++					skipped = nitems - (i + 1);
++					break;
 +				}
 +			}
 +			free(o.msg);
@@ -825,6 +829,8 @@ index 0000000..688be30
 +		}
 +		if (e.json)
 +			fputs("]}\n", stdout);
++		if (skipped)
++			bb_error_msg("%u edit(s) not attempted after an earlier failure", skipped);
 +		json_free(doc);
 +		free(data);
 +		fflush(stdout);
