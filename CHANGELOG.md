@@ -15,6 +15,10 @@ Project releases of `busybox-static` on top of upstream busybox
 - New `tests/wrapper-signals.sh` — 21 checks: TERM/INT/HUP/KILL against `run`
   and `sh`, guests that ignore TERM, grandchildren, and that ordinary exit
   codes, output and process hygiene are unchanged.
+- New `tests/reaper.sh` — 50 checks on the watchdog itself: 5 signals × 3 guest
+  shapes per applet, no watchdog left after success or after a kill, no
+  premature kill while the wrapper lives, nested wrappers, and three concurrent
+  runs stopped at once.
 - The watchdog is stopped before the wrapper returns, so it is never visible to
   a process scan of a completed run.
 
