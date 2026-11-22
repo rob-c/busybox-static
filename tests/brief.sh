@@ -448,5 +448,219 @@ ck "json truncated == text" "$(mfo truncated < "$T/t.txt")" \
 ck "json is one line" "1" "$("$BB" wc -l < "$T/j.txt" | tr -d ' ')"
 ck "text marker first" "1" "$("$BB" sed -n '1p' "$T/t.txt" | "$BB" grep -c '^\[brief\]')"
 
+
+# ===========================================================================
+# Exhaustive sweeps. The sections above sample the byte space; these walk it.
+# A record is the bytes between two '\n', so the only byte that may change
+# anything is 0x0a itself - every other value must come out untouched.
+# ===========================================================================
+
+# mkrec <byte-value> <total-len> <nul-pos|-1>: a record of ASCII 'A' with one
+# other byte in it, NUL-terminated with '\n'.
+mkrec() { # mkrec <fill-byte> <len> <special-pos> <special-byte>
+	"$BB" awk -v n="$2" -v p="$3" -v b="$4" -v f="$1" \
+		'BEGIN{for(i=0;i<n;i++)printf "%c",(i==p?b:f); printf "\n"}'
+}
+
+sec "21. byte sweep: all 255 non-LF values survive a record"
+
+i=0
+while [ $i -le 255 ]; do
+	if [ $i -ne 10 ]; then
+		"$BB" awk -v b=$i 'BEGIN{printf "A%cB\n", b}' > "$T/fx"
+		"$BB" brief "$T/fx" > "$T/o" 2>/dev/null
+		"$BB" tail -c 4 "$T/o" > "$T/got"
+		ck "byte 0x$(printf %02x $i) preserved" "0" "$("$BB" cmp -s "$T/fx" "$T/got"; echo $?)"
+	fi
+	i=$((i + 1))
+done
+
+sec "22. NUL position sweep: where the NUL sits changes nothing"
+
+p=0
+while [ $p -lt 40 ]; do
+	mkrec 65 40 $p 0 > "$T/fx"
+	"$BB" brief "$T/fx" > "$T/o" 2>/dev/null
+	"$BB" tail -c 41 "$T/o" > "$T/got"
+	ck "NUL at offset $p kept" "0" "$("$BB" cmp -s "$T/fx" "$T/got"; echo $?)"
+	p=$((p + 1))
+done
+mkrec 65 40 7 0 > "$T/fx"
+"$BB" brief "$T/fx" > "$T/o" 2>/dev/null
+ck "NUL sweep: one record" "1" "$(mfo lines_in < "$T/o")"
+ck "NUL sweep: nul reported" "1" "$(mfo nul < "$T/o")"
+
+sec "23. records differing after a NUL stay distinct (12 offsets)"
+
+for d in 6 7 8 9 10 12 15 20 25 30 35 39; do
+	mkrec 65 40 5 0 > "$T/fx"
+	mkrec 65 40 5 0 > "$T/fx2"
+	# change one byte at offset d in the second copy, past the NUL at 5
+	"$BB" awk -v n=40 -v p="$d" 'BEGIN{for(i=0;i<n;i++)printf "%c",(i==p?66:(i==5?0:65)); printf "\n"}' > "$T/fx2"
+	cat "$T/fx" "$T/fx2" > "$T/fx3"
+	"$BB" brief -d "$T/fx3" > "$T/o" 2>/dev/null
+	ck "NUL + difference at $d: 2 records" "2" "$(mfo records < "$T/o")"
+done
+
+sec "24. invariant and exit status: 3 binary corpora x 14 option sets"
+
+# c1 mixed text/binary, c2 all-NUL lines, c3 high-byte soup (no 0x0a)
+{
+	printf 'error: text\n'; printf 'a\000b\n'; printf '\377\376\n'
+	printf '\r\n'; printf 'no-newline-tail'
+} > "$T/c1"
+"$BB" awk 'BEGIN{for(l=0;l<8;l++){for(i=0;i<16;i++)printf "%c",0; printf "\n"}}' > "$T/c2"
+"$BB" awk 'BEGIN{for(l=0;l<8;l++){for(i=128;i<256;i++)if(i!=10)printf "%c",i; printf "\n"}}' > "$T/c3"
+
+for corpus in c1 c2 c3; do
+	for opts in "" "-d" "-s" "-k error" "-s -a 8" "-d -a 2" "-n 1" "-n 3 -s" \
+		"-B 1" "-B 100" "-f 1" "-f 2,4" "-S , -f 1,2" "-f 1 -k A"; do
+		# shellcheck disable=SC2086
+		"$BB" brief $opts "$T/$corpus" > "$T/o" 2>/dev/null
+		ck "exit 0 [$corpus $opts]" "0" "$?"
+		inv "invariant [$corpus $opts]" "$T/o"
+	done
+done
+
+sec "25. json over the binary corpora"
+
+for corpus in c1 c2 c3; do
+	"$BB" brief -F json "$T/$corpus" > "$T/j" 2>/dev/null
+	"$BB" brief "$T/$corpus" > "$T/t" 2>/dev/null
+	ck "json schema [$corpus]" "1" "$("$BB" sed -n 's/.*"schema":\([0-9]*\).*/\1/p' "$T/j")"
+	ck "json one line [$corpus]" "1" "$("$BB" wc -l < "$T/j" | tr -d ' ')"
+	ck "json nul == text nul [$corpus]" "$(mfo nul < "$T/t")" \
+		"$("$BB" sed -n 's/.*"nul_lines":\([0-9]*\),.*/\1/p' "$T/j")"
+	ck "json lines_in == text [$corpus]" "$(mfo lines_in < "$T/t")" \
+		"$("$BB" sed -n 's/.*"lines_in":\([0-9]*\).*/\1/p' "$T/j")"
+done
+
+sec "26. record-length boundaries"
+
+for n in 1 2 3 15 16 17 63 64 65 127 128 129 255 256 257 1023 1024 1025 4095 4096 4097; do
+	mkrec 65 "$n" -1 0 > "$T/fx"
+	"$BB" brief -B 200000 "$T/fx" > "$T/o" 2>/dev/null
+	"$BB" tail -c $((n + 1)) "$T/o" > "$T/got"
+	ck "record of $n bytes kept" "0" "$("$BB" cmp -s "$T/fx" "$T/got"; echo $?)"
+	ck "record of $n bytes: lines_in" "1" "$(mfo lines_in < "$T/o")"
+done
+
+sec "27. CR and LF combinations"
+
+crck() { # crck <name> <printf-format> <printf-format> <lines>
+	printf "$2" > "$T/fx"; printf "$3" > "$T/exp"
+	"$BB" brief "$T/fx" > "$T/o" 2>/dev/null
+	byteck "$1 bytes" "$T/exp" "$T/o"
+	ck "$1 lines" "$4" "$(mfo lines_in < "$T/o")"
+}
+crck "CRLF only"      'x\r\n'      'x\r\n'      1
+crck "CR CR LF"       'x\r\r\n'    'x\r\r\n'    1
+crck "CR alone"       '\r'         '\r\n'       1
+crck "LF then CR"     '\n\r'       '\n\r\n'     2
+crck "empty then CR"  '\n\r\n'     '\n\r\n'     2
+crck "CR inside"      'a\rb\n'     'a\rb\n'     1
+printf 'x\r\ny\r\n' > "$T/fx"
+"$BB" brief -d "$T/fx" > "$T/o" 2>/dev/null
+ck "CRLF -d: two records" "2" "$(mfo records < "$T/o")"
+printf 'x\r\n' 'x\n' > "$T/fx2"
+{ printf 'x\r\n'; printf 'x\n'; } > "$T/fx2"
+"$BB" brief -d "$T/fx2" > "$T/o" 2>/dev/null
+ck "CRLF is not LF" "2" "$(mfo records < "$T/o")"
+"$BB" brief -s "$T/fx2" > "$T/o" 2>/dev/null
+ck "CRLF -s keeps them distinct" "2" "$(mfo records < "$T/o")"
+printf 'a\rb\rc\n' > "$T/fx"
+"$BB" brief "$T/fx" > "$T/o" 2>/dev/null
+ck "several CRs in one record" "1" "$(mfo lines_in < "$T/o")"
+ck "several CRs: nul untouched" "0" "$(mfo nul < "$T/o")"
+
+sec "28. -f field projection over binary fields"
+
+printf 'a\000b c\000d\n' > "$T/fx"
+"$BB" brief -f 1 "$T/fx" > "$T/o" 2>/dev/null
+printf 'a\000b\n' > "$T/exp"
+byteck "-f 1 keeps NUL in field" "$T/exp" "$T/o"
+"$BB" brief -f 2 "$T/fx" > "$T/o" 2>/dev/null
+printf 'c\000d\n' > "$T/exp"
+byteck "-f 2 keeps NUL in field" "$T/exp" "$T/o"
+"$BB" brief -f 1,2 "$T/fx" > "$T/o" 2>/dev/null
+printf 'a\000b c\000d\n' > "$T/exp"
+byteck "-f 1,2 rejoins with one space" "$T/exp" "$T/o"
+"$BB" brief -f 1,2 -S '|' "$T/fx" > "$T/o" 2>/dev/null
+printf 'a\000b|c\000d\n' > "$T/exp"
+byteck "-S replaces the separator" "$T/exp" "$T/o"
+"$BB" brief -f 9 "$T/fx" > "$T/o" 2>/dev/null
+printf '\n' > "$T/exp"
+byteck "-f 9 (out of range) is an empty record" "$T/exp" "$T/o"
+printf 'a\tb\000c\n' > "$T/fx"
+"$BB" brief -f 2 "$T/fx" > "$T/o" 2>/dev/null
+printf 'b\000c\n' > "$T/exp"
+byteck "tab-delimited field with NUL" "$T/exp" "$T/o"
+printf '\377\376 x\n' > "$T/fx"
+"$BB" brief -f 1 "$T/fx" > "$T/o" 2>/dev/null
+printf '\377\376\n' > "$T/exp"
+byteck "high-byte field" "$T/exp" "$T/o"
+printf 'a\000b\n' 'a\000c\n' > "$T/fx"
+{ printf 'a\000b\n'; printf 'a\000c\n'; } > "$T/fx"
+"$BB" brief -d -f 1 "$T/fx" > "$T/o" 2>/dev/null
+ck "-f does not merge distinct records" "2" "$(mfo records < "$T/o")"
+ck "-f reports fields=true" "true" \
+	"$("$BB" brief -f 1 -F json "$T/fx" 2>/dev/null | "$BB" sed -n 's/.*"fields":\([a-z]*\).*/\1/p')"
+"$BB" brief -f 1,2,3 "$T/fx" > "$T/o" 2>/dev/null
+ck "-f wider than the record: still one record each" "2" "$(mfo records < "$T/o")"
+"$BB" brief -f 1 -B 1 "$T/fx" > "$T/o" 2>/dev/null
+ck "-f 1 with a 1-byte budget truncates" "1" "$(mfo truncated < "$T/o")"
+
+sec "29. -k over binary records"
+
+printf 'A\000B\nplain\n' > "$T/fx"
+"$BB" brief -k A "$T/fx" > "$T/o" 2>/dev/null
+ck "-k matches across a NUL boundary" "1" "$(mfo kept < "$T/o")"
+body "$T/o" "$T/got"
+printf 'A\000B\nplain\n' > "$T/exp"
+byteck "-k keeps the NUL bytes" "$T/exp" "$T/got"
+printf '\377\376\nplain\n' > "$T/fx"
+"$BB" brief -k "$(printf '\377')" "$T/fx" > "$T/o" 2>/dev/null
+ck "-k matches a high byte" "1" "$(mfo kept < "$T/o")"
+"$BB" brief -k zzzz "$T/fx" > "$T/o" 2>/dev/null
+ck "-k with no match keeps nothing" "0" "$(mfo kept < "$T/o")"
+"$BB" brief -k "" "$T/fx" > "$T/o" 2>/dev/null
+ck "-k '' keeps every record" "2" "$(mfo kept < "$T/o")"
+printf 'A\000B\nA\000B\nnoise\n' > "$T/fx"
+"$BB" brief -k A -d "$T/fx" > "$T/o" 2>/dev/null
+ck "-k never merges identical kept lines" "2" "$(mfo kept < "$T/o")"
+ck "-k repeats still counted as lines_in" "3" "$(mfo lines_in < "$T/o")"
+inv "-k binary: invariant" "$T/o"
+"$BB" brief -k A -F json "$T/fx" > "$T/o" 2>/dev/null
+ck "-k json kept flag" "2" \
+	"$("$BB" grep -o '"kept":true' "$T/o" | "$BB" wc -l | tr -d ' ')"
+ck "-k json: ordinary record is not kept" "1" \
+	"$("$BB" grep -c '"kept":false' "$T/o")"
+"$BB" brief -F json "$T/fx" > "$T/o" 2>/dev/null
+ck "no -k: nothing flagged kept" "0" \
+	"$("$BB" grep -o '"kept":true' "$T/o" | "$BB" wc -l | tr -d ' ')"
+
+sec "30. -a samples and -S separators with binary content"
+
+printf 'a\0001b\na\0002b\na\0003b\n' > "$T/fx"
+"$BB" brief -s -a 2 "$T/fx" > "$T/o" 2>/dev/null
+ck "-a 2 shows two samples" "2" "$(mfo shown_lines < "$T/o")"
+printf '3x a\0001b\n+ a\0002b\n' > "$T/exp"
+byteck "-a 2 body keeps NUL and the + prefix" "$T/exp" "$T/o"
+"$BB" brief -s -a 8 "$T/fx" > "$T/o" 2>/dev/null
+ck "-a 8 is accepted" "0" "$?"
+"$BB" brief -s -a 3 "$T/fx" > "$T/o" 2>/dev/null
+inv "-a 3: invariant" "$T/o"
+printf 'a\000b\n' > "$T/fx"
+"$BB" brief -a 2 "$T/fx" > "$T/o" 2>/dev/null
+printf 'a\000b\n' > "$T/exp"
+byteck "single occurrence: no Nx prefix" "$T/exp" "$T/o"
+printf 'p q\n' > "$T/fx"
+"$BB" brief -f 1,2 -S '::' "$T/fx" > "$T/o" 2>/dev/null
+printf 'p::q\n' > "$T/exp"
+byteck "-S with two bytes" "$T/exp" "$T/o"
+"$BB" brief -f 1,2 -S '' "$T/fx" > "$T/o" 2>/dev/null
+printf 'pq\n' > "$T/exp"
+byteck "-S empty concatenates" "$T/exp" "$T/o"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
