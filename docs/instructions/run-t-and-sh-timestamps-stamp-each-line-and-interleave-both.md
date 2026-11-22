@@ -1,21 +1,23 @@
 ---
-title: "`run -t` and `sh --timestamps` stamp each line and interleave both streams"
+title: "`run -t` and `sh --timestamps` stamp each line and preserve it in JSON and on disk"
 kind: "instruction"
-summary: "`run -t` / `sh --timestamps` emit one interleaved stream where each line is prefixed `[ s.uuuuuu out|err]`; `-F json` adds a `timeline` array and artifacts stay byte-exact."
-tags: [run, sh, timestamps, timeline, dmesg, ordering]
+summary: "`run -t` / `sh --timestamps` stamp each line `[ s.uuuuuu out|err]`; the same records are kept in JSON `timeline[]` (with `started_unix_us`), a `timeline` artifact, and `log -s timeline`."
+tags: [run, sh, timestamps, timeline, json, log, ordering]
 created: "2026-11-22T18:35:36.570Z"
-updated: "2026-11-22T18:35:36.570Z"
+updated: "2026-11-22T18:45:46.890Z"
 ---
-`run -t` / `sh --timestamps` print one interleaved stream in which every line carries the moment it was read and the stream it came from, dmesg style. `run -t -F json` puts the same data in a `timeline` array. The raw artifacts stay byte-exact, so evidence is untouched.
+`run -t` / `sh --timestamps` print one interleaved stream where every line carries its read time and stream, and the same records are preserved in three places: the JSON `timeline` array, a `timeline` artifact beside `stdout`/`stderr`, and the version `log -s timeline` reads back. Raw artifacts stay byte-exact.
 
 ```mermaid
 flowchart LR
-  A["child"] -->|stdout pipe| P["poll loop"]
-  A -->|stderr pipe| P
-  P --> B["artifact stdout<br/>byte-exact"]
-  P --> C["artifact stderr<br/>byte-exact"]
+  A["child"] -->|stdout| P["poll loop"]
+  A -->|stderr| P
+  P --> B["artifact stdout / stderr<br/>byte-exact"]
   P --> D["line assembler<br/>stamp on newline"]
-  D --> E["[  0.015623 out] one<br/>[  0.015686 err] two"]
+  D --> F["artifact timeline<br/>complete"]
+  D --> E["[  0.015623 out] one"]
+  D --> G["JSON timeline[]"]
+  F --> H["log -s timeline"]
 ```
 
 ## Text form
@@ -23,32 +25,38 @@ flowchart LR
 ```
 $ busybox sh --timestamps -c 'echo one; echo two >&2; sleep 0.05; echo three'
 run=R66 exit_code=0 timed_out=false cancelled=false duration_ms=80
-timeline_lines=3 bytes=14 truncated=false
+timeline_lines=3 shown=3 truncated=false
 --- timeline ---
 [   0.015623 out] one
 [   0.015686 err] two
 [   0.081766 out] three
 ```
 
-Microsecond resolution (`CLOCK_MONOTONIC`) relative to the fork, `out`/`err` tagged so a merged line is never ambiguous, and the two `--- stdout ---` / `--- stderr ---` sections are replaced — otherwise the interleaving would be lost again.
+Microsecond `CLOCK_MONOTONIC` relative to the fork; `out`/`err` tagged so a merged line is never ambiguous. The two `--- stdout ---` / `--- stderr ---` sections are replaced — keeping them would lose the interleaving again.
 
-## JSON form
+## JSON keeps the timestamps
 
 ```
-$ busybox run -t -F json -- busybox sh -c 'echo hi'
-{"schema":1,…,"timeline":[{"us":12119,"stream":"out","text":"hi"}],"timeline_truncated":false}
+$ busybox run -t -F json -- busybox sh -c 'echo a; echo b >&2'
+{…,"started_unix_us":1795372826626033,
+ "timeline":[{"us":13134,"stream":"out","text":"a"},{"us":13177,"stream":"err","text":"b"}],
+ "timeline_lines":2,"timeline_shown":2,"timeline_truncated":false}
 ```
 
-## What the ordering can and cannot promise
+`us` is µs since the fork; `started_unix_us` is the wall-clock origin, so a timeline can be aligned with other logs. `timeline_lines` vs `timeline_shown` says exactly how much of it you are seeing.
 
-The two pipes are separate, so byte order *between* them is not recoverable — that is the known cost of pipes over a pty (§10 question 3). What is recoverable is the order in which this process read each **complete line**, and stamping at read time is that honest approximation. Within one stream the order is exact; across streams it is read order, which is the best a pipe-based capture can do.
+## Evidence outlives the response
 
-## Details that matter
+Even with `-B 8`, where the view shows one line of five, `<dir>/timeline` holds all five. Read it back with `log`:
 
-- A line with no trailing newline is flushed with a final stamp; a 5000-byte line stays one record.
-- `--max-bytes` bounds the timeline the same way it bounds the view (`-B 8` gives one record plus `... [timeline truncated at 8 bytes] ...`).
-- `--brief`, `--quiet`, `--timeout`, `--pgid` and `--format json` all compose with `-t`.
-- `sh --timestamps` forwards to `run`, and `sh -c 'echo --timestamps'` still prints the literal string.
-- Binary output does not crash the assembler; the bytes go to the artifact untouched.
+```
+$ busybox log -D <dir> R7 -s timeline -m 'err]'
+```
 
-Checks: `tests/agent-ops-sweep.sh` §24, 38 of them, green on darwin-arm64 and AlmaLinux 9.
+`-s` now takes `stdout`, `stderr`, `timeline` or `both`; anything else exits 2.
+
+## The ordering limit, stated once
+
+The two pipes are separate, so byte order *between* them is not recoverable — the known cost of pipes over a pty (§10 Q3). Read order of *complete lines* is what gets stamped: exact within a stream, read order across streams. The `out`/`err` tag is what keeps that honest.
+
+Checks: `tests/agent-ops-sweep.sh` §24-25, 63 of them, green on darwin-arm64 and AlmaLinux 9.

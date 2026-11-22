@@ -1,9 +1,9 @@
 diff --git a/coreutils/run.c b/coreutils/run.c
 new file mode 100644
-index 0000000..2838b41
+index 0000000..7e435e7
 --- /dev/null
 +++ b/coreutils/run.c
-@@ -0,0 +1,1572 @@
+@@ -0,0 +1,1655 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * run - captured execution with retrievable evidence.
@@ -66,7 +66,7 @@ index 0000000..2838b41
 +//usage:     "\n	-l, --lines A:B		Line range, 1-based inclusive"
 +//usage:     "\n	-m, --match STR		Lines containing STR (literal)"
 +//usage:     "\n	-c, --context N		Context around matches (default 3)"
-+//usage:     "\n	-s, --stream WHICH	stdout (default), stderr or both"
++//usage:     "\n	-s, --stream WHICH	stdout (default), stderr, timeline or both"
 +//usage:     "\n	-M, --meta		Print the run metadata only"
 +//usage:     "\n	--diff R1:R2	Compare the stdout of two runs"
 +//usage:     "\n	-B, --max-bytes N	Output budget (default 12000)"
@@ -219,9 +219,12 @@ index 0000000..2838b41
 +static struct {
 +	struct tlrec *v;
 +	unsigned n, cap;
-+	size_t bytes, budget;
++	size_t bytes, budget;          /* budget: hard cap on held records */
 +	int truncated;
 +	unsigned long long start_us;
++	unsigned long long start_unix_us;
++	unsigned out_truncated;
++	size_t out_budget;
 +	char *part[2];    /* partial line per stream */
 +	size_t plen[2], pcap[2];
 +	int on;
@@ -289,31 +292,92 @@ index 0000000..2838b41
 +	}
 +}
 +
-+static void tl_print_text(void)
++/* The held records are complete; the *printed* ones are bounded, so a small
++ * budget shortens the view without shortening the evidence on disk. */
++static int tl_line_len(const struct tlrec *r)
 +{
++	return 22 + (int)strlen(r->text);   /* "[ s.uuuuuu out] " + text + "\n" */
++}
++
++static unsigned tl_shown_count(void)
++{
++	size_t used = 0;
 +	unsigned i;
 +
-+	for (i = 0; i < tl.n; i++)
++	for (i = 0; i < tl.n; i++) {
++		int n = tl_line_len(&tl.v[i]);
++
++		if (i && used + (size_t)n > tl.out_budget) {
++			tl.out_truncated = 1;
++			break;
++		}
++		used += (size_t)n;
++	}
++	return i;
++}
++
++static void tl_print_text(void)
++{
++	unsigned i, show = tl_shown_count();
++	size_t used = 0;
++
++	for (i = 0; i < show; i++) {
++		int n = tl_line_len(&tl.v[i]);
++
 +		printf("[%4llu.%06llu %s] %s\n",
 +				tl.v[i].us / 1000000, tl.v[i].us % 1000000,
 +				tl.v[i].stream == 'e' ? "err" : "out", tl.v[i].text);
-+	if (tl.truncated)
-+		printf("... [timeline truncated at %u bytes] ...\n", (unsigned)tl.budget);
++		used += (size_t)n;
++	}
++	if (show < tl.n)
++		printf("... [timeline truncated: %u of %u lines shown] ...\n",
++				show, tl.n);
++}
++
++/* the same records, written once, unbounded, as evidence */
++static void tl_write_file(const char *dir)
++{
++	char *path = art_path(dir, "timeline");
++	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
++	unsigned i;
++
++	free(path);
++	if (fd < 0)
++		return;
++	for (i = 0; i < tl.n; i++) {
++		char hdr[64];
++		int n = sprintf(hdr, "[%4llu.%06llu %s] ",
++				tl.v[i].us / 1000000, tl.v[i].us % 1000000,
++				tl.v[i].stream == 'e' ? "err" : "out");
++
++		full_write(fd, hdr, (size_t)n);
++		full_write(fd, tl.v[i].text, strlen(tl.v[i].text));
++		full_write(fd, "\n", 1);
++	}
++	close(fd);
 +}
 +
 +static void tl_print_json(void)
 +{
-+	unsigned i;
++	unsigned i, show = tl_shown_count();
++	size_t used = 0;
++	int first = 1;
 +
-+	printf("\"timeline\":[");
-+	for (i = 0; i < tl.n; i++) {
++	printf("\"started_unix_us\":%llu,\"timeline\":[", tl.start_unix_us);
++	for (i = 0; i < show; i++) {
++		int n = tl_line_len(&tl.v[i]);
++
 +		printf("%s{\"us\":%llu,\"stream\":\"%s\",\"text\":",
-+				i ? "," : "", tl.v[i].us,
++				first ? "" : ",", tl.v[i].us,
 +				tl.v[i].stream == 'e' ? "err" : "out");
 +		json_write_str(tl.v[i].text);
 +		putchar('}');
++		used += (size_t)n;
++		first = 0;
 +	}
-+	printf("],\"timeline_truncated\":%s", tl.truncated ? "true" : "false");
++	printf("],\"timeline_lines\":%u,\"timeline_shown\":%u,"
++			"\"timeline_truncated\":%s",
++			tl.n, i, (tl.truncated || tl.out_truncated) ? "true" : "false");
 +}
 +
 +static void pump(int fds[2], int arts[2], long deadline_ms, int kill_after_ms,
@@ -813,8 +877,14 @@ index 0000000..2838b41
 +		int want_tl = (opts & (1 << 14)) != 0;   /* t: 15th letter */
 +
 +		tl.on = want_tl;
-+		if (want_tl)
++		if (want_tl) {
++			struct timeval tv;
++
 +			tl.start_us = monotonic_us();
++			if (gettimeofday(&tv, NULL) == 0)
++				tl.start_unix_us = (unsigned long long)tv.tv_sec * 1000000
++						+ (unsigned long long)tv.tv_usec;
++		}
 +	}
 +	argv += optind;
 +
@@ -912,8 +982,11 @@ index 0000000..2838b41
 +
 +	bb_signals((1 << (SIGINT - 1)) | (1 << (SIGTERM - 1)), on_sig);
 +
-+	if (tl.on)
-+		tl.budget = (size_t)budget;   /* the same budget the view gets */
++	if (tl.on) {
++		/* hold everything the capture holds, but never more than 8 MiB */
++		tl.budget = (size_t)8 * 1024 * 1024;
++		tl.out_budget = (size_t)budget;
++	}
 +	started = now_ms();
 +	pid = fork();
 +	if (pid < 0)
@@ -1015,6 +1088,8 @@ index 0000000..2838b41
 +			m.err_bytes = (unsigned long long)st.st_size;
 +		close(art_out);
 +		close(art_err);
++		if (tl.on)
++			tl_write_file(dir);
 +		write_meta(dir, &m);
 +
 +		if (json) {
@@ -1081,8 +1156,9 @@ index 0000000..2838b41
 +			printf("run=R%u exit_code=%d timed_out=%s cancelled=%s duration_ms=%ld\n",
 +					id, m.exit_code, m.timed_out ? "true" : "false",
 +					m.cancelled ? "true" : "false", m.duration_ms);
-+			printf("timeline_lines=%u bytes=%u truncated=%s\n",
-+					tl.n, (unsigned)tl.bytes, tl.truncated ? "true" : "false");
++			printf("timeline_lines=%u shown=%u truncated=%s\n",
++					tl.n, tl_shown_count(),
++					(tl.truncated || tl.n > tl_shown_count()) ? "true" : "false");
 +			printf("--- timeline ---\n");
 +			tl_print_text();
 +			if (opt_pgid)
@@ -1555,8 +1631,15 @@ index 0000000..2838b41
 +		int both = (strcmp(which, "both") == 0);
 +
 +		if (!both && strcmp(which, "stdout") != 0
-+		 && strcmp(which, "stderr") != 0)
-+			bb_error_msg_and_die("--stream is stdout, stderr or both");
++		 && strcmp(which, "stderr") != 0
++		 && strcmp(which, "timeline") != 0)
++			bb_error_msg_and_die("--stream is stdout, stderr, timeline or both");
++		if (strcmp(which, "timeline") == 0) {
++			rc = dump_stream(art_path(dir, "timeline"), "timeline", opt_match,
++					first, last, ctx, budget, json);
++			fflush(stdout);
++			return rc;
++		}
 +		if (json && both)
 +			fputs("{\"schema\":1,\"results\":[", stdout);
 +		if (both || strcmp(which, "stdout") == 0) {
@@ -1576,7 +1659,6 @@ index 0000000..2838b41
 +	fflush(stdout);
 +	return rc;
 +}
-
 diff --git a/miscutils/doctor.c b/miscutils/doctor.c
 new file mode 100644
 index 0000000..5b607d5

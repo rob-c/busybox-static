@@ -1043,7 +1043,43 @@ index 0000000..1a1b177
 +	}
 +	return exitcode;
 +}
-
+diff --git a/include/error_ids.h b/include/error_ids.h
+new file mode 100644
+index 0000000..2278cf3
+--- /dev/null
++++ b/include/error_ids.h
+@@ -0,0 +1,31 @@
++/* vi: set sw=4 ts=4: */
++/*
++ * Opt-in diagnostic ids: the same message on stderr with its id in front, and
++ * the bare id on stdout.
++ *
++ * Off unless BUSYBOX_ERROR_IDS is set in the environment or the applet was
++ * started as "busybox --error-ids APPLET ...". With the switch off every
++ * diagnostic is byte-identical to what it always was, so a normal direct
++ * invocation is unaffected: the id path is one extra getenv on an error path
++ * that is already printing.
++ *
++ *   stdout   E NOT_FOUND            the id alone: branch without parsing prose
++ *   stderr   cat: NOT_FOUND: can't open '/nope': No such file or directory
++ *
++ * The id is bb_error_code when an applet set one, else derived from errno
++ * (ENOENT -> NOT_FOUND, EACCES -> PERMISSION, ...), else USAGE for a usage
++ * error, else FAILED. The channel letter is E for a diagnostic and W when the
++ * message opens with "warning".
++ *
++ * Licensed under GPLv2, see file LICENSE in this source tree.
++ */
++#ifndef ERROR_IDS_H
++#define ERROR_IDS_H
++
++extern int bb_error_ids;      /* nonzero: ids on (environment or --error-ids) */
++extern int bb_perror_errno;   /* errno at the last bb_perror_msg* call, else 0 */
++extern const char *bb_error_code; /* applet-set code for the next message */
++
++void bb_error_ids_init(void);
++
++#endif
 diff --git a/include/json_read.h b/include/json_read.h
 new file mode 100644
 index 0000000..15c6aee
@@ -1104,10 +1140,10 @@ index 0000000..15c6aee
 +
 +#endif
 diff --git a/libbb/appletlib.c b/libbb/appletlib.c
-index 34b74c3..8e86588 100644
+index 34b74c3..021f3b0 100644
 --- a/libbb/appletlib.c
 +++ b/libbb/appletlib.c
-@@ -28,6 +28,8 @@
+@@ -28,9 +28,12 @@
  
  /* Define this accessor before we #define "errno" our way */
  #include <errno.h>
@@ -1116,7 +1152,27 @@ index 34b74c3..8e86588 100644
  static inline int *get_perrno(void) { return &errno; }
  
  #include "busybox.h"
-@@ -754,6 +756,21 @@ get_script_content(unsigned n)
++#include "error_ids.h"
+ 
+ #if !(defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) \
+     || defined(__APPLE__) \
+@@ -172,6 +175,15 @@ void FAST_FUNC bb_show_usage(void)
+ 	if (ENABLE_FEATURE_CLEAN_UP)
+ 		dealloc_usage_messages((char*)usage_string);
+ # endif
++	/* --error-ids: a usage error is one diagnostic, so it gets one id, and
++	 * only when the text went to stderr (an error, not --help). */
++	bb_error_ids_init();
++	if (bb_error_ids && xfunc_error_retval) {
++		char id[32];
++		int n = sprintf(id, "E %s\n", bb_error_code ? bb_error_code : "USAGE");
++		fflush_all();
++		full_write(STDOUT_FILENO, id, n);
++	}
+ 	xfunc_die();
+ }
+ #endif
+@@ -754,6 +766,21 @@ get_script_content(unsigned n)
  # endif /* NUM_SCRIPTS > 0 */
  
  # if ENABLE_BUSYBOX
@@ -1138,7 +1194,28 @@ index 34b74c3..8e86588 100644
  #  if ENABLE_FEATURE_SH_STANDALONE && ENABLE_FEATURE_TAB_COMPLETION
      /*
       * Insert "busybox" into applet table as well.
-@@ -850,6 +867,128 @@ int busybox_main(int argc UNUSED_PARAM, char **argv)
+@@ -772,6 +799,20 @@ static
+ #  endif
+ int busybox_main(int argc UNUSED_PARAM, char **argv)
+ {
++	/* "busybox --error-ids APPLET ARGS..." is "busybox APPLET ARGS..." with
++	 * diagnostic ids on: drop the flag and let the normal dispatch run, so
++	 * there is one code path. A symlinked applet gets the same behaviour from
++	 * BUSYBOX_ERROR_IDS in its environment. */
++	if (argv[1] && strcmp(argv[1], "--error-ids") == 0) {
++		int i;
++		if (!argv[2])
++			bb_error_msg_and_die(bb_msg_requires_arg, "--error-ids");
++		bb_error_ids = 1;
++		for (i = 1; argv[i + 1]; i++)
++			argv[i] = argv[i + 1];
++		argv[i] = NULL;
++	}
++
+ 	if (!argv[1]) {
+ 		/* Called without arguments */
+ 		const char *a;
+@@ -850,6 +891,128 @@ int busybox_main(int argc UNUSED_PARAM, char **argv)
  	}
  #  endif
  
@@ -1802,12 +1879,168 @@ index 0000000..ed6ae04
 +		n++;
 +	return n;
 +}
+diff --git a/libbb/perror_msg.c b/libbb/perror_msg.c
+index fa1f0d3..866adeb 100644
+--- a/libbb/perror_msg.c
++++ b/libbb/perror_msg.c
+@@ -7,6 +7,7 @@
+  * Licensed under GPLv2 or later, see file LICENSE in this source tree.
+  */
+ #include "libbb.h"
++#include "error_ids.h"
+ 
+ void FAST_FUNC bb_perror_msg(const char *s, ...)
+ {
+@@ -14,7 +15,9 @@ void FAST_FUNC bb_perror_msg(const char *s, ...)
+ 
+ 	va_start(p, s);
+ 	/* Guard against "<error message>: Success" */
++	bb_perror_errno = errno;
+ 	bb_verror_msg(s, p, errno ? strerror(errno) : NULL);
++	bb_perror_errno = 0;
+ 	va_end(p);
+ }
+ 
+@@ -24,7 +27,9 @@ void FAST_FUNC bb_perror_msg_and_die(const char *s, ...)
+ 
+ 	va_start(p, s);
+ 	/* Guard against "<error message>: Success" */
++	bb_perror_errno = errno;
+ 	bb_verror_msg(s, p, errno ? strerror(errno) : NULL);
++	bb_perror_errno = 0;
+ 	va_end(p);
+ 	xfunc_die();
+ }
+diff --git a/libbb/verror_msg.c b/libbb/verror_msg.c
+index 74b608f..79c6f1a 100644
+--- a/libbb/verror_msg.c
++++ b/libbb/verror_msg.c
+@@ -7,6 +7,7 @@
+  * Licensed under GPLv2 or later, see file LICENSE in this source tree.
+  */
+ #include "libbb.h"
++#include "error_ids.h"
+ #if ENABLE_FEATURE_SYSLOG
+ # include <syslog.h>
+ #endif
+@@ -17,6 +18,96 @@ static smallint syslog_level = LOG_ERR;
+ smallint logmode = LOGMODE_STDIO;
+ const char *msg_eol = "\n";
+ 
++int bb_error_ids;
++int bb_perror_errno;
++const char *bb_error_code;
++
++/* The closed vocabulary of BUSYBOX-CONTRACT.md, plus the errno cases that
++ * carry a distinct meaning for a caller. Anything unmapped is FAILED: an id
++ * that might be wrong would be worse than one that says "something failed". */
++static const char *code_for_errno(int e)
++{
++	switch (e) {
++	case ENOENT:      return "NOT_FOUND";
++	case EACCES:
++	case EPERM:       return "PERMISSION";
++	case EINVAL:      return "INVALID_ARGUMENT";
++	case EEXIST:      return "EXISTS";
++	case ENOSPC:      return "NO_SPACE";
++	case ETIMEDOUT:   return "TIMEOUT";
++	case EISDIR:      return "IS_DIR";
++	case ENOTDIR:     return "NOT_DIR";
++	case ELOOP:       return "SYMLINK_LOOP";
++	case EINTR:       return "INTERRUPTED";
++	case EPIPE:       return "BROKEN_PIPE";
++	case ENAMETOOLONG:return "NAME_TOO_LONG";
++	case EBUSY:       return "BUSY";
++	case EMFILE:
++	case ENFILE:      return "TOO_MANY_FILES";
++	case ENOMEM:      return "NO_MEMORY";
++	case EAGAIN:      return "WOULD_BLOCK";
++	case ESRCH:       return "NOT_FOUND";
++	case ENOSYS:
++	case EOPNOTSUPP:  return "UNSUPPORTED";
++	case EROFS:       return "READ_ONLY";
++	case ENOTEMPTY:   return "NOT_EMPTY";
++	case ECHILD:      return "NO_CHILD";
++	case ENOEXEC:     return "NOT_EXECUTABLE";
++	case ERANGE:
++	case EOVERFLOW:   return "OUT_OF_RANGE";
++	case E2BIG:       return "TOO_LARGE";
++	case EXDEV:       return "CROSS_DEVICE";
++	}
++	return "FAILED";
++}
++
++/* Called on the few diagnostic paths that need ids. It re-formats rather than
++ * reusing the fast path above: ids are off by default and never on a hot path,
++ * so the default output must stay exactly as it was. */
++static void emit_with_ids(const char *s, va_list p, const char *strerr)
++{
++	char *body, *line;
++	const char *code;
++	int channel, n;
++
++	if (vasprintf(&body, s, p) < 0)
++		return;
++	channel = (strncmp(body, "warning", 7) == 0) ? 'W' : 'E';
++	code = bb_error_code;
++	if (!code)
++		code = bb_perror_errno ? code_for_errno(bb_perror_errno)
++		     : (channel == 'W' ? "WARN" : "FAILED");
++
++	/* stderr: the full message with the id in front of it */
++	n = asprintf(&line, "%s: %s: %s%s%s%s", applet_name, code, body,
++			strerr ? ": " : "", strerr ? strerr : "", msg_eol);
++	if (n >= 0) {
++		fflush_all();
++		full_write(STDERR_FILENO, line, (size_t)n);
++		free(line);
++	}
++	/* stdout: the id alone, so a reader never parses prose */
++	n = asprintf(&line, "%c %s\n", channel, code);
++	if (n >= 0) {
++		full_write(STDOUT_FILENO, line, (size_t)n);
++		free(line);
++	}
++	free(body);
++}
++
++/* A diagnostic id is enabled by the environment, so an applet symlink or a
++ * plain shell invocation gets it too. Looked up once. */
++void bb_error_ids_init(void)
++{
++	const char *v;
++
++	if (bb_error_ids)
++		return;
++	v = getenv("BUSYBOX_ERROR_IDS");
++	if (v && v[0] && strcmp(v, "0") != 0)
++		bb_error_ids = 1;
++}
++
+ void FAST_FUNC bb_verror_msg(const char *s, va_list p, const char* strerr)
+ {
+ 	char *msg, *msg1;
+@@ -26,6 +117,14 @@ void FAST_FUNC bb_verror_msg(const char *s, va_list p, const char* strerr)
+ 	if (!logmode)
+ 		return;
+ 
++	bb_error_ids_init();
++	if (bb_error_ids) {
++		emit_with_ids(s, p, strerr);
++		bb_perror_errno = 0;
++		bb_error_code = NULL;
++		return;
++	}
++
+ 	applet_len = strlen(applet_name) + 2; /* "applet: " */
+ 	strerr_len = strerr ? strlen(strerr) : 0;
+ 	msgeol_len = strlen(msg_eol);
 diff --git a/miscutils/waitfor.c b/miscutils/waitfor.c
 new file mode 100644
-index 0000000..4dd231e
+index 0000000..e828260
 --- /dev/null
 +++ b/miscutils/waitfor.c
-@@ -0,0 +1,468 @@
+@@ -0,0 +1,469 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * waitfor - bounded readiness polling.
@@ -2247,7 +2480,8 @@ index 0000000..4dd231e
 +	elapsed_ms = (long)((monotonic_us() - start) / 1000ULL);
 +
 +	if (o.json) {
-+		printf("{\"schema\":1,\"ready\":%s,\"kind\":\"%s\",\"target\":",
++		printf("{\"schema\":1,\"status\":\"%s\",\"ready\":%s,\"kind\":\"%s\",\"target\":",
++				ready ? "ok" : "error",
 +				ready ? "true" : "false",
 +				o.kind == 0 ? "file" : o.kind == 1 ? "tcp" :
 +				o.kind == 2 ? "unix" : o.kind == 4 ? "glob" :
@@ -2275,247 +2509,4 @@ index 0000000..4dd231e
 +	}
 +	fflush(stdout);
 +	return ready ? 0 : 3;
-+}
-diff --git a/miscutils/why.c b/miscutils/why.c
-new file mode 100644
-index 0000000..594f3ab
---- /dev/null
-+++ b/miscutils/why.c
-@@ -0,0 +1,237 @@
-+/* vi: set sw=4 ts=4: */
-+/*
-+ * why - explain why an applet is, or is not, in this build.
-+ *
-+ * Licensed under GPLv2, see file LICENSE in this source tree.
-+ */
-+//config:config WHY
-+//config:	bool "why (3 kb)"
-+//config:	default y
-+//config:	help
-+//config:	Explain an applet's build state: its CONFIG symbol, the value in a
-+//config:	.config, and the line in a prune list that disabled it.
-+
-+//applet:IF_WHY(APPLET(why, BB_DIR_USR_BIN, BB_SUID_DROP))
-+
-+//kbuild:lib-$(CONFIG_WHY) += why.o
-+
-+//usage:#define why_trivial_usage
-+//usage:       "[-C FILE] [-p FILE] APPLET..."
-+//usage:#define why_full_usage "\n\n"
-+//usage:       "Say whether APPLET is in this binary and which file decided that"
-+//usage:     "\n	-C, --config FILE	.config to read (default .config)"
-+//usage:     "\n	-p, --prune FILE	prune list to read (default prune/darwin-off.txt)"
-+//usage:     "\n	-F, --format FMT	text (default) or json"
-+
-+#include "libbb.h"
-+
-+/* add-shell -> ADD_SHELL, [ -> LBRACKET, [[ -> LBRACKET_LBRACKET */
-+static char *config_symbol(const char *name)
-+{
-+	char *out;
-+	size_t i, n = 0, len = strlen(name) + 8;
-+
-+	out = xmalloc(len);
-+	for (i = 0; name[i]; i++) {
-+		char c = name[i];
-+		if (c == '-')
-+			c = '_';
-+		else if (c == '+')
-+			c = 'P';       /* '+' is not valid in a symbol */
-+		else if (c == '[')
-+			c = (n == 0) ? 'L' : 'L';
-+		else if (c == ']')
-+			c = 'R';
-+		else if (c == '.')
-+			c = '_';
-+		else if (c >= 'a' && c <= 'z')
-+			c = (char)(c - 'a' + 'A');
-+		out[n++] = c;
-+	}
-+	out[n] = '\0';
-+	return out;
-+}
-+
-+/* Return a malloc'd "file:line: text" for the first match, else NULL. */
-+static char *find_line(const char *path, const char *needle)
-+{
-+	FILE *fp = fopen_for_read(path);
-+	char *line;
-+	unsigned lno = 0;
-+
-+	if (!fp)
-+		return NULL;
-+	while ((line = xmalloc_fgetline(fp)) != NULL) {
-+		char *hit;
-+
-+		lno++;
-+		hit = strstr(line, needle);
-+		if (hit) {
-+			char *res = xasprintf("%s:%u: %s", path, lno, line);
-+			free(line);
-+			fclose(fp);
-+			return res;
-+		}
-+		free(line);
-+	}
-+	fclose(fp);
-+	return NULL;
-+}
-+
-+/* "CONFIG_X is not set" / "CONFIG_X=y" in a .config */
-+static char *config_state(const char *path, const char *sym)
-+{
-+	FILE *fp = fopen_for_read(path);
-+	char *line;
-+	char *want_on;
-+	char *want_off;
-+	char *res = NULL;
-+
-+	if (!fp)
-+		return NULL;
-+	want_on = xasprintf("CONFIG_%s=", sym);
-+	want_off = xasprintf("# CONFIG_%s is not set", sym);
-+	while ((line = xmalloc_fgetline(fp)) != NULL) {
-+		if (strncmp(line, want_on, strlen(want_on)) == 0) {
-+			res = xasprintf("%s: %s", path, line);
-+			free(line);
-+			break;
-+		}
-+		if (strcmp(line, want_off) == 0) {
-+			res = xasprintf("%s: %s", path, line);
-+			free(line);
-+			break;
-+		}
-+		free(line);
-+	}
-+	fclose(fp);
-+	free(want_on);
-+	free(want_off);
-+	return res;
-+}
-+
-+static void json_str(const char *s)
-+{
-+	putchar('"');
-+	if (s) {
-+		for (; *s; s++) {
-+			unsigned char c = (unsigned char)*s;
-+			if (c == '"' || c == '\\') {
-+				putchar('\\');
-+				putchar(c);
-+			} else if (c == '\n') {
-+				fputs("\\n", stdout);
-+			} else if (c >= 0x20) {
-+				putchar(c);
-+			}
-+		}
-+	}
-+	putchar('"');
-+}
-+
-+int why_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
-+int why_main(int argc UNUSED_PARAM, char **argv)
-+{
-+	char *opt_cfg = NULL, *opt_prune = NULL, *opt_fmt = NULL;
-+	unsigned opts;
-+	int json = 0, idx = 0, rc = 0;
-+	const char *cfg, *prune;
-+	int first = 1;
-+
-+	static const char why_longopts[] ALIGN1 =
-+		"config\0" Required_argument "C"
-+		"prune\0"  Required_argument "p"
-+		"format\0" Required_argument "F"
-+		;
-+
-+	xfunc_error_retval = 2;
-+
-+	opts = getopt32long(argv, "C:p:F:", why_longopts,
-+			&opt_cfg, &opt_prune, &opt_fmt);
-+	(void)opts;
-+	argv += optind;
-+	if (!argv[0])
-+		bb_show_usage();
-+
-+	if (opt_fmt) {
-+		if (strcmp(opt_fmt, "json") == 0)
-+			json = 1;
-+		else if (strcmp(opt_fmt, "text") != 0)
-+			bb_error_msg_and_die("unknown format \"%s\"", opt_fmt);
-+	}
-+	cfg = opt_cfg ? opt_cfg : ".config";
-+	prune = opt_prune ? opt_prune : "prune/darwin-off.txt";
-+
-+	if (json)
-+		fputs("{\"schema\":1,\"results\":[", stdout);
-+
-+	for (; *argv; argv++, idx++) {
-+		char *sym = config_symbol(*argv);
-+		char *state = config_state(cfg, sym);
-+		char *pruned = find_line(prune, sym);
-+		int enabled = 0;
-+		const char *verdict;
-+		const char *reason;
-+
-+		if (state && strchr(state, '=')) {
-+			const char *eq = strrchr(state, '=');
-+			enabled = !(eq[1] == 'n' && eq[2] == '\0');
-+		}
-+		if (pruned) {
-+			verdict = "disabled";
-+			reason = "prune list";
-+			rc = 1;
-+		} else if (state && !enabled) {
-+			verdict = "disabled";
-+			reason = "config";
-+			rc = 1;
-+		} else if (state) {
-+			verdict = "enabled";
-+			reason = "config";
-+		} else {
-+			verdict = "unknown";
-+			reason = "no config entry";
-+			rc = 1;
-+		}
-+
-+		if (json) {
-+			if (!first)
-+				putchar(',');
-+			first = 0;
-+			fputs("{\"applet\":", stdout);
-+			json_str(*argv);
-+			fputs(",\"symbol\":", stdout);
-+			json_str(sym);
-+			fputs(",\"state\":", stdout);
-+			json_str(verdict);
-+			fputs(",\"decided_by\":", stdout);
-+			json_str(reason);
-+			fputs(",\"config_line\":", stdout);
-+			json_str(state);
-+			fputs(",\"prune_line\":", stdout);
-+			json_str(pruned);
-+			putchar('}');
-+		} else {
-+			printf("%s %s\n", verdict, *argv);
-+			printf("symbol=CONFIG_%s\n", sym);
-+			if (state)
-+				printf("config: %s\n", state);
-+			else
-+				printf("config: (no %s entry in %s)\n", sym, cfg);
-+			if (pruned)
-+				printf("prune: %s\n", pruned);
-+		}
-+		free(sym);
-+		free(state);
-+		free(pruned);
-+	}
-+	if (json) {
-+		/* one envelope for every applet: status first, code when it failed */
-+		printf("],\"status\":\"%s\"", rc ? "error" : "ok");
-+		if (rc)
-+			fputs(",\"code\":\"NOT_FOUND\"", stdout);
-+		fputs("}\n", stdout);
-+	}
-+	fflush(stdout);
-+	return rc;
 +}

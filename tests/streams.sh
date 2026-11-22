@@ -45,9 +45,12 @@ sec "1. a diagnostic goes to stderr for every applet that rejects an argument"
 
 # Applets whose stdout is shell code or data by design, and interpreters that
 # would block or run something: not part of the sweep.
-skip=" resize [ [[ ash hush sh vi ed sed awk less more telnet nc su login httpd
- crond inetd telnetd ftpd udhcpd udhcpc syslogd klogd watchdog getty chat
- adduser deluser passwd chpasswd "
+# Also skipped: applets that ignore an unknown argument and produce data or
+# write forever (`yes` produced 650 MB before its timeout), so they cannot be
+# swept this way.
+skip=" resize yes nologin [ [[ ash hush sh vi ed sed awk less more telnet nc su
+ login httpd crond inetd telnetd ftpd udhcpd udhcpc syslogd klogd watchdog getty
+ chat adduser deluser passwd chpasswd "
 
 swept=0
 bad=0
@@ -55,13 +58,17 @@ for a in $("$BB" --list); do
 	case "$skip" in
 	*" $a "*) continue ;;
 	esac
-	out=$("$BB" "$a" --nrs-bad-option-xyz </dev/null 2>/dev/null)
+	# Bounded to a file: an applet that ignores the argument can write a lot
+	# (or forever) before its timeout, and a shell variable would hold it all.
+	timeout 2 "$BB" "$a" --nrs-bad-option-xyz </dev/null >"$T/so" 2>/dev/null
 	rc=$?
 	swept=$((swept + 1))
-	if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && [ "$rc" -ne 137 ] && [ -n "$out" ]; then
+	if [ "$rc" -ne 0 ] && [ "$rc" -ne 124 ] && [ "$rc" -ne 137 ] && [ -s "$T/so" ]; then
 		bad=$((bad + 1))
-		printf '  stdout on rejection: %s (rc=%s): %s\n' "$a" "$rc" "$(printf '%s' "$out" | head -1 | cut -c1-60)"
+		printf '  stdout on rejection: %s (rc=%s): %s\n' "$a" "$rc" \
+			"$("$BB" head -1 "$T/so" | cut -c1-60)"
 	fi
+	rm -f "$T/so"
 done
 ck "no applet writes a diagnostic to stdout ($swept applets swept)" "0" "$bad"
 
@@ -130,7 +137,7 @@ sec "6. a warning keeps its own channel"
 
 printf 'one two\n' > w.txt
 run --error-ids od --width=0 w.txt
-ck "warning: W channel on stdout" "W WARN|" "$(ol)"
+ck "warning: W channel is the first stdout line" "W WARN" "$("$BB" head -1 "$T/o")"
 ck "warning: id in front of the message" "1" "$(grep -c 'od: WARN: warning: invalid width' "$T/e")"
 
 sec "7. machine-readable applets keep their code in the object, not in a second id"
@@ -153,7 +160,10 @@ ck "run json: codes is one line" "1" "$(wc -l < "$T/o" | cnt)"
 
 run run -F json -- "$BB" cat /nope
 ck "run without the flag has no codes key" "0" "$("$BB" grep -c '"codes"' "$T/o")"
-ck "run without the flag keeps the plain message" "1" "$("$BB" grep -c "NOT_FOUND" "$T/o")"
+ck "run without the flag: no id anywhere" "0" \
+	"$("$BB" grep -c 'NOT_FOUND' "$T/o" "$T/e" | "$BB" awk -F: '{s+=$2} END{print s+0}')"
+ck "run without the flag: the plain message survives" "1" \
+	"$("$BB" grep -c "can't open '/nope'" "$T/o" "$T/e" | "$BB" awk -F: '{s+=$2} END{print (s>0)?1:0}')"
 
 sec "9. ids are opt-in per invocation, not sticky"
 
