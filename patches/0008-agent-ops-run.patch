@@ -1,9 +1,9 @@
 diff --git a/coreutils/run.c b/coreutils/run.c
 new file mode 100644
-index 0000000..c58dbaa
+index 0000000..f8de7db
 --- /dev/null
 +++ b/coreutils/run.c
-@@ -0,0 +1,967 @@
+@@ -0,0 +1,1061 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * run - captured execution with retrievable evidence.
@@ -57,6 +57,7 @@ index 0000000..c58dbaa
 +//usage:     "\n	-c, --context N		Context around matches (default 3)"
 +//usage:     "\n	-s, --stream WHICH	stdout (default), stderr or both"
 +//usage:     "\n	-M, --meta		Print the run metadata only"
++//usage:     "\n	--diff R1:R2	Compare the stdout of two runs"
 +//usage:     "\n	-B, --max-bytes N	Output budget (default 12000)"
 +//usage:     "\n	-D, --dir PATH		Artifact root"
 +//usage:     "\n	-F, --format FMT	text (default) or json"
@@ -871,11 +872,87 @@ index 0000000..c58dbaa
 +	return 0;
 +}
 +
++/* log --diff R1:R2: compare two runs' stdout, line by line. */
++static int log_diff(const char *root, const char *spec, int json)
++{
++	char *colon = strchr(spec, ':');
++	char *a = NULL, *b = NULL, *pa, *pb, *sa, *sb;
++	size_t alen = 0, blen = 0;
++	unsigned line = 0, changed = 0, shown = 0;
++	char *spec2;
++
++	if (!colon || !colon[1])
++		bb_error_msg_and_die("--diff needs R1:R2");
++	spec2 = xstrdup(spec);
++	colon = strchr(spec2, ':');
++	*colon = '\0';
++
++	pa = art_path(xasprintf("%s/%s", root, spec2), "stdout");
++	pb = art_path(xasprintf("%s/%s", root, colon + 1), "stdout");
++	if (read_all(pa, &a, &alen) != 0 || read_all(pb, &b, &blen) != 0) {
++		if (json) {
++			fputs("{\"schema\":1,\"status\":\"error\",\"code\":\"NOT_FOUND\",\"message\":", stdout);
++			json_write_str("a run has no stdout artifact");
++			fputs("}\n", stdout);
++		} else {
++			fprintf(stderr, "%s: NOT_FOUND\n", a ? pb : pa);
++		}
++		free(a);
++		free(b);
++		free(spec2);
++		return 1;
++	}
++
++	if (json)
++		fputs("{\"schema\":1,\"status\":\"ok\",\"changes\":[", stdout);
++	sa = a;
++	sb = b;
++	while (*sa || *sb) {
++		char *ea = strchr(sa, '\n');
++		char *eb = strchr(sb, '\n');
++		size_t na = ea ? (size_t)(ea - sa) : strlen(sa);
++		size_t nb = eb ? (size_t)(eb - sb) : strlen(sb);
++
++		line++;
++		if (!(na == nb && memcmp(sa, sb, na) == 0)) {
++			changed++;
++			if (shown < 20) {
++				if (json) {
++					if (shown)
++						putchar(',');
++					printf("{\"line\":%u,\"a\":", line);
++					json_write_str(xasprintf("%.*s", (int)na, sa));
++					fputs(",\"b\":", stdout);
++					json_write_str(xasprintf("%.*s", (int)nb, sb));
++					putchar('}');
++				} else {
++					printf("line %u\n  - %.*s\n  + %.*s\n",
++							line, (int)na, sa, (int)nb, sb);
++				}
++				shown++;
++			}
++		}
++		if (!ea && !eb)
++			break;
++		sa = ea ? ea + 1 : sa + na;
++		sb = eb ? eb + 1 : sb + nb;
++	}
++	if (json)
++		printf("],\"lines\":%u,\"changed\":%u}\n", line, changed);
++	else
++		printf("lines=%u changed=%u\n", line, changed);
++	free(a);
++	free(b);
++	free(spec2);
++	return changed ? 1 : 0;
++}
++
 +int log_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
 +int log_main(int argc UNUSED_PARAM, char **argv)
 +{
 +	char *opt_lines = NULL, *opt_match = NULL, *opt_ctx = NULL;
 +	char *opt_stream = NULL, *opt_bytes = NULL, *opt_dir = NULL, *opt_fmt = NULL;
++	char *opt_diff = NULL;
 +	unsigned opts;
 +	const char *root, *run, *dir;
 +	long budget = DEFAULT_VIEW, ctx = DEFAULT_CONTEXT;
@@ -895,6 +972,21 @@ index 0000000..c58dbaa
 +
 +	xfunc_error_retval = 2;
 +
++	{
++		int i;
++
++		for (i = 1; argv[i]; i++) {
++			if (strcmp(argv[i], "--diff") == 0 && argv[i + 1]) {
++				int j;
++
++				opt_diff = argv[i + 1];
++				for (j = i; argv[j + 2]; j++)
++					argv[j] = argv[j + 2];
++				argv[j] = NULL;
++				break;
++			}
++		}
++	}
 +	opts = getopt32long(argv, "l:m:c:s:MB:D:F:", log_longopts,
 +			&opt_lines, &opt_match, &opt_ctx, &opt_stream,
 +			&opt_bytes, &opt_dir, &opt_fmt);
@@ -916,10 +1008,12 @@ index 0000000..c58dbaa
 +		first = strtol(opt_lines, NULL, 10);
 +		last = (colon && colon[1]) ? strtol(colon + 1, NULL, 10) : first;
 +	}
++	root = artifact_root(opt_dir);
++	if (opt_diff)
++		return log_diff(root, opt_diff, json);
 +	if (!argv[0])
 +		bb_show_usage();
 +	run = argv[0];                 /* was lost in the run.c rewrite */
-+	root = artifact_root(opt_dir);
 +	dir = xasprintf("%s/%s", root, run);
 +
 +	if (meta_only) {
