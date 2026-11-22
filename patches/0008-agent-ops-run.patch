@@ -1,6 +1,6 @@
 diff --git a/coreutils/run.c b/coreutils/run.c
 new file mode 100644
-index 0000000..6be2ee0
+index 0000000..6f52bef
 --- /dev/null
 +++ b/coreutils/run.c
 @@ -0,0 +1,1160 @@
@@ -1149,13 +1149,13 @@ index 0000000..6be2ee0
 +			fputs("{\"schema\":1,\"results\":[", stdout);
 +		if (both || strcmp(which, "stdout") == 0) {
 +			rc |= dump_stream(art_path(dir, "stdout"), "stdout", opt_match,
-+					first, last, ctx, budget, json && !both);
++					first, last, ctx, budget, json);
 +			if (both && json)
 +				putchar(',');
 +		}
 +		if (both || strcmp(which, "stderr") == 0)
 +			rc |= dump_stream(art_path(dir, "stderr"), "stderr", opt_match,
-+					first, last, ctx, budget, json && !both);
++					first, last, ctx, budget, json);
 +		if (json && both)
 +			fputs("]}\n", stdout);
 +		else if (json)

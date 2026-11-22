@@ -1,5 +1,5 @@
 #!/bin/bash
-# Behaviour suite for the brief applet (patch 0012).
+# Behaviour suite for the brief applet (patch 0014).
 #
 #   ./tests/brief.sh dist/darwin-arm64/bin/busybox
 #   docker run --rm -v "$PWD:/w:ro" almalinux:9 bash /w/tests/brief.sh \
