@@ -1,9 +1,9 @@
 diff --git a/coreutils/run.c b/coreutils/run.c
 new file mode 100644
-index 0000000..b16fa71
+index 0000000..02978f8
 --- /dev/null
 +++ b/coreutils/run.c
-@@ -0,0 +1,955 @@
+@@ -0,0 +1,956 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * run - captured execution with retrievable evidence.
@@ -907,6 +907,7 @@ index 0000000..b16fa71
 +	}
 +	if (!argv[0])
 +		bb_show_usage();
++	run = argv[0];                 /* was lost in the run.c rewrite */
 +	root = artifact_root(opt_dir);
 +	dir = xasprintf("%s/%s", root, run);
 +
