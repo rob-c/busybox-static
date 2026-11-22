@@ -515,7 +515,8 @@ sec "24. invariant and exit status: 3 binary corpora x 14 option sets"
 for corpus in c1 c2 c3; do
 	for opts in "" "-d" "-s" "-k error" "-s -a 8" "-d -a 2" "-n 1" "-n 3 -s" \
 		"-B 1" "-B 100" "-f 1" "-f 2,4" "-S , -f 1,2" "-f 1 -k A" \
-		"-c 1" "-c 2 -f 1" "-t 3" "-m 2" "-q" "-s -c 1" "-c 1 -m 3 -t 2"; do
+		"-c 1" "-c 2 -f 1" "-t 3" "-m 2" "-q" "-s -c 1" "-c 1 -m 3 -t 2" \
+		"-o e" "-x e" "-o e -x b" "-R e" "-R e -d" "-R e -a 2 -B 60"; do
 		# shellcheck disable=SC2086
 		"$BB" brief $opts "$T/$corpus" > "$T/o" 2>/dev/null
 		ck "exit 0 [$corpus $opts]" "0" "$?"
@@ -776,6 +777,104 @@ ck "json bare is false here" "1" "$("$BB" grep -c '"bare":false' "$T/j")"
 ck "json first item is the 3x record" "1" \
 	"$("$BB" grep -c '"items":\[{"n":3,' "$T/j")"
 ck "json schema is still 1" "1" "$("$BB" sed -n 's/.*"schema":\([0-9]*\).*/\1/p' "$T/j")"
+
+sec "36. -o / -x: selection without a format registry"
+
+printf '%s\n' "ok line" "src/a.c:1: error: bad" "warning: unused" "fine" > sel.txt
+"$BB" brief -o error sel.txt > "$T/o" 2>/dev/null
+ck "-o keeps the matching record" "src/a.c:1: error: bad" "$(body "$T/o" "$T/b"; "$BB" sed -n '1p' "$T/b")"
+ck "-o counts what it did not match" "3" "$(mfo dropped_lines < "$T/o")"
+ck "-o matched count" "1" "$(mfo matched < "$T/o")"
+inv "-o: invariant" "$T/o"
+
+"$BB" brief -o error -o warning sel.txt > "$T/o" 2>/dev/null
+ck "-o repeats as OR" "2" "$(mfo matched < "$T/o")"
+ck "-o OR shows both" "2" "$(body "$T/o" "$T/b"; "$BB" grep -c -e error -e warning "$T/b")"
+inv "-o OR: invariant" "$T/o"
+
+"$BB" brief -o error -x bad sel.txt > "$T/o" 2>/dev/null
+ck "-x subtracts from -o" "0" "$(mfo matched < "$T/o")"
+ck "-x leaves an empty body" "0" "$(mfo shown_lines < "$T/o")"
+inv "-o -x: invariant" "$T/o"
+
+"$BB" brief -o zzznomatch sel.txt > "$T/o" 2>/dev/null
+ck "-o with no match exits 0" "0" "$?"
+ck "-o with no match matched=0" "0" "$(mfo matched < "$T/o")"
+inv "-o no match: invariant" "$T/o"
+
+# selection then counting: the failures of any tool, counted
+printf '%s\n' "a.c:1: error: bad" "a.c:9: error: bad" "b.c:2: error: bad" > cnt.txt
+"$BB" brief -o error -s -t 3 cnt.txt > "$T/o" 2>/dev/null
+ck "-o -s counts by shape" "2x a.c:1: error: bad" "$(body "$T/o" "$T/b"; "$BB" sed -n '1p' "$T/b")"
+ck "-o -s keeps the other group" "2" "$(mfo shown_groups < "$T/o")"
+inv "-o -s -t: invariant" "$T/o"
+
+printf 'x\000y error z\nplain\n' > "$T/fx"
+printf 'x\000y error z\n' > "$T/exp"
+"$BB" brief -o error "$T/fx" > "$T/o" 2>/dev/null
+byteck "-o over a NUL record" "$T/exp" "$T/o"
+
+sec "37. -R: a record is many lines"
+
+{
+	printf 'banner line\n'
+	printf 'commit aaa\nAuthor: X\n    message one\n'
+	printf 'commit bbb\nAuthor: Y\n    message two\n'
+	printf 'commit aaa\nAuthor: X\n    message one\n'
+} > sec.txt
+"$BB" brief -R commit sec.txt > "$T/o" 2>/dev/null
+ck "-R counts records, not lines" "4" "$(mfo records < "$T/o")"
+ck "-R keeps the prologue as one record" "1" "$(body "$T/o" "$T/b"; "$BB" grep -c '^banner line' "$T/b")"
+ck "-R without -d merges nothing" "0" "$(mfo merged < "$T/o")"
+ck "-R shows every line it read" "10" "$(mfo shown_lines < "$T/o")"
+inv "-R: invariant" "$T/o"
+
+"$BB" brief -R commit -d sec.txt > "$T/o" 2>/dev/null
+ck "-R -d merges identical sections" "2x commit aaa" "$(body "$T/o" "$T/b"; "$BB" sed -n '2p' "$T/b")"
+ck "-R -d records" "3" "$(mfo records < "$T/o")"
+inv "-R -d: invariant" "$T/o"
+
+# a record is shown whole or not at all: no half a commit
+"$BB" brief -R commit -B 40 sec.txt > "$T/o" 2>/dev/null
+ck "-B 40 shows the banner only" "1" "$(mfo shown_lines < "$T/o")"
+ck "-B 40 shows no partial record" "1x banner line" \
+	"$(body "$T/o" "$T/b"; "$BB" grep -c commit "$T/b")"
+inv "-R tight budget: invariant" "$T/o"
+ck "-R tight budget truncates" "1" "$(mfo truncated < "$T/o")"
+
+# a record too big for any budget is dropped, and must not hide later ones
+"$BB" brief -R commit -B 26 sec.txt > "$T/o" 2>/dev/null
+ck "-R unshowable banner does not hide the rest" "1" "$(mfo shown_groups < "$T/o")"
+inv "-R unshowable: invariant" "$T/o"
+
+printf 'x1\nsame\nx2\nsame\nx3\nsame\n' > "$T/fx"
+printf 'x1\nsame\nx2\nsame\nx3\nsame\n' > "$T/exp"
+"$BB" brief -R same -q "$T/fx" > "$T/o" 2>/dev/null
+byteck "-R -q prints the records bare" "$T/exp" "$T/o"
+
+# -o selects a whole record when any of its lines matches
+printf 'head\nA\000B 1\nbody\nA\000B 2\n' > "$T/fx"
+printf 'A\000B 2\n' > "$T/exp"
+"$BB" brief -R A -o 2 "$T/fx" > "$T/o" 2>/dev/null
+byteck "-R selects a whole record by any of its lines" "$T/exp" "$T/o"
+
+printf 'x1\nx2\nx3\n' > "$T/fx"
+"$BB" brief -R x "$T/fx" > "$T/o" 2>/dev/null
+ck "-R matching every line is line mode" "3" "$(mfo records < "$T/o")"
+inv "-R every line: invariant" "$T/o"
+
+sec "38. the marker measures the call"
+
+"$BB" brief -d -c 1 -t 2 -R needlenope errs.txt > "$T/o" 2>/dev/null
+ck "in_bytes is the input size" "$(wc -c < errs.txt | cnt)" "$(mfo in_bytes < "$T/o")"
+ck "bytes is smaller than in_bytes here" "1" \
+	"$("$BB" awk -v a="$(mfo bytes < "$T/o")" -v b="$(mfo in_bytes < "$T/o")" 'BEGIN{print (a<b)}')"
+ck "record_start is echoed in json" "1" \
+	"$("$BB" brief -R commit -F json sec.txt 2>/dev/null | "$BB" grep -c '"record_start":"commit"')"
+ck "record_start null without -R" "1" \
+	"$("$BB" brief -F json errs.txt 2>/dev/null | "$BB" grep -c '"record_start":null')"
+ck "json item carries its line count" "1" \
+	"$("$BB" brief -R commit -F json sec.txt 2>/dev/null | "$BB" grep -c '"lines":3')"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

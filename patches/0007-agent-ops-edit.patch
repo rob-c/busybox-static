@@ -1,9 +1,9 @@
 diff --git a/editors/replace.c b/editors/replace.c
 new file mode 100644
-index 0000000..efff0db
+index 0000000..688be30
 --- /dev/null
 +++ b/editors/replace.c
-@@ -0,0 +1,845 @@
+@@ -0,0 +1,857 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * replace - guarded, all-or-nothing literal file editing.
@@ -89,6 +89,7 @@ index 0000000..efff0db
 +	unsigned ncand;
 +	char old_ver[65];
 +	char new_ver[65];
++	size_t sha_prefix_len;   /* >0 when --sha256 was given as a prefix */
 +	int changed;
 +	struct sb diff;
 +};
@@ -439,7 +440,18 @@ index 0000000..efff0db
 +	}
 +	sha256_hex(data, len, o->old_ver);
 +
-+	if (e->has_sha && strcasecmp(e->sha256, o->old_ver) != 0) {
++	if (e->has_sha) {
++		size_t sl = strlen(e->sha256);
++
++		/* A short hash is a prefix: peek prints the first 12 hex digits. */
++		if (sl < 64)
++			o->sha_prefix_len = sl;
++	}
++	if (e->has_sha
++	 && (o->sha_prefix_len
++	     ? strncasecmp(e->sha256, o->old_ver, o->sha_prefix_len) != 0
++	     : strcasecmp(e->sha256, o->old_ver) != 0)
++	) {
 +		o->code = (char *)"STALE_INPUT";
 +		o->msg = xasprintf("content version is sha256:%s", o->old_ver);
 +		goto fail;
