@@ -1,9 +1,9 @@
 diff --git a/miscutils/brief.c b/miscutils/brief.c
 new file mode 100644
-index 0000000..46fa9ca
+index 0000000..a247196
 --- /dev/null
 +++ b/miscutils/brief.c
-@@ -0,0 +1,646 @@
+@@ -0,0 +1,766 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * brief - structure-preserving reduction of line-oriented tool output.
@@ -19,6 +19,15 @@ index 0000000..46fa9ca
 + * because libbb's xmalloc_fgetline() splits on NUL - see
 + * docs/instructions/brief-a-generic-record-reducing-filter-that-never-edits-a-line.md
 + *
++ * One table produces two kinds of view, and the accounting is the same for
++ * both. A *reduction* (-d, -s) shows every distinct record once, in the order
++ * it first appeared. An *aggregation* (-c, with -t and -m) shows one record
++ * per distinct value of the selected fields, and can order by count. The
++ * reduction is what you read; the aggregation is what you count with, and it
++ * is the view that answers "what repeats here", which is the question a
++ * reader asks first and the one a pipeline of cut/sort/uniq answers with four
++ * forks and no byte-exactness. Both obey the same invariant.
++ *
 + * Licensed under GPLv2, see file LICENSE in this source tree.
 + */
 +//config:config BRIEF
@@ -30,18 +39,25 @@ index 0000000..46fa9ca
 +//config:	  grouped and counted, caller-declared salient lines are kept
 +//config:	  verbatim, and every reduction is reported on a marker line.
 +//config:	  Input is byte-exact: NULs inside a line are data, not separators.
++//config:	  With -c it also aggregates: one record per distinct value of the
++//config:	  chosen fields, which -t orders by count and -m filters.
 +
 +//applet:IF_BRIEF(APPLET_NOEXEC(brief, brief_main, BB_DIR_USR_BIN, BB_SUID_DROP, brief))
 +
 +//kbuild:lib-$(CONFIG_BRIEF) += brief.o
 +
 +//usage:#define brief_trivial_usage
-+//usage:       "[-ds] [-k STR] [-f LIST] [-S SEP] [-B BYTES] [-n N] [-a N] [-F FMT] [FILE]..."
++//usage:       "[-dsq] [-c LIST] [-t N] [-m N] [-k STR] [-f LIST] [-S SEP]"
++//usage:       " [-B BYTES] [-n N] [-a N] [-F FMT] [FILE]..."
 +//usage:#define brief_full_usage "\n\n"
 +//usage:       "Reduce line-oriented output to a bounded view, preserving every byte shown"
 +//usage:     "\n"
 +//usage:     "\n	-d	Group identical lines and count them"
 +//usage:     "\n	-s	Group lines equal after masking digits (implies -d)"
++//usage:     "\n	-c LIST	Group by these fields (1,3-4) and show them"
++//usage:     "\n	-t N	Order groups by count, highest first (implies -d)"
++//usage:     "\n	-m N	Show only groups seen at least N times (implies -d)"
++//usage:     "\n	-q	Bare records: no \"Nx \" and no \"+ \" prefix"
 +//usage:     "\n	-k STR	Keep lines containing STR verbatim, never merged"
 +//usage:     "\n	-f LIST	Show only these 1-based fields (1,3-4); input may be reformatted"
 +//usage:     "\n	-S SEP	Join -f fields with SEP (default: one space)"
@@ -54,10 +70,17 @@ index 0000000..46fa9ca
 +//usage:     "\nwith a \"+ \" prefix so they cannot be read as repeats."
 +//usage:     "\n"
 +//usage:     "\nGrouping is on the original line, so -f can never merge two"
-+//usage:     "\nrecords that differ only outside the shown fields."
++//usage:     "\nrecords that differ only outside the shown fields. -c groups on"
++//usage:     "\nthe projected line instead, which is what makes it an aggregate."
 +//usage:     "\n"
 +//usage:     "\nRecords are bytes: an embedded NUL is kept, not treated as a line"
 +//usage:     "\nbreak, and the marker reports nul=<n> when any record held one."
++//usage:     "\n"
++//usage:     "\n-c is the aggregation: \"brief -c 2 -t 10\" is the ten commonest"
++//usage:     "\nvalues of field 2, with their counts, from one process and no"
++//usage:     "\nforks. -m drops the singletons that make a first page useless."
++//usage:     "\n-q prints the reduced records themselves, so the output can be"
++//usage:     "\npiped into grep and still match the input byte for byte."
 +
 +#include "libbb.h"
 +
@@ -74,6 +97,10 @@ index 0000000..46fa9ca
 +	OPT_n = (1 << 6),
 +	OPT_a = (1 << 7),
 +	OPT_F = (1 << 8),
++	OPT_c = (1 << 9),
++	OPT_t = (1 << 10),
++	OPT_m = (1 << 11),
++	OPT_q = (1 << 12),
 +};
 +
 +static const char brief_longopts[] ALIGN1 =
@@ -86,6 +113,10 @@ index 0000000..46fa9ca
 +	"max-records\0" Required_argument "n"
 +	"samples\0" Required_argument "a"
 +	"format\0"  Required_argument "F"
++	"count-by\0" Required_argument "c"
++	"top\0"     Required_argument "t"
++	"min-count\0" Required_argument "m"
++	"bare\0"    No_argument       "q"
 +	;
 +
 +struct fw {
@@ -394,6 +425,21 @@ index 0000000..46fa9ca
 +	return it;
 +}
 +
++/* -t: order by count, highest first; ties keep first-appearance order so the
++ * output is deterministic and the budget is spent on the repeated records
++ * instead of on whatever happened to arrive first. */
++static int cmp_by_count(const void *pa, const void *pb)
++{
++	unsigned ia = *(const unsigned *)pa;
++	unsigned ib = *(const unsigned *)pb;
++	unsigned ca = items[ia].count;
++	unsigned cb = items[ib].count;
++
++	if (ca != cb)
++		return ca > cb ? -1 : 1;
++	return ia < ib ? -1 : (ia > ib);
++}
++
 +static int mem_contains(const char *h, size_t hn, const char *n)
 +{
 +	size_t nn = strlen(n), i;
@@ -416,14 +462,17 @@ index 0000000..46fa9ca
 +{
 +	const char *opt_keep = NULL, *opt_fields = NULL, *opt_sep = NULL;
 +	const char *opt_bytes = NULL, *opt_recs = NULL, *opt_samples = NULL;
-+	const char *opt_fmt = NULL;
-+	struct fw fr[BRIEF_MAX_FRANGES];
-+	unsigned nfr = 0, i;
++	const char *opt_fmt = NULL, *opt_countby = NULL;
++	const char *opt_top = NULL, *opt_min = NULL;
++	struct fw fr[BRIEF_MAX_FRANGES], cbfr[BRIEF_MAX_FRANGES];
++	unsigned nfr = 0, ncb = 0, i, oi;
 +	unsigned budget = 8000, max_recs = 2000, max_samples = 1;
-+	int dedupe, skeleton, json_out;
++	unsigned top_n = 0, min_count = 1;
++	int dedupe, skeleton, json_out, bare;
 +	unsigned lines_in = 0, lines_shown = 0, lines_merged = 0;
 +	unsigned kept = 0, dropped_records = 0, dropped_lines = 0;
-+	unsigned nul_lines = 0;
++	unsigned nul_lines = 0, shown_groups = 0, projected = 0;
++	unsigned *order;
 +	char *body = NULL;
 +	size_t body_len = 0;
 +	int truncated = 0;
@@ -431,9 +480,10 @@ index 0000000..46fa9ca
 +	unsigned flags;
 +
 +	xfunc_error_retval = 2; /* usage errors, until input is opened */
-+	flags = getopt32long(argv, "dsk:f:S:B:n:a:F:", brief_longopts,
++	flags = getopt32long(argv, "dsk:f:S:B:n:a:F:c:t:m:q", brief_longopts,
 +			&opt_keep, &opt_fields, &opt_sep,
-+			&opt_bytes, &opt_recs, &opt_samples, &opt_fmt);
++			&opt_bytes, &opt_recs, &opt_samples, &opt_fmt,
++			&opt_countby, &opt_top, &opt_min);
 +	argv += optind;
 +
 +	if (opt_bytes)
@@ -454,8 +504,26 @@ index 0000000..46fa9ca
 +		bb_error_msg("unknown format %s", opt_fmt);
 +		return 2;
 +	}
++	if (opt_countby) {
++		ncb = parse_fields(opt_countby, cbfr);
++		if (!ncb)
++			return xfunc_error_retval;
++	}
++	if (opt_top)
++		top_n = xatoul_range(opt_top, 1, INT_MAX);
++	if (opt_min)
++		min_count = xatoul_range(opt_min, 1, INT_MAX);
++	bare = (flags & OPT_q) != 0;
++	/* -c decides grouping and, unless -f says otherwise, display: a caller
++	 * can aggregate on one field and print another. */
++	if (!nfr && ncb) {
++		memcpy(fr, cbfr, sizeof(cbfr[0]) * ncb);
++		nfr = ncb;
++	}
 +	skeleton = (flags & OPT_s) != 0;
-+	dedupe = skeleton || (flags & OPT_d) != 0;
++	/* -c, -t and -m are grouping requests in their own right: asking for an
++	 * aggregate without -d must not silently produce a pass-through. */
++	dedupe = skeleton || (flags & OPT_d) != 0 || ncb || top_n || min_count > 1;
 +
 +	xfunc_error_retval = 1;
 +
@@ -501,8 +569,20 @@ index 0000000..46fa9ca
 +			}
 +			if (dedupe) {
 +				size_t keylen = 0;
-+				char *key = norm_key(line, len, skeleton, &keylen);
++				char *key;
 +
++				if (ncb) {
++					/* -c: equality is on the projected record, so two
++					 * lines that differ only outside the counted fields
++					 * belong to the same group - which is the point. */
++					struct sbuf kb = { 0 };
++
++					project_into(&kb, line, len, cbfr, ncb, opt_sep);
++					key = norm_key(kb.p ? kb.p : "", kb.len, skeleton, &keylen);
++					free(kb.p);
++				} else {
++					key = norm_key(line, len, skeleton, &keylen);
++				}
 +				it = item_find(key, keylen, nitems < max_recs);
 +				free(key);
 +				if (!it) {
@@ -546,25 +626,40 @@ index 0000000..46fa9ca
 +			break;          /* last named file done */
 +	}
 +
-+	for (i = 0; i < nitems; i++) {
-+		struct item *it = &items[i];
++	/* The table's own order unless -t asked for a frequency order. */
++	order = xmalloc((nitems ? nitems : 1) * sizeof(order[0]));
++	for (i = 0; i < nitems; i++)
++		order[i] = i;
++	if (top_n && nitems > 1)
++		qsort(order, nitems, sizeof(order[0]), cmp_by_count);
++
++	for (oi = 0; oi < nitems; oi++) {
++		struct item *it = &items[order[oi]];
 +		unsigned k, emitted;
 +
++		/* -m: below the threshold the group is not a record at all */
++		if (it->count < min_count) {
++			dropped_records++;
++			dropped_lines += it->count;
++			continue;
++		}
 +		it->shown = 1;
 +		emitted = 0;
 +		for (k = 0; k < it->nsmp; k++) {
 +			struct sbuf line = { 0 };
 +			size_t shown_len;
 +
-+			if (it->count > 1 && k == 0) {
-+				char num[32];
++			if (!bare) {
++				if (it->count > 1 && k == 0) {
++					char num[32];
 +
-+				/* ASCII, so the output survives any locale: "3x line" */
-+				sprintf(num, "%ux ", it->count);
-+				sb_addstr(&line, num);
-+			} else if (k > 0) {
-+				/* another variant of the same group, not a repeat */
-+				sb_addstr(&line, "+ ");
++					/* ASCII, so the output survives any locale: "3x line" */
++					sprintf(num, "%ux ", it->count);
++					sb_addstr(&line, num);
++				} else if (k > 0) {
++					/* another variant of the same group, not a repeat */
++					sb_addstr(&line, "+ ");
++				}
 +			}
 +			if (nfr)
 +				project_into(&line, it->smp[k].p, it->smp[k].n, fr, nfr, opt_sep);
@@ -584,20 +679,35 @@ index 0000000..46fa9ca
 +			body[body_len++] = '\n';
 +			free(line.p);
 +			lines_shown++;
++			if (nfr)
++				projected++;
 +			emitted++;
 +		}
 +		/* Invariant: lines_in == lines_shown + lines_merged + dropped_lines.
 +		 * A record counts as merged only for the occurrences it did not
 +		 * display, so -a cannot double-count them. */
-+		if (it->shown && it->count > emitted)
-+			lines_merged += it->count - emitted;
-+		if (!it->shown) {
-+			/* this and every later record is unshown */
-+			for (; i < nitems; i++)
-+				dropped_lines += items[i].count;
-+			dropped_records += nitems - i;
-+			break;
++		if (it->shown) {
++			shown_groups++;
++			if (it->count > emitted)
++				lines_merged += it->count - emitted;
++			continue;
 +		}
++		/* The budget is spent. Occurrences of THIS group that were not
++		 * printed are merges into the record that was printed; everything
++		 * after it in the chosen order is dropped whole. Adding the whole
++		 * count here, as this loop once did, double-counted a group that -a
++		 * had already started printing. */
++		if (emitted) {
++			shown_groups++;
++			lines_merged += it->count - emitted;
++			dropped_records += nitems - oi - 1;
++		} else {
++			dropped_lines += it->count;
++			dropped_records += nitems - oi;
++		}
++		for (i = oi + 1; i < nitems; i++)
++			dropped_lines += items[order[i]].count;
++		break;
 +	}
 +
 +	if (json_out) {
@@ -607,13 +717,21 @@ index 0000000..46fa9ca
 +				"\"lines_shown\":%u,\"lines_merged\":%u,"
 +				"\"dropped_records\":%u,\"dropped_lines\":%u,"
 +				"\"nul_lines\":%u,\"bytes\":%u,\"truncated\":%s,\"fields\":%s,"
-+				"\"items\":[",
++				"\"shown_groups\":%u,\"projected\":%u,\"bare\":%s,"
++				"\"top\":%u,\"min_count\":%u,\"grouped_by\":",
 +				lines_in, nitems, kept, lines_shown, lines_merged,
 +				dropped_records, dropped_lines, nul_lines, (unsigned)body_len,
 +				truncated ? "true" : "false",
-+				nfr ? "true" : "false");
-+		for (i = 0; i < nitems; i++) {
-+			struct item *it = &items[i];
++				nfr ? "true" : "false",
++				shown_groups, projected, bare ? "true" : "false",
++				top_n, min_count);
++		if (ncb)
++			put_json_str(opt_countby, strlen(opt_countby));
++		else
++			fputs("null", stdout);
++		fputs(",\"items\":[", stdout);
++		for (oi = 0; oi < nitems; oi++) {
++			struct item *it = &items[order[oi]];
 +			unsigned k;
 +
 +			if (!it->shown)
@@ -641,10 +759,12 @@ index 0000000..46fa9ca
 +		 * whole output. */
 +		printf("[brief] lines_in=%u records=%u kept=%u shown_lines=%u"
 +				" merged=%u dropped_records=%u dropped_lines=%u"
-+				" nul=%u bytes=%u truncated=%d\n",
++				" nul=%u bytes=%u truncated=%d shown_groups=%u projected=%u"
++				" bare=%d top=%u min=%u\n",
 +				lines_in, nitems, kept, lines_shown,
 +				lines_merged, dropped_records, dropped_lines,
-+				nul_lines, (unsigned)body_len, truncated);
++				nul_lines, (unsigned)body_len, truncated,
++				shown_groups, projected, bare, top_n, min_count);
 +		if (body && body_len)
 +			fwrite(body, 1, body_len, stdout);
 +	}

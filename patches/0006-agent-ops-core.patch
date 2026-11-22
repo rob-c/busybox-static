@@ -1,9 +1,9 @@
 diff --git a/coreutils/peek.c b/coreutils/peek.c
 new file mode 100644
-index 0000000..8f57751
+index 0000000..52edd5f
 --- /dev/null
 +++ b/coreutils/peek.c
-@@ -0,0 +1,919 @@
+@@ -0,0 +1,1001 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * peek - bounded, numbered and versioned file reads.
@@ -692,6 +692,79 @@ index 0000000..8f57751
 +	return same ? 0 : 1;
 +}
 +
++/* peek --follow SECS: bounded equivalent of tail -f, driven by fstat only. */
++static int peek_follow(const char *path, long from, size_t budget,
++		long seconds, int json)
++{
++	char *buf = xmalloc(4096);
++	struct stat st;
++	size_t total = 0, emitted = 0;
++	long left = seconds * 1000;
++	int fd;
++
++	fd = open(path, O_RDONLY);
++	if (fd < 0) {
++		if (json) {
++			fputs("{\"schema\":1,\"status\":\"error\",\"code\":\"NOT_FOUND\",\"message\":", stdout);
++			json_member_str("message", strerror(errno));
++			fputs("}\n", stdout);
++		} else {
++			fprintf(stderr, "peek: %s: %s\n", path, strerror(errno));
++		}
++		free(buf);
++		return 1;
++	}
++	if (from < 0)
++		from = 0;
++	if (lseek(fd, from, SEEK_SET) < 0)
++		from = 0;
++
++	for (;;) {
++		ssize_t n;
++
++		while (emitted < budget
++		    && (n = safe_read(fd, buf, 4096)) > 0
++		) {
++			size_t take = n;
++
++			if (take > budget - emitted)
++				take = budget - emitted;
++			fwrite(buf, 1, take, stdout);
++			emitted += take;
++			total += n;
++		}
++		if (emitted >= budget || left <= 0)
++			break;
++		if (fstat(fd, &st) == 0 && (off_t)(from + total) <= st.st_size) {
++			usleep(50 * 1000);
++			left -= 50;
++			continue;
++		}
++		{
++			/* grew: loop reads it on the next pass */
++			struct timespec ts = { 0, 50 * 1000 * 1000 };
++
++			nanosleep(&ts, NULL);
++			left -= 50;
++		}
++	}
++	close(fd);
++	if (json) {
++		fputs("\n{\"schema\":1,", stdout);
++		json_member_str("path", path);
++		printf(",\"status\":\"ok\",\"from_byte\":%ld,\"to_byte\":%ld,"
++				"\"emitted\":%u,\"truncated\":%s}\n",
++				from, from + (long)total, (unsigned)emitted,
++				emitted >= budget ? "true" : "false");
++	} else {
++		printf("followed=%u from_byte=%ld to_byte=%ld truncated=%s\n",
++				(unsigned)emitted, from, from + (long)total,
++				emitted >= budget ? "true" : "false");
++	}
++	free(buf);
++	return 0;
++}
++
 +int peek_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
 +int peek_main(int argc UNUSED_PARAM, char **argv)
 +{
@@ -704,6 +777,7 @@ index 0000000..8f57751
 +	char *opt_fmt = NULL;
 +	char *opt_req = NULL;
 +	char *opt_diff = NULL;
++	char *opt_follow = NULL;
 +	unsigned opts;
 +	int json = 0;
 +	int regex_mode = 0;
@@ -725,14 +799,15 @@ index 0000000..8f57751
 +		"preview\0"    No_argument       "p"
 +		"format\0"     Required_argument "f"
 +		"diff\0"       Required_argument "d"
++		"follow\0"     Required_argument "w"
 +		;
 +
 +	xfunc_error_retval = 2;   /* usage errors exit 2 */
 +
-+	opts = getopt32long(argv, "l:a:c:rF:B:M:R:pf:d:",
++	opts = getopt32long(argv, "l:a:c:rF:B:M:R:pf:d:w:",
 +			peek_longopts, &opt_lines, &opt_around, &opt_ctx,
 +			&opt_from, &opt_budget, &opt_maxfile, &opt_req,
-+			&opt_fmt, &opt_diff);
++			&opt_fmt, &opt_diff, &opt_follow);
 +	(void)opts;
 +	argv += optind;
 +
@@ -754,6 +829,13 @@ index 0000000..8f57751
 +	out.json = json;
 +	out.budget = budget;
 +
++	if (opt_follow && !opt_req) {
++		if (!argv[0])
++			bb_show_usage();
++		fflush_stdout_and_exit(peek_follow(argv[0],
++				opt_from ? strtol(opt_from, NULL, 10) : 0,
++				budget, strtol(opt_follow, NULL, 10), json));
++	}
 +	if (opt_diff && !opt_req) {
 +		if (!argv[0])
 +			bb_show_usage();

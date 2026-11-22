@@ -40,7 +40,7 @@ rc() { "$@" > "$T/out" 2> "$T/err"; echo $?; }
 is_ok_code() { case "$1" in 0|1|2|3) echo 1 ;; *) echo 0 ;; esac; }
 ckrc() { ck "$1" "1" "$(is_ok_code "$2")"; }
 # field from a one-line text marker or JSON object
-tf() { "$BB" sed -n "1{s/^/ /;s/.* $1=\([^ ]*\).*/\1/p;q;}" "$2"; }
+tf() { "$BB" sed -n "s/^/ /;s/.* $1=\([^ ]*\).*/\1/p" "$2" | "$BB" head -1; }
 jv() { "$BB" sed -n "s/.*\"$1\":\([^,}]*\).*/\1/p" "$2" | "$BB" head -1; }
 # eqfield <name> <field> <short args> <long args>: same extracted field+status
 # (for applets whose output carries a run id, duration or path)
@@ -532,6 +532,22 @@ for a in $APPS column; do
 	# a control byte in an argument must not crash
 	r=$(rc "$BB" "$a" "$("$BB" printf 'a\001b')")
 	ck "control byte arg is safe [$a]" "1" "$([ "$r" -lt 124 ] && echo 1)"
+done
+
+
+sec "18. presence, listing and the contract surface"
+for a in $APPS column; do
+	ck "listed by --list [$a]" "1" "$("$BB" --list | "$BB" grep -qx "$a" && echo 1)"
+	ck "--list --full describes it [$a]" "1" "$("$BB" --list-full | "$BB" grep -q "$a" && echo 1)"
+done
+for f in $FIXTURES; do
+	r=$(rc "$BB" brief -s -k a "$FX/$f")
+	ck "brief -s -k combined rc [$f]" "0" "$r"
+	li=$(tf lines_in "$T/out"); sh=$(tf shown_lines "$T/out")
+	mg=$(tf merged "$T/out"); dl=$(tf dropped_lines "$T/out")
+	ck "brief -s -k invariant [$f]" "$li" "$((sh + mg + dl))"
+	r=$(rc "$BB" peek -l 1:1 -B 1 "$FX/$f")
+	ckrc "peek -B 1 rc [$f]" "$r"
 done
 
 printf '\n%d passed, %d failed, %d skipped\n' "$pass" "$fail" "$skips"
