@@ -514,7 +514,8 @@ sec "24. invariant and exit status: 3 binary corpora x 14 option sets"
 
 for corpus in c1 c2 c3; do
 	for opts in "" "-d" "-s" "-k error" "-s -a 8" "-d -a 2" "-n 1" "-n 3 -s" \
-		"-B 1" "-B 100" "-f 1" "-f 2,4" "-S , -f 1,2" "-f 1 -k A"; do
+		"-B 1" "-B 100" "-f 1" "-f 2,4" "-S , -f 1,2" "-f 1 -k A" \
+		"-c 1" "-c 2 -f 1" "-t 3" "-m 2" "-q" "-s -c 1" "-c 1 -m 3 -t 2"; do
 		# shellcheck disable=SC2086
 		"$BB" brief $opts "$T/$corpus" > "$T/o" 2>/dev/null
 		ck "exit 0 [$corpus $opts]" "0" "$?"
@@ -660,6 +661,121 @@ byteck "-S with two bytes" "$T/exp" "$T/o"
 "$BB" brief -f 1,2 -S '' "$T/fx" > "$T/o" 2>/dev/null
 printf 'pq\n' > "$T/exp"
 byteck "-S empty concatenates" "$T/exp" "$T/o"
+
+sec "31. -c: aggregation on selected fields"
+
+printf '%s\n' "bash 12 ok" "bash 13 ok" "bash 44 fail" \
+	"read 1 ok" "edit 2 fail" "edit 3 ok" > agg.txt
+"$BB" brief -c 1 agg.txt > "$T/o" 2>/dev/null
+ck "-c groups without -d" "3x bash" "$(body "$T/o" "$T/b"; "$BB" sed -n '1p' "$T/b")"
+ck "-c records" "3" "$(mfo records < "$T/o")"
+ck "-c merged" "3" "$(mfo merged < "$T/o")"
+inv "-c 1: invariant" "$T/o"
+ck "-c sets projected" "3" "$(mfo projected < "$T/o")"
+ck "-c json grouped_by" "1" "$("$BB" brief -c 1 -F json agg.txt 2>/dev/null | grep -c '"grouped_by":"1"')"
+
+# group on one field, print another
+printf '%s\n' "a 1 x" "a 2 y" "a 3 z" "b 1 p" > fld.txt
+"$BB" brief -c 2 -f 3 fld.txt > "$T/o" 2>/dev/null
+ck "-c 2 -f 3 groups on 2, prints 3" "2x x" "$(body "$T/o" "$T/b"; "$BB" sed -n '1p' "$T/b")"
+ck "-c 2 -f 3 keeps the other groups" "3" "$(mfo records < "$T/o")"
+inv "-c 2 -f 3: invariant" "$T/o"
+
+# every selected field out of range collapses to one empty record by design
+"$BB" brief -c 9 agg.txt > "$T/o" 2>/dev/null
+ck "-c 9 one group" "1" "$(mfo records < "$T/o")"
+inv "-c 9: invariant" "$T/o"
+
+# a NUL in a projected field is data, not a separator
+printf 'a\000b 1\na\000b 2\nz\000 9\n' > "$T/fx"
+printf '2x a\000b\nz\000\n' > "$T/exp"
+"$BB" brief -c 1 "$T/fx" > "$T/o" 2>/dev/null
+byteck "-c 1 over NUL fields" "$T/exp" "$T/o"
+
+sec "32. -t: the budget is spent on the repeated records"
+
+# 500 unique records, then one record repeated 3000 times
+"$BB" awk 'BEGIN{for(i=0;i<500;i++)printf "unique record number %d\n",i;
+	for(i=0;i<3000;i++)printf "warning: conversion from size_t to int, possible loss of data\n"}' > late.txt
+"$BB" brief -B 400 late.txt > "$T/o" 2>/dev/null
+ck "without -t the repeat is invisible" "0" "$(body "$T/o" "$T/b"; "$BB" grep -c '3000x' "$T/b")"
+ck "without -t the budget truncated the table" "1" "$(mfo truncated < "$T/o")"
+inv "budget truncation: invariant" "$T/o"
+
+"$BB" brief -t 3 -B 400 late.txt > "$T/o" 2>/dev/null
+ck "-t puts the 3000x record first" "3000x warning: conversion from size_t to int, possible loss of data" \
+	"$(body "$T/o" "$T/b"; "$BB" sed -n '1p' "$T/b")"
+ck "-t merged the repeats" "2999" "$(mfo merged < "$T/o")"
+inv "-t: invariant" "$T/o"
+
+# equal counts keep first-appearance order
+printf '%s\n' "zeta" "alpha" "zeta" "alpha" > tie.txt
+"$BB" brief -t 2 tie.txt > "$T/o" 2>/dev/null
+ck "-t tie-break is first appearance" "2x zeta|2x alpha" \
+	"$(body "$T/o" "$T/b"; "$BB" sed -n '1,2p' "$T/b" | tr '\n' '|' | sed 's/|$//')"
+
+# a budget that cuts inside a group must not double-count it
+printf 'x1\nx2\nx3\n' > var.txt
+"$BB" brief -s -a 8 -B 6 var.txt > "$T/o" 2>/dev/null
+ck "mid-group truncation counts the rest as merged" "2" "$(mfo merged < "$T/o")"
+ck "mid-group truncation drops nothing" "0" "$(mfo dropped_lines < "$T/o")"
+inv "mid-group truncation: invariant" "$T/o"
+
+sec "33. -m: below the threshold is not a record"
+
+# agg.txt grouped by field 1 is bash:2, read:1, edit:2
+"$BB" brief -c 1 -m 2 agg.txt > "$T/o" 2>/dev/null
+ck "-m drops singletons" "2" "$(mfo shown_groups < "$T/o")"
+ck "-m counts the dropped lines" "1" "$(mfo dropped_lines < "$T/o")"
+ck "-m counts the dropped records" "1" "$(mfo dropped_records < "$T/o")"
+inv "-m 2: invariant" "$T/o"
+
+"$BB" brief -c 1 -m 99 agg.txt > "$T/o" 2>/dev/null
+ck "-m above every count shows nothing" "0" "$(mfo shown_lines < "$T/o")"
+ck "-m above every count drops all" "6" "$(mfo dropped_lines < "$T/o")"
+ck "-m above every count drops every record" "3" "$(mfo dropped_records < "$T/o")"
+inv "-m 99: invariant" "$T/o"
+
+"$BB" brief -m 1 agg.txt > "$T/m1" 2>/dev/null
+"$BB" brief -d agg.txt > "$T/m0" 2>/dev/null
+ck "-m 1 is the default view" "$(mfo shown_lines < "$T/m0")" "$(mfo shown_lines < "$T/m1")"
+
+sec "34. -q: bare records stay quotable"
+
+printf '%s\n' "a 1 x" "a 2 y" "a 1 x" "b 3 z" > q.txt
+printf '%s\n' "a 1 x" "a 2 y" "b 3 z" > qexp.txt
+"$BB" brief -d -q q.txt > "$T/o" 2>/dev/null
+body "$T/o" "$T/b"
+"$BB" cmp -s qexp.txt "$T/b"
+ck "-q body equals the input minus duplicates" "0" "$?"
+ck "-q says so in the marker" "1" "$(mfo bare < "$T/o")"
+ck "-q still counts the merge" "1" "$(mfo merged < "$T/o")"
+inv "-q: invariant" "$T/o"
+
+printf 'a\000b\na\000b\nc\000\n' > "$T/fx"
+printf 'a\000b\nc\000\n' > "$T/exp"
+"$BB" brief -d -q "$T/fx" > "$T/o" 2>/dev/null
+byteck "-q over NUL records is byte-exact" "$T/exp" "$T/o"
+
+printf 'p q\np r\n' > "$T/fx"
+printf 'p\n' > "$T/exp"
+"$BB" brief -q -c 1 "$T/fx" > "$T/o" 2>/dev/null
+byteck "-q -c prints the projected record bare" "$T/exp" "$T/o"
+
+sec "35. the new marker and json fields agree"
+
+"$BB" brief -c 1 -t 2 -m 1 agg.txt > "$T/t" 2>/dev/null
+"$BB" brief -c 1 -t 2 -m 1 -F json agg.txt > "$T/j" 2>/dev/null
+for f in shown_groups projected; do
+	ck "json $f == text" "$(mfo $f < "$T/t")" \
+		"$("$BB" sed -n "s/.*\"$f\":\\([0-9]*\\),.*/\\1/p" "$T/j")"
+done
+ck "json top == text" "$(mfo top < "$T/t")" "$("$BB" sed -n 's/.*"top":\([0-9]*\),.*/\1/p' "$T/j")"
+ck "json min_count == text" "$(mfo min < "$T/t")" "$("$BB" sed -n 's/.*"min_count":\([0-9]*\),.*/\1/p' "$T/j")"
+ck "json bare is false here" "1" "$("$BB" grep -c '"bare":false' "$T/j")"
+ck "json first item is the 3x record" "1" \
+	"$("$BB" grep -c '"items":\[{"n":3,' "$T/j")"
+ck "json schema is still 1" "1" "$("$BB" sed -n 's/.*"schema":\([0-9]*\).*/\1/p' "$T/j")"
 
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

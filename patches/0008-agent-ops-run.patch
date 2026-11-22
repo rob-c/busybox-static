@@ -1,9 +1,9 @@
 diff --git a/coreutils/run.c b/coreutils/run.c
 new file mode 100644
-index 0000000..126496e
+index 0000000..6be2ee0
 --- /dev/null
 +++ b/coreutils/run.c
-@@ -0,0 +1,1102 @@
+@@ -0,0 +1,1160 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * run - captured execution with retrievable evidence.
@@ -44,6 +44,7 @@ index 0000000..126496e
 +//usage:     "\n	-i, --stdin FILE	Feed FILE as the child's stdin"
 +//usage:     "\n	-P, --pgid		Print the child's process group id"
 +//usage:     "\n	-e, --env NAME=VALUE	Set NAME for the child (repeatable)"
++//usage:     "\n	-r, --prune N		Keep only the newest N runs"
 +//usage:     "\n	-F, --format FMT	text (default) or json"
 +//usage:     "\n"
 +//usage:     "\nExit: the child's status when it exits on its own, 3 when this"
@@ -384,6 +385,53 @@ index 0000000..126496e
 +	return shown;
 +}
 +
++/* Remove all but the newest `keep` run directories under root. Returns the count. */
++static unsigned prune_runs(const char *root, unsigned keep)
++{
++	struct dirent *de;
++	DIR *d;
++	unsigned *ids, n = 0, cap = 64, i, j, removed = 0;
++
++	d = opendir(root);
++	if (!d)
++		return 0;
++	ids = xmalloc(sizeof(ids[0]) * cap);
++	while ((de = readdir(d)) != NULL) {
++		unsigned v;
++
++		if (de->d_name[0] != 'R' || sscanf(de->d_name + 1, "%u", &v) != 1)
++			continue;
++		if (n == cap) {
++			cap *= 2;
++			ids = xrealloc(ids, sizeof(ids[0]) * cap);
++		}
++		ids[n++] = v;
++	}
++	closedir(d);
++
++	/* newest first */
++	for (i = 1; i < n; i++) {
++		unsigned t = ids[i];
++
++		for (j = i; j > 0 && ids[j - 1] < t; j--)
++			ids[j] = ids[j - 1];
++		ids[j] = t;
++	}
++	for (i = keep; i < n; i++) {
++		char *dir = xasprintf("%s/R%u", root, ids[i]);
++		char *p;
++
++		p = art_path(dir, "stdout"); unlink(p); free(p);
++		p = art_path(dir, "stderr"); unlink(p); free(p);
++		p = art_path(dir, "meta");   unlink(p); free(p);
++		if (rmdir(dir) == 0)
++			removed++;
++		free(dir);
++	}
++	free(ids);
++	return removed;
++}
++
 +int run_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
 +int run_main(int argc UNUSED_PARAM, char **argv)
 +{
@@ -391,6 +439,7 @@ index 0000000..126496e
 +	char *opt_capture = NULL, *opt_dir = NULL, *opt_cwd = NULL, *opt_fmt = NULL;
 +	char *opt_stdin = NULL;
 +	int opt_pgid = 0;
++	char *opt_prune = NULL;
 +	unsigned opts;
 +	long deadline_ms = 0, budget = DEFAULT_VIEW, capture_limit = DEFAULT_CAPTURE;
 +	int kill_after = 2000, json = 0, use_shell = 0;
@@ -415,6 +464,7 @@ index 0000000..126496e
 +		"format\0"        Required_argument "F"
 +		"stdin\0"         Required_argument "i"
 +		"pgid\0"          No_argument       "P"
++		"prune\0"         Required_argument "r"
 +		;
 +
 +	xfunc_error_retval = 2;
@@ -437,9 +487,9 @@ index 0000000..126496e
 +		}
 +		argv[j] = NULL;
 +	}
-+	opts = getopt32long(argv, "T:k:B:C:D:d:sF:i:P", run_longopts,
++	opts = getopt32long(argv, "T:k:B:C:D:d:sF:i:Pr:", run_longopts,
 +			&opt_timeout, &opt_kill, &opt_bytes, &opt_capture,
-+			&opt_dir, &opt_cwd, &opt_fmt, &opt_stdin);
++			&opt_dir, &opt_cwd, &opt_fmt, &opt_stdin, &opt_prune);
 +	use_shell = (opts & (1 << 6)) != 0;   /* s */
 +	{
 +		opt_pgid = (opts & (1 << 9)) != 0;   /* P */
@@ -690,6 +740,14 @@ index 0000000..126496e
 +			if ((m.out_bytes + m.err_bytes) > (unsigned long long)budget)
 +				printf("... view truncated; `log R%u --match ...' has the rest\n", id);
 +		}
++	}
++	if (opt_prune) {
++		unsigned keep = (unsigned)strtoul(opt_prune, NULL, 10);
++
++		unsigned gone = prune_runs(root, keep ? keep : 1);
++
++		if (!json)
++			printf("pruned=%u keep=%u\n", gone, keep);
 +	}
 +	fflush(stdout);
 +	if (m.timed_out || m.cancelled)
