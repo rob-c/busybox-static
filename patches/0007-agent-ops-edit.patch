@@ -1,9 +1,9 @@
 diff --git a/editors/replace.c b/editors/replace.c
 new file mode 100644
-index 0000000..726f35c
+index 0000000..69f7ea5
 --- /dev/null
 +++ b/editors/replace.c
-@@ -0,0 +1,813 @@
+@@ -0,0 +1,814 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * replace - guarded, all-or-nothing literal file editing.
@@ -439,8 +439,10 @@ index 0000000..726f35c
 +	}
 +
 +	m = collect_matches(e, data, len, &nm, o);
++	if (!m && o->code)
++		goto fail;                /* a real parse/regex error */
 +	if (!m)
-+		goto fail;
++		nm = 0;                   /* zero matches: fall through to the count check */
 +
 +	o->changes = nm;
 +	if ((long)nm != e->expect) {
@@ -769,8 +771,7 @@ index 0000000..726f35c
 +				report_text(&sub, &o, failed);
 +			if (failed) {
 +				exitcode = 1;
-+				if (o.code && (strcmp(o.code, "STALE_INPUT") == 0
-+						|| strcmp(o.code, "NOT_FOUND") == 0)) {
++				if (o.code) {
 +					free(o.msg);
 +					free(o.diff.p);
 +					break;   /* later edits would build on a bad state */

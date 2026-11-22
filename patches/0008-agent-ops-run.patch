@@ -1,9 +1,9 @@
 diff --git a/coreutils/run.c b/coreutils/run.c
 new file mode 100644
-index 0000000..062b88c
+index 0000000..b16fa71
 --- /dev/null
 +++ b/coreutils/run.c
-@@ -0,0 +1,890 @@
+@@ -0,0 +1,955 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * run - captured execution with retrievable evidence.
@@ -274,7 +274,45 @@ index 0000000..062b88c
 +	(void)captured;
 +}
 +
-+/* Head+tail view of one artifact, bounded. */
++/* Bound head+tail into ONE string, so JSON gets a single scalar. */
++static char *bounded_string(const char *path, size_t budget)
++{
++	int fd = open(path, O_RDONLY);
++	struct stat st;
++	size_t half = budget / 2;
++	char *head = NULL, *tail = NULL, *out;
++	ssize_t rh = 0, rt = 0;
++
++	if (fd < 0 || fstat(fd, &st) != 0) {
++		if (fd >= 0)
++			close(fd);
++		return xstrdup("");
++	}
++	head = xmalloc(half + 1);
++	rh = safe_read(fd, head, half);
++	if (rh < 0)
++		rh = 0;
++	head[rh] = '\0';
++	if ((unsigned long long)st.st_size > (unsigned long long)budget) {
++		tail = xmalloc(half + 1);
++		if (lseek(fd, (off_t)(st.st_size - (off_t)half), SEEK_SET) >= 0) {
++			rt = safe_read(fd, tail, half);
++			if (rt < 0)
++				rt = 0;
++			tail[rt] = '\0';
++		} else
++			tail[0] = '\0';
++		out = xasprintf("%s\n... [%llu bytes] ...\n%s", head,
++				(unsigned long long)st.st_size, tail ? tail : "");
++		free(tail);
++	} else {
++		out = xstrdup(head);
++	}
++	free(head);
++	close(fd);
++	return out;
++}
++
 +static size_t dump_bounded(const char *path, size_t budget, int json, const char *label)
 +{
 +	int fd = open(path, O_RDONLY);
@@ -399,7 +437,39 @@ index 0000000..062b88c
 +		capture_limit = strtol(opt_capture, NULL, 10);
 +	if (!argv[0])
 +		bb_show_usage();
++	/* Contract: a missing command is a wrapper failure, not a child exit 127. */
++	if (!use_shell) {
++		const char *path = getenv("PATH");
++		const char *p2 = path ? path : "/usr/local/bin:/usr/bin:/bin";
++		int found = 0;
 +
++		if (strchr(argv[0], '/')) {
++			struct stat st;
++			found = (stat(argv[0], &st) == 0 && S_ISREG(st.st_mode));
++			p2 = NULL;
++		}
++		while (p2 && *p2 && !found) {
++			const char *colon = strchr(p2, ':');
++			size_t len = colon ? (size_t)(colon - p2) : strlen(p2);
++			char *cand = len ? xasprintf("%.*s/%s", (int)len, p2, argv[0])
++					: xasprintf("./%s", argv[0]);
++			struct stat st;
++
++			found = (stat(cand, &st) == 0 && S_ISREG(st.st_mode));
++			free(cand);
++			p2 = colon ? colon + 1 : NULL;
++		}
++		if (!found) {
++			if (json)
++				printf("{\"schema\":1,\"status\":\"error\","
++						"\"code\":\"SPAWN_FAILED\","
++						"\"message\":\"command not found: %s\"}\n", argv[0]);
++			else
++				bb_error_msg("SPAWN_FAILED: command not found: %s", argv[0]);
++			fflush(stdout);
++			return 1;
++		}
++	}
 +	root = artifact_root(opt_dir);
 +	if (mkdir(root, 0700) != 0 && errno != EEXIST)
 +		bb_perror_msg_and_die("mkdir %s", root);
@@ -534,18 +604,14 @@ index 0000000..062b88c
 +					(m.out_bytes + m.err_bytes) > (unsigned long long)budget
 +						? "true" : "false");
 +			{
-+				size_t shown_out;
++				char *vo = bounded_string(p1, (size_t)budget * 3 / 4);
++				char *ve = bounded_string(p2, (size_t)budget / 4);
 +
-+				shown_out = dump_bounded(p1, (size_t)budget * 3 / 4, 1, "stdout");
-+				if (!shown_out)
-+					fputs("\"\"", stdout);
++				json_write_str(vo);
 +				fputs(",\"stderr_view\":", stdout);
-+				{
-+					size_t shown_err = dump_bounded(p2, (size_t)budget / 4, 1,
-+							"stderr");
-+					if (!shown_err)
-+						fputs("\"\"", stdout);
-+				}
++				json_write_str(ve);
++				free(vo);
++				free(ve);
 +			}
 +			putchar('}');
 +			putchar('\n');
@@ -841,7 +907,6 @@ index 0000000..062b88c
 +	}
 +	if (!argv[0])
 +		bb_show_usage();
-+	run = argv[0];
 +	root = artifact_root(opt_dir);
 +	dir = xasprintf("%s/%s", root, run);
 +
