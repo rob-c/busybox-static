@@ -962,10 +962,10 @@ index 0000000..02978f8
 +}
 diff --git a/miscutils/doctor.c b/miscutils/doctor.c
 new file mode 100644
-index 0000000..55e905e
+index 0000000..5b607d5
 --- /dev/null
 +++ b/miscutils/doctor.c
-@@ -0,0 +1,235 @@
+@@ -0,0 +1,280 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * doctor - report the environment an agent-facing busybox is running in.
@@ -987,6 +987,7 @@ index 0000000..55e905e
 +//usage:       "[-d TOOL,TOOL...] [-F FMT]"
 +//usage:#define doctor_full_usage "\n\n"
 +//usage:       "Report the runtime environment without dumping secrets"
++//usage:     "\n	-b, --build	Also report toolchain and tree layout"
 +//usage:     "\n	-d, --deps LIST	Comma-separated tools to locate"
 +//usage:     "\n	-F, --format FMT	text (default) or json"
 +
@@ -1088,19 +1089,20 @@ index 0000000..55e905e
 +{
 +	char *opt_deps = NULL, *opt_fmt = NULL;
 +	unsigned opts;
-+	int json = 0;
++	int json = 0, want_build = 0;
 +	char *cwd, *exe, *tmpdir = NULL;
 +	int tmp_ok;
 +	const char *deps;
 +
 +	static const char doctor_longopts[] ALIGN1 =
++		"build\0"  No_argument       "b"
 +		"deps\0"   Required_argument "d"
 +		"format\0" Required_argument "F"
 +		;
 +
 +	xfunc_error_retval = 2;
 +
-+	opts = getopt32long(argv, "d:F:", doctor_longopts, &opt_deps, &opt_fmt);
++	opts = getopt32long(argv, "bd:F:", doctor_longopts, &opt_deps, &opt_fmt);
 +	(void)opts;
 +	if (opt_fmt) {
 +		if (strcmp(opt_fmt, "json") == 0)
@@ -1115,6 +1117,7 @@ index 0000000..55e905e
 +		exe = xstrdup(bb_busybox_exec_path);
 +	tmp_ok = tmp_writable(&tmpdir);
 +	deps = opt_deps ? opt_deps : "git,make,python3";
++	want_build = (opts & 1) != 0;    /* b */
 +
 +	if (json) {
 +		printf("{\"schema\":1,\"platform\":\"%s\",\"cwd\":",
@@ -1161,7 +1164,33 @@ index 0000000..55e905e
 +			}
 +			free(copy);
 +		}
-+		fputs("}}\n", stdout);
++		if (want_build) {
++			static const char *const tools[] = {
++				"cc", "clang", "llvm-ar", "llvm-nm", "llvm-strip",
++				"zig", "make", "git", NULL };
++			unsigned i;
++
++			fputs("},\"build\":{\"tools\":{", stdout);
++			for (i = 0; tools[i]; i++) {
++				char *hit = find_tool(tools[i]);
++				if (i)
++					putchar(',');
++				json_write_str(tools[i]);
++				putchar(':');
++				if (hit)
++					json_write_str(hit);
++				else
++					fputs("null", stdout);
++				free(hit);
++			}
++			printf("},\"tree\":{\"src\":%s,\"build\":%s,\"patches\":%s}}",
++					access("src/Makefile", F_OK) == 0 ? "true" : "false",
++					access("build", F_OK) == 0 ? "true" : "false",
++					access("patches", F_OK) == 0 ? "true" : "false");
++		} else {
++			putchar('}');
++		}
++		fputs("}\n", stdout);
 +	} else {
 +		printf("platform=%s\n",
 +#if defined(__APPLE__)
@@ -1193,6 +1222,22 @@ index 0000000..55e905e
 +				free(hit);
 +			}
 +			free(copy);
++		}
++		if (want_build) {
++			static const char *const tools[] = {
++				"cc", "clang", "llvm-ar", "llvm-nm", "llvm-strip",
++				"zig", "make", "git", NULL };
++			unsigned i;
++
++			for (i = 0; tools[i]; i++) {
++				char *hit = find_tool(tools[i]);
++				printf("tool=%s path=%s\n", tools[i], hit ? hit : "-");
++				free(hit);
++			}
++			printf("tree=src:%s build:%s patches:%s\n",
++					access("src/Makefile", F_OK) == 0 ? "yes" : "no",
++					access("build", F_OK) == 0 ? "yes" : "no",
++					access("patches", F_OK) == 0 ? "yes" : "no");
 +		}
 +	}
 +	fflush(stdout);
