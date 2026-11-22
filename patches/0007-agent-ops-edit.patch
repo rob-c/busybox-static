@@ -1,9 +1,9 @@
 diff --git a/editors/replace.c b/editors/replace.c
 new file mode 100644
-index 0000000..69f7ea5
+index 0000000..efff0db
 --- /dev/null
 +++ b/editors/replace.c
-@@ -0,0 +1,814 @@
+@@ -0,0 +1,845 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * replace - guarded, all-or-nothing literal file editing.
@@ -32,6 +32,7 @@ index 0000000..69f7ea5
 +//usage:     "\n	-S, --sha256 HEX	Require this content version first"
 +//usage:     "\n	-r, --regex		Treat --old as a POSIX extended regex"
 +//usage:     "\n	-L, --follow		Allow editing through a symlink"
++//usage:     "\n	--backup SUF	Save the original as PATHSUF before writing"
 +//usage:     "\n	-N, --dry-run		Print the diff, change nothing"
 +//usage:     "\n	-B, --max-diff-bytes N	Cap the printed diff (default 4096)"
 +//usage:     "\n	-R, --request FILE	Batch edits (JSON)"
@@ -62,6 +63,7 @@ index 0000000..69f7ea5
 +	int regex;
 +	int follow;
 +	int dry_run;
++	const char *backup;   /* suffix for the pre-edit copy, or NULL */
 +	size_t max_diff;
 +	int json;
 +};
@@ -394,8 +396,13 @@ index 0000000..69f7ea5
 +	char *out = NULL;
 +	size_t outlen = 0;
 +
-+	memset(o, 0, sizeof(*o));
-+	/* o->diff.cap is set up by the caller; limit survives */
++	{
++		/* the caller owns the diff budget: memset() must not wipe it */
++		size_t keep_limit = o->diff.limit;
++
++		memset(o, 0, sizeof(*o));
++		o->diff.limit = keep_limit;
++	}
 +
 +	if (lstat(e->path, &lst) != 0) {
 +		o->code = (char *)"NOT_FOUND";
@@ -494,6 +501,27 @@ index 0000000..69f7ea5
 +		outlen = w;
 +	}
 +	sha256_hex(out, outlen, o->new_ver);
++
++	if (e->backup) {
++		char *bak = xasprintf("%s%s", target, e->backup);
++		int bfd = open(bak, O_WRONLY | O_CREAT | O_TRUNC, st.st_mode & 07777);
++
++		if (bfd < 0) {
++			o->code = (char *)"INVALID_ARGUMENT";
++			o->msg = xasprintf("backup %s: %s", bak, strerror(errno));
++			free(bak);
++			goto fail;
++		}
++		if (full_write(bfd, data, len) != len) {
++			o->code = (char *)"INVALID_ARGUMENT";
++			o->msg = xasprintf("backup %s: write failed", bak);
++			close(bfd);
++			free(bak);
++			goto fail;
++		}
++		close(bfd);
++		free(bak);
++	}
 +
 +	emit_diff(&o->diff, data, len, m, nm, e->new);
 +
@@ -639,6 +667,7 @@ index 0000000..69f7ea5
 +{
 +	char *opt_old = NULL, *opt_new = NULL, *opt_expect = NULL;
 +	char *opt_sha = NULL, *opt_diff_bytes = NULL, *opt_req = NULL, *opt_fmt = NULL;
++	char *opt_backup = NULL;
 +	unsigned opts;
 +	struct edit e;
 +	int exitcode = 0;
@@ -654,17 +683,19 @@ index 0000000..69f7ea5
 +		"max-diff-bytes\0" Required_argument "B"
 +		"request\0"        Required_argument "R"
 +		"format\0"         Required_argument "F"
++		"backup\0"         Required_argument "K"
 +		;
 +
 +	xfunc_error_retval = 2;
 +
-+	opts = getopt32long(argv, "o:n:x:S:rLNB:R:F:", replace_longopts,
++	opts = getopt32long(argv, "o:n:x:S:rLNB:R:F:K:", replace_longopts,
 +			&opt_old, &opt_new, &opt_expect, &opt_sha,
-+			&opt_diff_bytes, &opt_req, &opt_fmt);
++			&opt_diff_bytes, &opt_req, &opt_fmt, &opt_backup);
 +	argv += optind;
 +	(void)opts;
 +
 +	memset(&e, 0, sizeof(e));
++	e.backup = opt_backup;
 +	e.expect = 1;
 +	e.max_diff = DEFAULT_MAX_DIFF;
 +	e.regex = (opts & (1 << 4)) != 0;    /* r: o n x S r L N B R F */

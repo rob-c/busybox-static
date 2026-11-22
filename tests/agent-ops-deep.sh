@@ -75,7 +75,7 @@ sec "1. contract sweep: usage errors, help, format values"
 APPS="peek replace waitfor run log doctor why json patchcheck bench snapshot check brief"
 for a in $APPS; do
 	ck "help exits 0 [$a]" "0" "$(rc "$BB" "$a" --help)"
-	ck "help prints usage [$a]" "1" "$("$BB" grep -qc '[Uu]sage:' "$T/out")"
+	ck "help prints usage [$a]" "1" "$("$BB" grep -c '[Uu]sage:' "$T/out")"
 	ck "unknown option exits 2 [$a]" "2" "$(rc "$BB" "$a" --nosuchoption)"
 done
 for a in replace waitfor run log doctor why json patchcheck bench snapshot check brief; do
@@ -83,6 +83,7 @@ for a in replace waitfor run log doctor why json patchcheck bench snapshot check
 done
 # every applet named here must exist in this build
 for a in $APPS column; do
+	ck "unknown option exits 2 [$a]" "2" "$(rc "$BB" "$a" --nosuchoption)"
 	ck "applet present [$a]" "1" "$("$BB" --list | "$BB" grep -qx "$a" && echo 1 || echo 0)"
 done
 # --caps agrees with --list
@@ -98,7 +99,7 @@ for f in $FIXTURES; do
 	ckrc "peek rc in table [$f]" "$r"
 	# either a versioned header or a contract-coded error - never silence
 	ck "peek says something [$f]" "1" \
-		"$("$BB" grep -qc 'version=sha256:\|NOT_FOUND\|INVALID_ARGUMENT\|UNSUPPORTED' "$T/out" "$T/err" >/dev/null 2>&1 && echo 1)"
+		"$("$BB" grep -q 'version=sha256:\|NOT_FOUND\|INVALID_ARGUMENT\|UNSUPPORTED' "$T/out" "$T/err" >/dev/null 2>&1 && echo 1)"
 	if [ "$r" = 0 ]; then
 		ck "peek header has version [$f]" "1" "$("$BB" grep -c 'version=sha256:' "$T/out")"
 		ck "peek reports shown_bytes [$f]" "1" "$("$BB" grep -c 'shown_bytes=' "$T/out")"
@@ -142,7 +143,7 @@ for f in three nonl crlf ten; do
 	done
 	ck "peek continuation terminates [$f]" "1" "$([ $iters -lt 40 ] && echo 1)"
 	ck "peek continuation reaches the end [$f]" "1" \
-		"$("$BB" grep -qc 'truncated=false' "$T/out")"
+		"$("$BB" grep -c 'truncated=false' "$T/out")"
 done
 ck "peek continuation never loops forever [ten]" "1" "$([ $iters -lt 40 ] && echo 1)"
 
@@ -164,14 +165,15 @@ printf 'one\ntwo\nNEEDLE\nfour\nfive\n' > "$T/n.txt"
 ck "peek -a finds the match" "1" "$(rc "$BB" peek -a NEEDLE "$T/n.txt" >/dev/null; "$BB" grep -c 'NEEDLE' "$T/out")"
 ck "peek -a includes context" "1" "$(rc "$BB" peek -a NEEDLE -c 1 "$T/n.txt" >/dev/null; "$BB" grep -c '^2 | two$' "$T/out")"
 ck "peek -a misses cleanly" "1" "$(rc "$BB" peek -a ZZZ "$T/n.txt")"
-ck "peek -r treats the pattern as a regex" "1" "$(rc "$BB" peek -a 'NEE.DLE' -r "$T/n.txt" >/dev/null; "$BB" grep -c 'NEEDLE' "$T/out")"
+ck "peek -r treats the pattern as a regex" "1" "$(rc "$BB" peek -a 'NEE[DF]LE' -r "$T/n.txt" >/dev/null; "$BB" grep -c 'NEEDLE' "$T/out")"
+ck "peek -r without -r: same pattern is literal" "1" "$(rc "$BB" peek -a 'NEE[DF]LE' "$T/n.txt")"
 ck "peek -M refuses a big file" "1" "$(rc "$BB" peek -l 1:1 -M 1 "$FX/ten")"
 ck "peek -M refusal is not a crash" "1" "$([ "$(rc "$BB" peek -l 1:1 -M 1 "$FX/ten")" -lt 124 ] && echo 1)"
 
 sec "7. peek on binary and odd bytes"
 ck "peek binary rc" "1" "$(is_ok_code "$(rc "$BB" peek -l 1:2 "$FX/binary")")"
 ck "peek binary names UNSUPPORTED or shows the line" "1" \
-	"$("$BB" grep -qc 'UNSUPPORTED\|version=sha256:' "$T/out" "$T/err" >/dev/null 2>&1 && echo 1)"
+	"$("$BB" grep -q 'UNSUPPORTED\|version=sha256:' "$T/out" "$T/err" >/dev/null 2>&1 && echo 1)"
 ck "peek crlf counts 3 lines" "3" "$(rc "$BB" peek -l 1:10 "$FX/crlf" >/dev/null; "$BB" grep -c '^[0-9]* | ' "$T/out")"
 ck "peek nonl counts 2 lines" "2" "$(rc "$BB" peek -l 1:10 "$FX/nonl" >/dev/null; "$BB" grep -c '^[0-9]* | ' "$T/out")"
 ck "peek empty file rc in table" "1" "$(is_ok_code "$(rc "$BB" peek -l 1:1 "$FX/empty")")"
@@ -184,7 +186,7 @@ ck "peek -R returns the lines" "2" "$("$BB" grep -c '^[0-9]* | ' "$T/out")"
 printf '{"schema":1,"requests":[{"path":"%s/nope","lines":"1:2"}]}' "$FX" > "$T/req2.json"
 r=$(rc "$BB" peek -R "$T/req2.json")
 ckrc "peek -R missing path rc" "$r"
-ck "peek -R missing path names NOT_FOUND" "1" "$("$BB" grep -qc 'NOT_FOUND' "$T/out" "$T/err" >/dev/null 2>&1 && echo 1)"
+ck "peek -R missing path names NOT_FOUND" "1" "$("$BB" grep -q 'NOT_FOUND' "$T/out" "$T/err" >/dev/null 2>&1 && echo 1)"
 printf 'not json' > "$T/req3.json"
 ck "peek -R bad json is a usage/arg error" "1" "$(is_ok_code "$(rc "$BB" peek -R "$T/req3.json")")"
 
@@ -197,7 +199,8 @@ for f in oneline three nonl crlf crmid unicode spaces blanks ten; do
 	cp "$FX/$f" "$T/w"
 	case "$f" in
 	oneline) old="only" ;;
-	three|nonl|ten) old="b" ;;
+	three|nonl) old="b" ;;
+	ten) old="l5" ;;
 	crlf) old="b" ;;
 	crmid) old="C" ;;
 	unicode) old="w" ;;
@@ -220,11 +223,14 @@ for f in oneline three nonl crlf crmid unicode spaces blanks ten; do
 	r=$(rc "$BB" replace "$T/w" --old "zzzznotthere" --new "Q")
 	ck "replace miss rc [$f]" "1" "$r"
 	ck "replace miss left the file alone [$f]" "$before" "$("$BB" md5sum < "$T/w")"
-	ck "replace miss says so [$f]" "1" "$("$BB" grep -qc 'No files changed' "$T/out" "$T/err" >/dev/null 2>&1 && echo 1)"
-	# dry run must not write
-	r=$(rc "$BB" replace "$T/w" --old "zzzznotthere" --new "Q" -N)
-	ck "replace dry-run rc [$f]" "0" "$r"
-	ck "replace dry-run wrote nothing [$f]" "$before" "$("$BB" md5sum < "$T/w")"
+	ck "replace miss says so [$f]" "1" "$("$BB" grep -q 'No files changed' "$T/out" "$T/err" >/dev/null 2>&1 && echo 1)"
+	# dry run must print a diff and write nothing
+	if [ -n "$old" ]; then
+		r=$(rc "$BB" replace "$T/w" --old "$old" --new "ZZ" -N)
+		ck "replace dry-run rc [$f]" "0" "$r"
+		ck "replace dry-run wrote nothing [$f]" "$before" "$("$BB" md5sum < "$T/w")"
+		ck "replace dry-run says dry_run [$f]" "1" "$("$BB" grep -c 'dry_run=true' "$T/out")"
+	fi
 done
 
 sec "10. replace: counts, versions, symlinks, modes, dry-run"
