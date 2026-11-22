@@ -1,9 +1,9 @@
 diff --git a/miscutils/brief.c b/miscutils/brief.c
 new file mode 100644
-index 0000000..d871d62
+index 0000000..4d213b8
 --- /dev/null
 +++ b/miscutils/brief.c
-@@ -0,0 +1,959 @@
+@@ -0,0 +1,1137 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * brief - structure-preserving reduction of line-oriented tool output.
@@ -242,6 +242,12 @@ index 0000000..d871d62
 +	for (; s < end; s++) {
 +		if (*s == '"' || *s == '\\') {
 +			printf("\\%c", *s);
++		} else if (*s == '\n') {
++			printf("\\n");          /* 2 bytes, not the 6 of \\u000a */
++		} else if (*s == '\t') {
++			printf("\\t");
++		} else if (*s == '\r') {
++			printf("\\r");
 +		} else if ((unsigned char)*s < 0x20) {
 +			printf("\\u%04x", (unsigned char)*s);
 +		} else {
@@ -528,6 +534,21 @@ index 0000000..d871d62
 +
 +static struct istate st;
 +
++/* Why the view is incomplete, by how much it narrows the output. -F json and
++ * the marker both name it, because "truncated" alone does not tell a reader
++ * which flag to change. */
++enum { TB_NONE, TB_SELECTION, TB_RECORDS, TB_MIN, TB_TOP, TB_SIZE, TB_BUDGET };
++static int trunc_by;
++static const char *const trunc_names[] = {
++	"", "selection", "records", "min_count", "top", "record_size", "budget"
++};
++
++static void note_loss(int why)
++{
++	if (why > trunc_by)
++		trunc_by = why;
++}
++
 +/* 1 when any pattern in the list occurs in the record. Substrings, not regex:
 + * a pattern that has to be escaped is a pattern an agent gets wrong. */
 +static int pat_hit(llist_t *list, const char *h, size_t hn)
@@ -596,11 +617,13 @@ index 0000000..d871d62
 +	/* -o/-x act before the table, so -n cannot fill up with records the
 +	 * caller did not ask for and hide the ones it did. */
 +	if (st.only && !pat_hit(st.only, p, n)) {
++		note_loss(TB_SELECTION);
 +		st.dropped_records++;
 +		st.dropped_lines += nl;
 +		return;
 +	}
 +	if (st.without && pat_hit(st.without, p, n)) {
++		note_loss(TB_SELECTION);
 +		st.dropped_records++;
 +		st.dropped_lines += nl;
 +		return;
@@ -636,12 +659,14 @@ index 0000000..d871d62
 +		it = item_find(key, keylen, nitems < st.max_recs);
 +		free(key);
 +		if (!it) {
++			note_loss(TB_RECORDS);
 +			st.dropped_records++;
 +			st.dropped_lines += nl;
 +			return;
 +		}
 +	} else {
 +		if (nitems >= st.max_recs) {
++			note_loss(TB_RECORDS);
 +			st.dropped_records++;
 +			st.dropped_lines += nl;
 +			return;
@@ -689,6 +714,68 @@ index 0000000..d871d62
 +			break;
 +		p = nl + 1;
 +	}
++}
++
++/* The JSON rendering of a record: the same bytes as the text view, without the
++ * presentation the JSON object already carries. The "Nx " count is a field
++ * ("n") and the final newline is a text-layout artifact, so neither is
++ * duplicated into the string: a model reading "line" gets the record itself. */
++static void render_json_record(struct sbuf *out, const struct sample *sm)
++{
++	const char *p = sm->p, *end = sm->p + sm->n;
++
++	for (;;) {
++		const char *nl = memchr(p, '\n', (size_t)(end - p));
++		size_t l = nl ? (size_t)(nl - p) : (size_t)(end - p);
++
++		if (st.nfr)
++			project_into(out, p, l, st.fr, st.nfr, st.sep);
++		else
++			sb_add(out, p, l);
++		if (!nl)
++			break;
++		sb_addch(out, '\n');
++		p = nl + 1;
++	}
++}
++
++/* The selected fields as a JSON array, so a reader never has to re-split the
++ * projected line. Only for single-line records: a projection of a section has
++ * no one obvious array to be. */
++static void put_json_fields(const char *line, size_t len)
++{
++	const struct fw *fr = st.nfr ? st.fr : st.cbfr;
++	unsigned nfr = st.nfr ? st.nfr : st.ncb;
++	const char *p = line, *end = line + len;
++	unsigned field = 0, i;
++	int first = 1;
++
++	putchar('[');
++	while (p < end) {
++		const char *start;
++		int want = 0;
++
++		while (p < end && is_sep[(unsigned char)*p])
++			p++;
++		if (p == end)
++			break;
++		start = p;
++		while (p < end && !is_sep[(unsigned char)*p])
++			p++;
++		field++;
++		for (i = 0; i < nfr; i++)
++			if (field >= fr[i].lo && field <= fr[i].hi) {
++				want = 1;
++				break;
++			}
++		if (!want)
++			continue;
++		if (!first)
++			putchar(',');
++		put_json_str(start, (size_t)(p - start));
++		first = 0;
++	}
++	putchar(']');
 +}
 +
 +/* ---- main -------------------------------------------------------------- */
@@ -832,6 +919,16 @@ index 0000000..d871d62
 +
 +		/* -m: below the threshold the record is not shown at all */
 +		if (it->count < st.min_count) {
++			note_loss(TB_MIN);
++			st.dropped_records++;
++			st.dropped_lines += it->lines;
++			continue;
++		}
++		/* -t N keeps the N most frequent groups: "top" has to mean a cap,
++		 * or the count says 87 groups while the hint says 3. */
++		if (top_n && shown_groups >= top_n) {
++			note_loss(TB_TOP);
++			truncated = 1;
 +			st.dropped_records++;
 +			st.dropped_lines += it->lines;
 +			continue;
@@ -852,12 +949,14 @@ index 0000000..d871d62
 +				 * empty the whole view. */
 +				it->shown = -1;
 +				truncated = 1;   /* the view is incomplete, by size */
++				note_loss(TB_SIZE);
 +				free(rec.p);
 +				break;
 +			}
 +			if (body_len + rec.len > (size_t)budget) {
 +				it->shown = 0;
 +				truncated = 1;
++				note_loss(TB_BUDGET);
 +				free(rec.p);
 +				break;
 +			}
@@ -898,9 +997,69 @@ index 0000000..d871d62
 +	}
 +
 +	if (json_out) {
-+		int first = 1;
++		int first = 1, nhint = 0;
++		double pct10 = 0;
 +
-+		printf("{\"schema\":1,\"lines_in\":%lu,\"records\":%u,\"kept\":%lu,"
++		/* Everything a reader needs in order to understand the view
++		 * without seeing the input: what came in, what is shown, how
++		 * much is missing and which flag caused that. */
++		if (st.in_bytes)
++			pct10 = 100.0 * (double)body_len / (double)st.in_bytes;
++		printf("{\"schema\":1,\"summary\":");
++		{
++			char sum[256];
++
++			if (shown_groups == nitems)
++				snprintf(sum, sizeof(sum),
++						"%lu lines in, %u records, all shown, "
++						"%lu of %lu body bytes, %s",
++						st.lines_in, nitems,
++						(unsigned long)body_len, (unsigned long)st.in_bytes,
++						trunc_by ? "incomplete" : "complete");
++			else
++				snprintf(sum, sizeof(sum),
++						"%lu lines in, %u records, %u of %u shown, "
++						"%lu of %lu body bytes, %s",
++						st.lines_in, nitems, shown_groups, nitems,
++						(unsigned long)body_len, (unsigned long)st.in_bytes,
++						trunc_by ? "incomplete" : "complete");
++			put_json_str(sum, strlen(sum));
++		}
++		printf(",\"pct_of_input\":%.1f", (double)pct10);
++		fputs(",\"hints\":[", stdout);
++		/* One hint per cause, each naming the flag to change. Computed
++		 * from the counters, never canned: a complete view with nothing
++		 * merged emits an empty array. */
++		if (trunc_by == TB_BUDGET) {
++			printf("%s\"the byte budget stopped the view: raise -B, or -B 0 for no limit\"",
++					nhint++ ? "," : "");
++		} else if (trunc_by == TB_SIZE) {
++			printf("%s\"records larger than the whole budget were dropped: raise -B\"",
++					nhint++ ? "," : "");
++		} else if (trunc_by == TB_RECORDS) {
++			printf("%s\"the table stopped at -n, so later records were not counted: raise -n\"",
++					nhint++ ? "," : "");
++		} else if (trunc_by == TB_MIN) {
++			printf("%s\"groups seen fewer than -m times are hidden: lower -m or drop it\"",
++					nhint++ ? "," : "");
++		} else if (trunc_by == TB_TOP) {
++			printf("%s\"-t kept the %u highest-count groups of %u: raise -t for the rest\"",
++					nhint++ ? "," : "", top_n, nitems);
++		} else if (trunc_by == TB_SELECTION && st.matched == 0) {
++			printf("%s\"nothing matched -o/-x: they are substrings, not regexes\"",
++					nhint++ ? "," : "");
++		}
++		if (st.lines_merged && !top_n) {
++			printf("%s\"%lu lines are repeats of a shown record: -t 10 ranks them first\"",
++					nhint++ ? "," : "", st.lines_merged);
++		}
++
++		fputs("],\"truncated_by\":", stdout);
++		if (trunc_by)
++			put_json_str(trunc_names[trunc_by], strlen(trunc_names[trunc_by]));
++		else
++			fputs("null", stdout);
++		printf(",\"lines_in\":%lu,\"records\":%u,\"kept\":%lu,"
 +				"\"lines_shown\":%lu,\"lines_merged\":%lu,"
 +				"\"dropped_records\":%lu,\"dropped_lines\":%lu,"
 +				"\"nul_lines\":%lu,\"bytes\":%lu,\"truncated\":%s,\"fields\":%s,"
@@ -928,21 +1087,39 @@ index 0000000..d871d62
 +		for (oi = 0; oi < nitems; oi++) {
 +			struct item *it = &items[order[oi]];
 +			unsigned k;
++			struct sbuf rec = { 0 };
 +
 +			if (it->shown != 1)
 +				continue;
-+			for (k = 0; k < it->nsmp; k++) {
-+				struct sbuf rec = { 0 };
-+
-+				render_record(&rec, &it->smp[k], it->count, k == 0);
-+				printf("%s{\"n\":%u,\"kept\":%s,\"lines\":%u,\"line\":",
-+						first ? "" : ",", it->count,
-+						it->is_kept ? "true" : "false", it->smp[k].nl);
-+				put_json_str(rec.p ? rec.p : "", rec.len);
-+				putchar('}');
-+				free(rec.p);
-+				first = 0;
++			/* One object per group: "n" is its count, "line" its first
++			 * sample, and "samples" appears only when -a showed more
++			 * than one, so the default output carries no repetition. */
++			render_json_record(&rec, &it->smp[0]);
++			printf("%s{\"n\":%u,\"lines\":%lu,\"kept\":%s",
++					first ? "" : ",", it->count, it->lines,
++					it->is_kept ? "true" : "false");
++			if (nfr && it->smp[0].nl == 1) {
++				fputs(",\"f\":", stdout);
++				put_json_fields(it->smp[0].p, it->smp[0].n);
 +			}
++			fputs(",\"line\":", stdout);
++			put_json_str(rec.p ? rec.p : "", rec.len);
++			if (it->nsmp > 1) {
++				fputs(",\"samples\":[", stdout);
++				put_json_str(rec.p ? rec.p : "", rec.len);
++				for (k = 1; k < it->nsmp; k++) {
++					struct sbuf more = { 0 };
++
++					render_json_record(&more, &it->smp[k]);
++					putchar(',');
++					put_json_str(more.p ? more.p : "", more.len);
++					free(more.p);
++				}
++				putchar(']');
++			}
++			putchar('}');
++			free(rec.p);
++			first = 0;
 +		}
 +		fputs("]}\n", stdout);
 +	} else {
@@ -952,12 +1129,13 @@ index 0000000..d871d62
 +		printf("[brief] lines_in=%lu records=%u kept=%lu shown_lines=%lu"
 +				" merged=%lu dropped_records=%lu dropped_lines=%lu"
 +				" nul=%lu bytes=%lu truncated=%d shown_groups=%u projected=%lu"
-+				" bare=%d top=%u min=%u matched=%lu in_bytes=%lu\n",
++				" bare=%d top=%u min=%u matched=%lu in_bytes=%lu truncated_by=%s\n",
 +				st.lines_in, nitems, st.kept, st.lines_shown,
 +				st.lines_merged, st.dropped_records, st.dropped_lines,
 +				st.nul_lines, (unsigned long)body_len, truncated,
 +				shown_groups, st.projected, st.bare, top_n, min_count,
-+				st.matched, (unsigned long)st.in_bytes);
++				st.matched, (unsigned long)st.in_bytes,
++				trunc_by ? trunc_names[trunc_by] : "-");
 +		if (body && body_len)
 +			fwrite(body, 1, body_len, stdout);
 +	}

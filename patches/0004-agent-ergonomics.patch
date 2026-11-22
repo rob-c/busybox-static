@@ -3917,7 +3917,7 @@ index 6cdd641..5c0252f 100644
  {
  #if FIXED_HEADER
 diff --git a/shell/ash.c b/shell/ash.c
-index 9afeaed..a6b3412 100644
+index 9afeaed..dedf2a1 100644
 --- a/shell/ash.c
 +++ b/shell/ash.c
 @@ -906,8 +906,8 @@ out2str(const char *p)
@@ -4372,6 +4372,136 @@ index 9afeaed..a6b3412 100644
  			case '%':
  			case '#':
  				subtype = (c == '#' ? VSTRIMLEFT : VSTRIMRIGHT);
+@@ -15173,6 +15507,112 @@ extern int etext();
+  * exception occurs.  When an exception occurs the variable "state"
+  * is used to figure out how far we had gotten.
+  */
++/* ---------- agent-facing hooks: --timeout and --brief ---------- */
++
++static char *ash_brief_which;
++
++#if ENABLE_BRIEF
++int brief_main_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
++#endif
++
++/* Peel --timeout SECS and --brief WHICH off argv before ash parses options. */
++static void ash_strip_agent_opts(char **argv)
++{
++	int i, j = 1;
++
++	for (i = 1; argv[i]; i++) {
++		if (strcmp(argv[i], "--timeout") == 0) {
++			xfunc_error_retval = 2;
++			bb_error_msg_and_die("sh has no --timeout; use"
++					" 'busybox run --timeout SECS -- sh -c CMD'");
++		}
++		if (strcmp(argv[i], "--brief") == 0) {
++			ash_brief_which = (argv[i + 1] && argv[i + 1][0] != '-')
++					? argv[++i] : (char *)"stdout";
++			continue;
++		}
++		argv[j++] = argv[i];
++	}
++	argv[j] = NULL;
++	if (ash_brief_which
++	 && strcmp(ash_brief_which, "stdout") != 0
++	 && strcmp(ash_brief_which, "stderr") != 0
++	 && strcmp(ash_brief_which, "both") != 0
++	) {
++		xfunc_error_retval = 2;
++		bb_error_msg_and_die("--brief is stdout, stderr or both");
++	}
++}
++
++/*
++ * Redirect the selected stream(s) through `brief -d`. The reducer runs in a
++ * forked child with its own argv, so ash's option state is untouched, and the
++ * pipe closes when the shell exits, which is the reducer's EOF.
++ */
++static void ash_brief_stream(int fd, int orig_out, int orig_err)
++{
++	int p[2], keep;
++	pid_t pid;
++
++	if (pipe(p) != 0)
++		return;
++	keep = dup(fd);
++	fflush_all();
++#if ENABLE_BRIEF
++	pid = fork();
++	if (pid == 0) {
++		char *av[3];
++
++		/* The reducer's own output goes to the real streams, not the other pipe. */
++		if (orig_out >= 0)
++			dup2(orig_out, 1);
++		if (orig_err >= 0)
++			dup2(orig_err, 2);
++		dup2(p[0], 0);
++		if (p[0] > 2)
++			close(p[0]);
++		if (p[1] > 2)
++			close(p[1]);
++		av[0] = (char *)"brief";
++		av[1] = (char *)"-d";
++		av[2] = NULL;
++		brief_main_main(2, av);
++		_exit(0);
++	}
++	if (pid < 0) {
++		close(p[0]);
++		close(p[1]);
++		if (keep >= 0)
++			close(keep);
++		return;
++	}
++#else
++	(void)pid;
++	(void)orig_out;
++	(void)orig_err;
++#endif
++	close(p[0]);
++	dup2(p[1], fd);
++	close(p[1]);
++	if (keep > 2)
++		close(keep);
++}
++
++static void ash_agent_setup(void)
++{
++	if (ash_brief_which) {
++		int orig_out = dup(1);
++		int orig_err = dup(2);
++
++		if (strcmp(ash_brief_which, "stdout") == 0
++		 || strcmp(ash_brief_which, "both") == 0)
++			ash_brief_stream(1, orig_out, orig_err);
++		if (strcmp(ash_brief_which, "stderr") == 0
++		 || strcmp(ash_brief_which, "both") == 0)
++			ash_brief_stream(2, orig_out, orig_err);
++	}
++}
++
+ int ash_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
+ #if NUM_SCRIPTS > 0
+ int ash_main(int argc, char **argv)
+@@ -15187,6 +15627,8 @@ int ash_main(int argc UNUSED_PARAM, char **argv)
+ 
+ 	dbg_show_dirtymem("dirtymem at main start");
+ 
++	ash_strip_agent_opts(argv);
++
+ 	/* Initialize global data */
+ 	INIT_G_misc();
+ 	INIT_G_memstack();
+@@ -15241,6 +15683,7 @@ int ash_main(int argc UNUSED_PARAM, char **argv)
+ 		minusc = get_script_content(-argc - 1);
+ #endif
+ 	login_sh = procargs(argv);
++	ash_agent_setup();
+ #if DEBUG
+ 	TRACE(("Shell args: "));
+ 	trace_puts_args(argv);
 diff --git a/shell/hush.c b/shell/hush.c
 index afed0b5..6e337e7 100644
 --- a/shell/hush.c
@@ -4406,6 +4536,162 @@ index afed0b5..6e337e7 100644
  	*p = '\0'; /* replace trailing SPECIAL_VAR_SYMBOL */
  	var = arg;
  	exp_saveptr = arg[1] ? (char*)strchr(VAR_ENCODED_SUBST_OPS, arg[1]) : NULL;
+diff --git a/util-linux/column.c b/util-linux/column.c
+new file mode 100644
+index 0000000..3a6bf34
+--- /dev/null
++++ b/util-linux/column.c
+@@ -0,0 +1,150 @@
++/* vi: set sw=4 ts=4: */
++/*
++ * column - format input into columns
++ *
++ * Licensed under GPLv2, see file LICENSE in this source tree.
++ */
++//config:config COLUMN
++//config:	bool "column (2.6 kb)"
++//config:	default y
++//config:	help
++//config:	Format input into aligned columns.
++
++//applet:IF_COLUMN(APPLET_NOEXEC(column, column, BB_DIR_USR_BIN, BB_SUID_DROP, column))
++
++//kbuild:lib-$(CONFIG_COLUMN) += column.o
++
++//usage:#define column_trivial_usage
++//usage:       "[-t] [-s SEP] [-o SEP] [FILE]..."
++//usage:#define column_full_usage "\n\n"
++//usage:       "Format lines into columns"
++//usage:     "\n	-t	Build a table: align fields into columns"
++//usage:     "\n	-s SEP	Input field separator (default: runs of blanks)"
++//usage:     "\n	-o SEP	Output separator between columns (default: two spaces)"
++
++#include "libbb.h"
++
++int column_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
++int column_main(int argc UNUSED_PARAM, char **argv)
++{
++	unsigned opts;
++	const char *in_sep = NULL;
++	const char *out_sep = "  ";
++	llist_t *lines = NULL;
++	llist_t *lp;
++	FILE *fp;
++	char *line;
++	unsigned nrows = 0;
++	unsigned maxcols = 0;
++	unsigned *width;      /* width[i]: widest cell in column i */
++	char ***cells;        /* cells[row][col] */
++	unsigned *ncells;     /* number of cells per row */
++	unsigned r, c;
++
++	/* bits: t = 1, s = 2, o = 4 */
++	xfunc_error_retval = 2;
++	opts = getopt32long(argv, "^" "ts:o:" "\0" "?1",
++		"table\0"          No_argument       "t"
++		"separator\0"      Required_argument "s"
++		"output-separator\0" Required_argument "o"
++		, &in_sep, &out_sep
++	);
++	xfunc_error_retval = 1;   /* past option parsing: failures are operational */
++
++	argv += optind;
++	if (argv[0]) {
++		fp = xfopen_stdin(argv[0]);
++	} else {
++		fp = stdin;
++	}
++
++	while ((line = xmalloc_fgetline(fp)) != NULL)
++		llist_add_to_end(&lines, line);
++	if (fp != stdin)
++		fclose(fp);
++
++	/* First pass: split and measure. */
++	for (lp = lines; lp; lp = lp->link)
++		nrows++;
++
++	if (nrows == 0)
++		return EXIT_SUCCESS;
++
++	cells = xzalloc(nrows * sizeof(cells[0]));
++	ncells = xzalloc(nrows * sizeof(ncells[0]));
++	width = xzalloc(sizeof(width[0]));
++
++	r = 0;
++	for (lp = lines; lp; lp = lp->link) {
++		char *text = lp->data;
++		char **vec = NULL;
++		unsigned n = 0;
++
++		if (in_sep) {
++			/* single-character separator: split on each occurrence */
++			char *p = text;
++			while (p) {
++				char *next = strchr(p, in_sep[0]);
++				if (next)
++					*next++ = '\0';
++				vec = xrealloc_vector(vec, 4, n);
++				vec[n++] = p;
++				p = next;
++			}
++		} else {
++			/* default: split on runs of blanks, as `column -t` does */
++			char *p = text;
++			while (*p) {
++				while (*p == ' ' || *p == '\t')
++					p++;
++				if (!*p)
++					break;
++				vec = xrealloc_vector(vec, 4, n);
++				vec[n++] = p;
++				while (*p && *p != ' ' && *p != '\t')
++					p++;
++				if (*p)
++					*p++ = '\0';
++			}
++		}
++
++		cells[r] = vec;
++		ncells[r] = n;
++		if (n > maxcols)
++			maxcols = n;
++		r++;
++	}
++
++	if (maxcols == 0)
++		return EXIT_SUCCESS;
++
++	width = xrealloc(width, maxcols * sizeof(width[0]));
++	memset(width, 0, maxcols * sizeof(width[0]));
++	for (r = 0; r < nrows; r++) {
++		for (c = 0; c < ncells[r]; c++) {
++			unsigned w = strlen(cells[r][c]);
++			if (w > width[c])
++				width[c] = w;
++		}
++	}
++
++	for (r = 0; r < nrows; r++) {
++		for (c = 0; c < ncells[r]; c++) {
++			fputs(cells[r][c], stdout);
++			if (c + 1 < ncells[r]) {
++				unsigned pad = width[c] - strlen(cells[r][c]);
++				unsigned k;
++				if (opts & 1) { /* -t */
++					for (k = 0; k < pad; k++)
++						bb_putchar(' ');
++					fputs(out_sep, stdout);
++				} else {
++					fputs(out_sep, stdout);
++				}
++			}
++		}
++		bb_putchar('\n');
++	}
++
++	return EXIT_SUCCESS;
++}
 diff --git a/util-linux/fallocate.c b/util-linux/fallocate.c
 index d5c2589..58e1db8 100644
 --- a/util-linux/fallocate.c
@@ -4804,301 +5090,3 @@ index 337d718..f0af1df 100644
  
  #if defined(__dietlibc__)
  // TODO: This does not belong here.
-diff --git a/util-linux/column.c b/util-linux/column.c
-new file mode 100644
-index 0000000..3a6bf34
---- /dev/null
-+++ b/util-linux/column.c
-@@ -0,0 +1,150 @@
-+/* vi: set sw=4 ts=4: */
-+/*
-+ * column - format input into columns
-+ *
-+ * Licensed under GPLv2, see file LICENSE in this source tree.
-+ */
-+//config:config COLUMN
-+//config:	bool "column (2.6 kb)"
-+//config:	default y
-+//config:	help
-+//config:	Format input into aligned columns.
-+
-+//applet:IF_COLUMN(APPLET_NOEXEC(column, column, BB_DIR_USR_BIN, BB_SUID_DROP, column))
-+
-+//kbuild:lib-$(CONFIG_COLUMN) += column.o
-+
-+//usage:#define column_trivial_usage
-+//usage:       "[-t] [-s SEP] [-o SEP] [FILE]..."
-+//usage:#define column_full_usage "\n\n"
-+//usage:       "Format lines into columns"
-+//usage:     "\n	-t	Build a table: align fields into columns"
-+//usage:     "\n	-s SEP	Input field separator (default: runs of blanks)"
-+//usage:     "\n	-o SEP	Output separator between columns (default: two spaces)"
-+
-+#include "libbb.h"
-+
-+int column_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
-+int column_main(int argc UNUSED_PARAM, char **argv)
-+{
-+	unsigned opts;
-+	const char *in_sep = NULL;
-+	const char *out_sep = "  ";
-+	llist_t *lines = NULL;
-+	llist_t *lp;
-+	FILE *fp;
-+	char *line;
-+	unsigned nrows = 0;
-+	unsigned maxcols = 0;
-+	unsigned *width;      /* width[i]: widest cell in column i */
-+	char ***cells;        /* cells[row][col] */
-+	unsigned *ncells;     /* number of cells per row */
-+	unsigned r, c;
-+
-+	/* bits: t = 1, s = 2, o = 4 */
-+	xfunc_error_retval = 2;
-+	opts = getopt32long(argv, "^" "ts:o:" "\0" "?1",
-+		"table\0"          No_argument       "t"
-+		"separator\0"      Required_argument "s"
-+		"output-separator\0" Required_argument "o"
-+		, &in_sep, &out_sep
-+	);
-+	xfunc_error_retval = 1;   /* past option parsing: failures are operational */
-+
-+	argv += optind;
-+	if (argv[0]) {
-+		fp = xfopen_stdin(argv[0]);
-+	} else {
-+		fp = stdin;
-+	}
-+
-+	while ((line = xmalloc_fgetline(fp)) != NULL)
-+		llist_add_to_end(&lines, line);
-+	if (fp != stdin)
-+		fclose(fp);
-+
-+	/* First pass: split and measure. */
-+	for (lp = lines; lp; lp = lp->link)
-+		nrows++;
-+
-+	if (nrows == 0)
-+		return EXIT_SUCCESS;
-+
-+	cells = xzalloc(nrows * sizeof(cells[0]));
-+	ncells = xzalloc(nrows * sizeof(ncells[0]));
-+	width = xzalloc(sizeof(width[0]));
-+
-+	r = 0;
-+	for (lp = lines; lp; lp = lp->link) {
-+		char *text = lp->data;
-+		char **vec = NULL;
-+		unsigned n = 0;
-+
-+		if (in_sep) {
-+			/* single-character separator: split on each occurrence */
-+			char *p = text;
-+			while (p) {
-+				char *next = strchr(p, in_sep[0]);
-+				if (next)
-+					*next++ = '\0';
-+				vec = xrealloc_vector(vec, 4, n);
-+				vec[n++] = p;
-+				p = next;
-+			}
-+		} else {
-+			/* default: split on runs of blanks, as `column -t` does */
-+			char *p = text;
-+			while (*p) {
-+				while (*p == ' ' || *p == '\t')
-+					p++;
-+				if (!*p)
-+					break;
-+				vec = xrealloc_vector(vec, 4, n);
-+				vec[n++] = p;
-+				while (*p && *p != ' ' && *p != '\t')
-+					p++;
-+				if (*p)
-+					*p++ = '\0';
-+			}
-+		}
-+
-+		cells[r] = vec;
-+		ncells[r] = n;
-+		if (n > maxcols)
-+			maxcols = n;
-+		r++;
-+	}
-+
-+	if (maxcols == 0)
-+		return EXIT_SUCCESS;
-+
-+	width = xrealloc(width, maxcols * sizeof(width[0]));
-+	memset(width, 0, maxcols * sizeof(width[0]));
-+	for (r = 0; r < nrows; r++) {
-+		for (c = 0; c < ncells[r]; c++) {
-+			unsigned w = strlen(cells[r][c]);
-+			if (w > width[c])
-+				width[c] = w;
-+		}
-+	}
-+
-+	for (r = 0; r < nrows; r++) {
-+		for (c = 0; c < ncells[r]; c++) {
-+			fputs(cells[r][c], stdout);
-+			if (c + 1 < ncells[r]) {
-+				unsigned pad = width[c] - strlen(cells[r][c]);
-+				unsigned k;
-+				if (opts & 1) { /* -t */
-+					for (k = 0; k < pad; k++)
-+						bb_putchar(' ');
-+					fputs(out_sep, stdout);
-+				} else {
-+					fputs(out_sep, stdout);
-+				}
-+			}
-+		}
-+		bb_putchar('\n');
-+	}
-+
-+	return EXIT_SUCCESS;
-+}
-
-diff --git a/include/sysinfo_compat.h b/include/sysinfo_compat.h
-new file mode 100644
-new file mode 100644
---- /dev/null
-+++ b/include/sysinfo_compat.h
-@@ -0,0 +1,135 @@
-+/* vi: set sw=4 ts=4: */
-+/*
-+ * shim for the one Linux API that free, uptime, fallocate and ps rely on.
-+ * Kept entirely in this new header so the port never has to edit
-+ * include/platform.h or libbb/platform.c, which patches 0002 and 0003 own.
-+ *
-+ * Licensed under GPLv2, see file LICENSE in this source tree.
-+ */
-+#ifndef BB_SYSINFO_COMPAT_H
-+#define BB_SYSINFO_COMPAT_H
-+
-+#if !defined(__linux__)
-+
-+/* free/uptime/ps read struct sysinfo.  Off Linux there is none, so provide a
-+ * minimal one, filled from sysctls below. */
-+struct sysinfo {
-+	unsigned long uptime;
-+	unsigned long loads[3];
-+	unsigned long totalram;
-+	unsigned long freeram;
-+	unsigned long sharedram;
-+	unsigned long bufferram;
-+	unsigned long totalswap;
-+	unsigned long freeswap;
-+	unsigned short procs;
-+	unsigned long mem_unit;
-+};
-+
-+#if defined(__APPLE__)
-+#include <sys/sysctl.h>
-+#include <mach/mach.h>
-+#include <mach/vm_statistics.h>
-+#include <mach/mach_host.h>
-+
-+static int bb_sysinfo(struct sysinfo *si)
-+{
-+	struct timeval boot, now;
-+	size_t len;
-+	uint64_t memsize = 0;
-+	vm_statistics64_data_t vm;
-+	mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
-+	double loads[3];
-+	int mib[2];
-+
-+	memset(si, 0, sizeof(*si));
-+
-+	mib[0] = CTL_KERN;
-+	mib[1] = KERN_BOOTTIME;
-+	len = sizeof(boot);
-+	if (sysctl(mib, 2, &boot, &len, NULL, 0) == 0) {
-+		gettimeofday(&now, NULL);
-+		if (now.tv_sec > boot.tv_sec)
-+			si->uptime = (unsigned long)(now.tv_sec - boot.tv_sec);
-+	}
-+
-+	len = sizeof(memsize);
-+	if (sysctlbyname("hw.memsize", &memsize, &len, NULL, 0) == 0)
-+		si->totalram = (unsigned long)memsize;
-+
-+	if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
-+			(host_info64_t)&vm, &count) == KERN_SUCCESS
-+	) {
-+		unsigned long page = (unsigned long)vm_page_size;
-+
-+		si->freeram = (unsigned long)
-+			(((uint64_t)vm.free_count + vm.speculative_count) * page);
-+		si->bufferram = (unsigned long)
-+			(((uint64_t)vm.purgeable_count + vm.wire_count) * page);
-+	}
-+
-+	si->mem_unit = 1;
-+	{
-+		/* free(1) prints Swap: total/used/free from these.  macOS keeps swap
-+		 * accounting in vm.swapusage rather than in the VM stats. */
-+		struct xsw_usage xsw;
-+		size_t xlen = sizeof(xsw);
-+		if (sysctlbyname("vm.swapusage", &xsw, &xlen, NULL, 0) == 0) {
-+			si->totalswap = (unsigned long)xsw.xsu_total;
-+			si->freeswap = (unsigned long)xsw.xsu_avail;
-+		}
-+	}
-+	if (getloadavg(loads, 3) == 3) {
-+		/* uptime prints these via LOAD_INT/LOAD_FRAC, i.e. /2048 */
-+		si->loads[0] = (unsigned long)(loads[0] * 2048.0);
-+		si->loads[1] = (unsigned long)(loads[1] * 2048.0);
-+		si->loads[2] = (unsigned long)(loads[2] * 2048.0);
-+	}
-+	return 0;
-+}
-+#define sysinfo(info) bb_sysinfo(info)
-+
-+/* Reclaimable page cache: inactive + purgeable pages.  One definition for
-+ * free, vmstat and top, so the three do not report different "cached" values
-+ * for the same machine. */
-+static unsigned long long bb_darwin_cached_bytes(void)
-+{
-+	vm_statistics64_data_t vm;
-+	mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
-+
-+	memset(&vm, 0, sizeof(vm));
-+	if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
-+			(host_info64_t)&vm, &count) != KERN_SUCCESS)
-+		return 0;
-+	return ((unsigned long long)vm.inactive_count + vm.purgeable_count)
-+		* (unsigned long long)vm_page_size;
-+}
-+
-+
-+/* macOS has no posix_fallocate: F_PREALLOCATE does the work, then the file is
-+ * grown so the semantics match glibc (size becomes offset+len). */
-+#include <sys/fcntl.h>
-+static int bb_posix_fallocate(int fd, off_t offset, off_t len)
-+{
-+	struct fstore fst;
-+	struct stat st;
-+
-+	memset(&fst, 0, sizeof(fst));
-+	fst.fst_flags = F_ALLOCATEALL;
-+	fst.fst_posmode = F_PEOFPOSMODE;
-+	fst.fst_offset = offset;
-+	fst.fst_length = len;
-+	if (fcntl(fd, F_PREALLOCATE, &fst) == -1)
-+		return errno ? errno : EIO;
-+	if (fstat(fd, &st) == 0 && st.st_size < offset + len) {
-+		if (ftruncate(fd, offset + len) != 0)
-+			return errno ? errno : EIO;
-+	}
-+	return 0;
-+}
-+#define posix_fallocate(fd, off, len) bb_posix_fallocate(fd, off, len)
-+#endif /* __APPLE__ */
-+
-+#endif /* !__linux__ */
-+
-+#endif

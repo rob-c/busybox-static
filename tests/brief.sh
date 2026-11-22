@@ -938,7 +938,7 @@ ck "hints is an array" "1" "$("$BB" grep -c '"hints":\[' "$T/j")"
 ck "truncated_by is null when nothing was cut" "1" "$("$BB" grep -c '"truncated_by":null' "$T/j")"
 # the count is a field, so the record itself carries no "Nx " and no newline
 ck "item line is the record, not the rendering" "1" "$("$BB" grep -c '"n":2,"lines":2,"kept":false,"line":"a"' "$T/j")"
-ck "one object per group" "2" "$("$BB" grep -c '"n":' "$T/j")"
+ck "one object per group" "2" "$("$BB" grep -o '"n":' "$T/j" | "$BB" wc -l | cnt)"
 # merged lines are what -t would rank
 ck "hint names -t when lines were merged" "1" "$("$BB" grep -c '\-t 10 ranks' "$T/j")"
 
@@ -963,7 +963,7 @@ ck "hint warns that -o is not a regex" "1" "$("$BB" grep -c 'substrings, not reg
 printf 'src/a.c:1: error: bad\nsrc/a.c:9: error: bad\n' > dj3.txt
 "$BB" brief -i : -c 1 -F json dj3.txt > "$T/j" 2>/dev/null
 ck "f is the projected field array" "1" "$("$BB" grep -c '"f":\["src/a.c"\]' "$T/j")"
-ck "f is absent without a projection" "1" \
+ck "f is absent without a projection" "0" \
 	"$("$BB" brief -F json dj2.txt 2>/dev/null | "$BB" grep -c '"f":')"
 
 # samples only when -a asked for more than one
