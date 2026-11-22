@@ -1,9 +1,9 @@
 diff --git a/miscutils/brief.c b/miscutils/brief.c
 new file mode 100644
-index 0000000..47e946f
+index 0000000..d871d62
 --- /dev/null
 +++ b/miscutils/brief.c
-@@ -0,0 +1,954 @@
+@@ -0,0 +1,959 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * brief - structure-preserving reduction of line-oriented tool output.
@@ -97,6 +97,10 @@ index 0000000..47e946f
 +
 +#define BRIEF_MAX_SAMPLES 8
 +#define BRIEF_MAX_FRANGES 32
++/* A -R record is assembled in memory, so an input that never matches the start
++ * pattern would otherwise hold the whole stream. Past this size the record is
++ * closed early: a pathological input gets several records instead of an OOM. */
++#define BRIEF_MAX_RECORD (4 * 1024 * 1024)
 +
 +enum {
 +	OPT_d = (1 << 0),
@@ -795,6 +799,7 @@ index 0000000..47e946f
 +			/* A new line opens a new record: always without -R, and
 +			 * only when it matches the start pattern with -R. */
 +			if (st.cur_nl && (!st.record_pat
++					|| st.cur.len >= BRIEF_MAX_RECORD
 +					|| mem_contains(line, len, st.record_pat)))
 +				flush_record();
 +			if (st.cur_nl)

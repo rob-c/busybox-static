@@ -1,9 +1,9 @@
 diff --git a/coreutils/peek.c b/coreutils/peek.c
 new file mode 100644
-index 0000000..52edd5f
+index 0000000..63ba1de
 --- /dev/null
 +++ b/coreutils/peek.c
-@@ -0,0 +1,1001 @@
+@@ -0,0 +1,1005 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * peek - bounded, numbered and versioned file reads.
@@ -321,8 +321,12 @@ index 0000000..52edd5f
 +		cost = (size_t)ndig + 3 + tlen + 1;
 +
 +		if (o->shown + cost > o->budget) {
-+			if (o->shown == 0 && o->budget > (size_t)ndig + 3) {
-+				size_t room = o->budget - ((size_t)ndig + 3);
++			size_t room = (o->budget > (size_t)ndig + 3)
++					? o->budget - ((size_t)ndig + 3) : 0;
++
++			if (o->shown == 0 && room == 0)
++				room = 1;   /* always show something, or next never advances */
++			if (room) {
 +				size_t cut = utf8_cut(t, room);
 +				if (o->json) {
 +					if (*any_emitted)

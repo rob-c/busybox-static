@@ -910,5 +910,20 @@ printf 'abc\n' > "$T/fx"
 ck "-i with every field out of range exits 0" "0" "$?"
 inv "-i out of range: invariant" "$T/o"
 
+sec "40. a -R record is bounded in memory"
+
+# 4.5 MB with no match: the record cap must close it instead of holding it all
+"$BB" awk 'BEGIN{for(i=0;i<110000;i++) printf "line %06d aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", i}' > big.txt
+"$BB" brief -R nomatchxyz -B 100 big.txt > "$T/o" 2>/dev/null
+ck "-R with no match still exits 0" "0" "$?"
+ck "-R caps the record instead of buffering it all" "1" \
+	"$("$BB" awk -v r="$(mfo records < "$T/o")" 'BEGIN{print (r>=2)}')"
+inv "-R record cap: invariant" "$T/o"
+
+# a record that fits under the cap stays one record
+printf 'a\nb\nc\n' > "$T/fx"
+"$BB" brief -R a "$T/fx" > "$T/o" 2>/dev/null
+ck "a small -R record is one record" "1" "$(mfo records < "$T/o")"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

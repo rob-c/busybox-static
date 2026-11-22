@@ -1,9 +1,9 @@
 diff --git a/coreutils/run.c b/coreutils/run.c
 new file mode 100644
-index 0000000..6f52bef
+index 0000000..f2b45d2
 --- /dev/null
 +++ b/coreutils/run.c
-@@ -0,0 +1,1160 @@
+@@ -0,0 +1,1162 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * run - captured execution with retrievable evidence.
@@ -846,10 +846,12 @@ index 0000000..6f52bef
 +	int truncated = 0;
 +
 +	if (read_all(path, &data, &len) != 0) {
-+		if (json)
++		if (json) {
 +			printf("{\"schema\":1,\"stream\":\"%s\",\"status\":\"error\","
-+					"\"code\":\"NOT_FOUND\"}", label);
-+		else
++					"\"code\":\"NOT_FOUND\",\"message\":", label);
++			json_write_str("run not found or stream missing");
++			putchar('}');
++		} else
 +			fprintf(stderr, "%s: NOT_FOUND\n", path);
 +		return 1;
 +	}
