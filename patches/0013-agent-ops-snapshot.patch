@@ -1,0 +1,275 @@
+diff --git a/miscutils/snapshot.c b/miscutils/snapshot.c
+new file mode 100644
+index 0000000..d5fcfb1
+--- /dev/null
++++ b/miscutils/snapshot.c
+@@ -0,0 +1,269 @@
++/* vi: set sw=4 ts=4: */
++/*
++ * snapshot - hash a directory tree and diff two snapshots.
++ *
++ * Licensed under GPLv2, see file LICENSE in this source tree.
++ */
++//config:config SNAPSHOT
++//config:	bool "snapshot (5 kb)"
++//config:	default n
++//config:	help
++//config:	  Record the sha256 of every regular file under a directory, or
++//config:	  compare two such records and print what changed. Same command,
++//config:	  same fields on Linux and Darwin, no inotify and no /proc.
++
++//applet:IF_SNAPSHOT(APPLET_NOEXEC(snapshot, snapshot_main, BB_DIR_USR_BIN, BB_SUID_DROP, snapshot))
++
++//kbuild:lib-$(CONFIG_SNAPSHOT) += snapshot.o
++
++//usage:#define snapshot_trivial_usage
++//usage:       "[-d DIR] [-o FILE] [--diff A B] [--format json]"
++//usage:#define snapshot_full_usage "\n\n"
++//usage:       "Hash a tree, or diff two saved snapshots\n"
++//usage:     "\n	-d DIR	Tree to walk (default: .)"
++//usage:     "\n	-o FILE	Write the snapshot to FILE instead of stdout"
++//usage:     "\n	--diff A B	Compare two snapshot files"
++//usage:     "\n	--format json	Structured output (schema 1)"
++
++#include "libbb.h"
++
++static const char snap_longopts[] ALIGN1 =
++	"dir\0"    Required_argument "d"
++	"output\0" Required_argument "o"
++	"diff\0"   Required_argument "D"
++	"format\0" Required_argument "F"
++	;
++#define snap_longopts (snap_longopts)
++
++struct ent {
++	char *path;      /* relative, no leading ./ */
++	char *hash;
++	off_t size;
++};
++
++struct entlist {
++	struct ent *v;
++	unsigned n, cap;
++};
++
++static void add_ent(struct entlist *l, char *path, const char *hash, off_t size)
++{
++	if (l->n == l->cap) {
++		l->cap = l->cap ? l->cap * 2 : 64;
++		l->v = xrealloc(l->v, sizeof(l->v[0]) * l->cap);
++	}
++	l->v[l->n].path = path;
++	l->v[l->n].hash = xstrdup(hash);
++	l->v[l->n].size = size;
++	l->n++;
++}
++
++static int cmp_ent(const void *a, const void *b)
++{
++	return strcmp(((const struct ent *)a)->path, ((const struct ent *)b)->path);
++}
++
++static void hash_file(const char *full, char *out64)
++{
++	sha256_ctx_t ctx;
++	unsigned char res[32];
++	int fd = open_or_warn(full, O_RDONLY);
++	ssize_t r;
++	char buf[4096];
++
++	if (fd < 0) {
++		strcpy(out64, "unreadable");
++		return;
++	}
++	sha256_begin(&ctx);
++	while ((r = safe_read(fd, buf, sizeof(buf))) > 0)
++		sha256_hash(&ctx, buf, r);
++	close(fd);
++	sha256_end(&ctx, res);
++	bin2hex(out64, (char *)res, 32);
++}
++
++static void walk(struct entlist *l, const char *base, const char *rel, int depth)
++{
++	DIR *d;
++	struct dirent *de;
++	char *dirpath = rel[0] ? xasprintf("%s/%s", base, rel) : xstrdup(base);
++
++	if (depth > 32) {
++		free(dirpath);
++		return;
++	}
++	d = opendir(dirpath);
++	if (!d) {
++		free(dirpath);
++		return;
++	}
++	while ((de = readdir(d)) != NULL) {
++		char *child_rel, *full;
++		struct stat st;
++
++		if (de->d_name[0] == '.'
++		 && (de->d_name[1] == '\0'
++		  || (de->d_name[1] == '.' && de->d_name[2] == '\0'))
++		)
++			continue;
++		child_rel = rel[0] ? xasprintf("%s/%s", rel, de->d_name) : xstrdup(de->d_name);
++		full = xasprintf("%s/%s", base, child_rel);
++		if (lstat(full, &st) != 0) {
++			free(full);
++			free(child_rel);
++			continue;
++		}
++		if (S_ISDIR(st.st_mode)) {
++			walk(l, base, child_rel, depth + 1);
++			free(child_rel);
++		} else if (S_ISREG(st.st_mode)) {
++			char h[65];
++
++			hash_file(full, h);
++			add_ent(l, child_rel, h, st.st_size);
++		} else {
++			free(child_rel);
++		}
++		free(full);
++	}
++	closedir(d);
++	free(dirpath);
++}
++
++/* Read "hash size path" lines produced by a previous run. */
++static void load(const char *file, struct entlist *l)
++{
++	char *buf = xmalloc_open_read_close(file, NULL);
++	char *save = buf, *line;
++
++	while (buf && (line = strsep(&save, "\n")) != NULL) {
++		char *hash, *size, *path;
++
++		if (!*line)
++			continue;
++		hash = strsep(&line, " ");
++		size = strsep(&line, " ");
++		path = line;
++		if (!path)
++			continue;
++		add_ent(l, xstrdup(path), hash, (off_t)strtoull(size, NULL, 10));
++	}
++	free(buf);
++}
++
++static void json_str(const char *s)
++{
++	putchar('"');
++	for (; *s; s++) {
++		if (*s == '"' || *s == '\\')
++			printf("\\%c", *s);
++		else if ((unsigned char)*s < 0x20)
++			printf("\\u%04x", (unsigned char)*s);
++		else
++			putchar(*s);
++	}
++	putchar('"');
++}
++
++int snapshot_main_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
++int snapshot_main_main(int argc UNUSED_PARAM, char **argv)
++{
++	const char *opt_dir = NULL, *opt_out = NULL, *opt_diff = NULL, *opt_fmt = NULL;
++	struct entlist l = { NULL, 0, 0 };
++	int json_out, rc = 0;
++	unsigned i;
++	FILE *out;
++
++	getopt32long(argv, "d:o:D:F:", snap_longopts, &opt_dir, &opt_out, &opt_diff, &opt_fmt);
++	json_out = opt_fmt && strcmp(opt_fmt, "json") == 0;
++
++	if (opt_diff) {
++		/* --diff A B: opt_diff holds A, argv[optind] holds B */
++		struct entlist a = { NULL, 0, 0 }, b = { NULL, 0, 0 };
++		unsigned ia = 0, ib = 0, changed = 0, added = 0, removed = 0, comma = 0;
++
++		argv += optind;
++		if (!argv[0])
++			bb_show_usage();
++		load(opt_diff, &a);
++		load(argv[0], &b);
++		qsort(a.v, a.n, sizeof(a.v[0]), cmp_ent);
++		qsort(b.v, b.n, sizeof(b.v[0]), cmp_ent);
++
++		if (json_out)
++			fputs("{\"schema\":1,\"status\":\"ok\",\"changes\":[", stdout);
++		while (ia < a.n || ib < b.n) {
++			int c;
++			const struct ent *ea = ia < a.n ? &a.v[ia] : NULL;
++			const struct ent *eb = ib < b.n ? &b.v[ib] : NULL;
++			const char *kind = NULL;
++
++			if (!ea)
++				c = 1;
++			else if (!eb)
++				c = -1;
++			else
++				c = strcmp(ea->path, eb->path);
++			if (c < 0) {
++				kind = "removed";
++				removed++;
++				ia++;
++			} else if (c > 0) {
++				kind = "added";
++				added++;
++				ib++;
++			} else {
++				if (strcmp(ea->hash, eb->hash) != 0) {
++					kind = "changed";
++					changed++;
++				}
++				ia++;
++				ib++;
++			}
++			if (!kind)
++				continue;
++			if (json_out) {
++				if (comma++)
++					putchar(',');
++				fputs("{\"kind\":\"", stdout);
++				fputs(kind, stdout);
++				fputs("\",\"path\":", stdout);
++				json_str(c < 0 ? ea->path : eb->path);
++				putchar('}');
++			} else {
++				printf("%s %s\n", kind, c < 0 ? ea->path : eb->path);
++			}
++		}
++		if (json_out)
++			printf("],\"added\":%u,\"removed\":%u,\"changed\":%u}\n",
++					added, removed, changed);
++		else
++			printf("added=%u removed=%u changed=%u\n", added, removed, changed);
++		fflush_stdout_and_exit(added || removed || changed ? 1 : 0);
++	}
++
++	walk(&l, opt_dir ? opt_dir : ".", "", 0);
++	qsort(l.v, l.n, sizeof(l.v[0]), cmp_ent);
++
++	out = opt_out ? xfopen_for_write(opt_out) : stdout;
++	if (json_out) {
++		fprintf(out, "{\"schema\":1,\"status\":\"ok\",\"dir\":");
++		fputs("\"", out);
++		fputs(opt_dir ? opt_dir : ".", out);
++		fprintf(out, "\",\"count\":%u,\"files\":[", l.n);
++		for (i = 0; i < l.n; i++) {
++			if (i)
++				putc(',', out);
++			fprintf(out, "{\"path\":\"%s\",\"size\":%lld,\"sha256\":\"%s\"}",
++					l.v[i].path, (long long)l.v[i].size, l.v[i].hash);
++		}
++		fputs("]}\n", out);
++	} else {
++		for (i = 0; i < l.n; i++)
++			fprintf(out, "%s %lld %s\n", l.v[i].hash, (long long)l.v[i].size, l.v[i].path);
++	}
++	if (out != stdout)
++		fclose(out);
++	return rc;
++}

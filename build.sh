@@ -72,6 +72,7 @@ if [[ -n "$ZIGTRIPLE" ]]; then
 		"CONFIG_JSON=y"
 		"CONFIG_PATCHCHECK=y"
 		"CONFIG_BENCH=y"
+		"CONFIG_SNAPSHOT=y"
 		# tc.c still uses the CBQ qdisc API, removed from Linux kernel headers
 		# (sched_cbq was deleted in Linux 6.x), so it cannot compile here.
 		"CONFIG_TC=n"
@@ -108,6 +109,7 @@ else
 		"CONFIG_JSON=y"
 		"CONFIG_PATCHCHECK=y"
 		"CONFIG_BENCH=y"
+		"CONFIG_SNAPSHOT=y"
 		# Applets ported to macOS in patch 0004.  They must be listed here,
 		# not just edited into build/<target>/.config: build-all.sh wipes the
 		# build dirs, so anything set only in a .config is lost on a clean
