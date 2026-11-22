@@ -20,7 +20,7 @@ updated: "2026-11-22T17:23:28.877Z"
 | case | rtk | brief | verdict |
 |---|---|---|---|
 | `git log -30` (18,918 B) | 9,672 B digest | 2,020 B, whole commits | brief, 4.8× smaller and byte-exact |
-| `grep -rn` (36,000 B) | `rg` 14,361 B | `-i : -c 1 -t 20` 2,504 B | brief, 5.7× smaller |
+| `grep -rn` (36,000 B) | `rg` 14,361 B | `-i : -c 1 -t 20` 766 B | brief, 18.7× smaller |
 | pytest log (17,137 B) | `log` 644 B (no messages), `err` 772 B | `-o FAILED` 618 B | brief: smaller and it keeps the messages |
 | `ls -l` (11,129 B) | 779 B, 52/174 entries silently | 999 B, 54 entries, `truncated=1` | brief: rtk's head start is silent loss |
 | wall time | `rtk ls` 70.5 ms | `ls -l \| brief` 35.7 ms | brief, one process |

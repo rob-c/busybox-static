@@ -1,9 +1,9 @@
 diff --git a/miscutils/brief.c b/miscutils/brief.c
 new file mode 100644
-index 0000000..4d213b8
+index 0000000..da08407
 --- /dev/null
 +++ b/miscutils/brief.c
-@@ -0,0 +1,1137 @@
+@@ -0,0 +1,1142 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * brief - structure-preserving reduction of line-oriented tool output.
@@ -92,6 +92,11 @@ index 0000000..4d213b8
 +//usage:     "\n"
 +//usage:     "\nThe marker carries in_bytes and bytes, so the saving of every call"
 +//usage:     "\nis measurable without a ledger file."
++//usage:     "\n"
++//usage:     "\n-F json returns the same numbers plus a summary sentence, hints"
++//usage:     "\nnaming the flag that would change the answer, a reason in"
++//usage:     "\ntruncated_by, and one object per group whose line carries the"
++//usage:     "\nrecord itself - no count prefix, no trailing newline."
 +
 +#include "libbb.h"
 +

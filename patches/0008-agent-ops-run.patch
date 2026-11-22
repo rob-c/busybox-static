@@ -1,9 +1,9 @@
 diff --git a/coreutils/run.c b/coreutils/run.c
 new file mode 100644
-index 0000000..c828994
+index 0000000..ac381c5
 --- /dev/null
 +++ b/coreutils/run.c
-@@ -0,0 +1,1265 @@
+@@ -0,0 +1,1288 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * run - captured execution with retrievable evidence.
@@ -45,6 +45,7 @@ index 0000000..c828994
 +//usage:     "\n	-P, --pgid		Print the child's process group id"
 +//usage:     "\n	-e, --env NAME=VALUE	Set NAME for the child (repeatable)"
 +//usage:     "\n	-r, --prune N		Keep only the newest N runs"
++//usage:     "\n	-q, --quiet		Print the captured streams only, no summary"
 +//usage:     "\n	-b, --brief WHICH	Reduce the view through brief -d:"
 +//usage:     "\n			stdout (default), stderr or both"
 +//usage:     "\n	-F, --format FMT	text (default) or json"
@@ -507,6 +508,7 @@ index 0000000..c828994
 +	char *opt_prune = NULL;
 +	char *opt_brief = NULL;
 +	int brief_out = 0, brief_err = 0;
++	int quiet = 0;
 +	unsigned opts;
 +	long deadline_ms = 0, budget = DEFAULT_VIEW, capture_limit = DEFAULT_CAPTURE;
 +	int kill_after = 2000, json = 0, use_shell = 0;
@@ -532,6 +534,7 @@ index 0000000..c828994
 +		"stdin\0"         Required_argument "i"
 +		"pgid\0"          No_argument       "P"
 +		"prune\0"         Required_argument "r"
++		"quiet\0"         No_argument       "q"
 +		"brief\0"         Required_argument "b"
 +		;
 +
@@ -555,10 +558,11 @@ index 0000000..c828994
 +		}
 +		argv[j] = NULL;
 +	}
-+	opts = getopt32long(argv, "T:k:B:C:D:d:sF:i:Pr:b:", run_longopts,
++	opts = getopt32long(argv, "T:k:B:C:D:d:sF:i:Pr:b:q", run_longopts,
 +			&opt_timeout, &opt_kill, &opt_bytes, &opt_capture,
 +			&opt_dir, &opt_cwd, &opt_fmt, &opt_stdin, &opt_prune, &opt_brief);
 +	use_shell = (opts & (1 << 6)) != 0;   /* s */
++	quiet = (opts & (1 << 12)) != 0;      /* q: 13th letter of the optstring */
 +	if (opt_brief) {
 +		if (strcmp(opt_brief, "both") == 0)
 +			brief_out = brief_err = 1;
@@ -799,6 +803,25 @@ index 0000000..c828994
 +			}
 +			putchar('}');
 +			putchar('\n');
++		} else if (quiet) {
++			if (brief_out) {
++				char *bv = brief_reduce(p1, (size_t)budget);
++
++				if (bv) {
++					fputs(bv, stdout);
++					free(bv);
++				}
++			} else
++				dump_bounded(p1, (size_t)budget, 0, "stdout");
++			if (brief_err) {
++				char *bv = brief_reduce(p2, (size_t)budget / 4);
++
++				if (bv) {
++					fputs(bv, stderr);
++					free(bv);
++				}
++			} else
++				dump_bounded(p2, (size_t)budget / 4, 0, "stderr");
 +		} else {
 +			printf("run=R%u exit_code=%d timed_out=%s cancelled=%s duration_ms=%ld\n",
 +					id, m.exit_code, m.timed_out ? "true" : "false",
