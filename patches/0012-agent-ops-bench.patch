@@ -1,0 +1,150 @@
+diff --git a/miscutils/bench.c b/miscutils/bench.c
+new file mode 100644
+index 0000000..2bed0ad
+--- /dev/null
++++ b/miscutils/bench.c
+@@ -0,0 +1,144 @@
++/* vi: set sw=4 ts=4: */
++/*
++ * bench - run a command N times and report the timings.
++ *
++ * Licensed under GPLv2, see file LICENSE in this source tree.
++ */
++//config:config BENCH
++//config:	bool "bench (5 kb)"
++//config:	default n
++//config:	help
++//config:	  Run a command repeatedly and report min/median/max wall time.
++//config:	  Output is one line per run plus a summary, or JSON with
++//config:	  --format json. Warmup runs are discarded.
++
++//applet:IF_BENCH(APPLET_NOEXEC(bench, bench_main, BB_DIR_USR_BIN, BB_SUID_DROP, bench))
++
++//kbuild:lib-$(CONFIG_BENCH) += bench.o
++
++//usage:#define bench_trivial_usage
++//usage:       "[-n N] [-w N] [--format json] [--] CMD..."
++//usage:#define bench_full_usage "\n\n"
++//usage:       "Time CMD N times\n"
++//usage:     "\n	-n N	Runs (default 5)"
++//usage:     "\n	-w N	Warmup runs to discard (default 1)"
++//usage:     "\n	--format json	Structured output (schema 1)"
++
++#include "libbb.h"
++#include <sys/wait.h>
++#include <time.h>
++
++static const char bench_longopts[] ALIGN1 =
++	"runs\0"   Required_argument "n"
++	"warmup\0" Required_argument "w"
++	"format\0" Required_argument "F"
++	;
++#define bench_longopts (bench_longopts)
++
++static long long now_us(void)
++{
++	struct timespec ts;
++
++	clock_gettime(CLOCK_MONOTONIC, &ts);
++	return (long long)ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
++}
++
++/* Run once; returns the child's status (exit code, or 128+signal). */
++static int run_once(char **argv)
++{
++	pid_t pid;
++	int st;
++
++	fflush_all();
++	pid = fork();
++	if (pid < 0)
++		return -1;
++	if (pid == 0) {
++		execvp(argv[0], argv);
++		_exit(127);
++	}
++	if (waitpid(pid, &st, 0) < 0)
++		return -1;
++	if (WIFEXITED(st))
++		return WEXITSTATUS(st);
++	if (WIFSIGNALED(st))
++		return 128 + WTERMSIG(st);
++	return -1;
++}
++
++static int cmp_ll(const void *a, const void *b)
++{
++	long long x = *(const long long *)a, y = *(const long long *)b;
++	return x < y ? -1 : (x > y ? 1 : 0);
++}
++
++int bench_main_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
++int bench_main_main(int argc UNUSED_PARAM, char **argv)
++{
++	const char *opt_runs = NULL, *opt_warm = NULL, *opt_fmt = NULL;
++	long long *t;
++	long long sum = 0, min, max;
++	unsigned n, i, ok = 0, failed = 0;
++	int json_out, rc, last;
++
++	getopt32long(argv, "+n:w:F:", bench_longopts, &opt_runs, &opt_warm, &opt_fmt);
++	argv += optind;
++	if (!argv[0])
++		bb_show_usage();
++	json_out = opt_fmt && strcmp(opt_fmt, "json") == 0;
++	n = opt_runs ? (unsigned)strtoul(opt_runs, NULL, 10) : 5;
++	if (n == 0)
++		n = 1;
++
++	for (i = 0; opt_warm && i < (unsigned)strtoul(opt_warm, NULL, 10); i++)
++		run_once(argv);
++
++	t = xmalloc(sizeof(t[0]) * n);
++	rc = 0;
++	for (i = 0; i < n; i++) {
++		long long t0 = now_us();
++
++		last = run_once(argv);
++		t[i] = now_us() - t0;
++		if (last == 0) {
++			ok++;
++			sum += t[i];
++		} else {
++			failed++;
++			rc = 1;
++		}
++		if (!json_out)
++			printf("run=%u ms=%lld.%03lld status=%d\n", i + 1,
++					t[i] / 1000, t[i] % 1000, last);
++	}
++
++	min = max = t[0];
++	for (i = 1; i < n; i++) {
++		if (t[i] < min) min = t[i];
++		if (t[i] > max) max = t[i];
++	}
++	qsort(t, n, sizeof(t[0]), cmp_ll);
++
++	if (json_out) {
++		printf("{\"schema\":1,\"status\":\"%s\",\"runs\":%u,\"ok\":%u,\"failed\":%u,"
++				"\"min_us\":%lld,\"median_us\":%lld,\"max_us\":%lld,\"mean_us\":%lld,"
++				"\"cmd\":",
++				rc ? "error" : "ok", n, ok, failed,
++				min, t[n / 2], max, ok ? sum / (long long)ok : 0);
++		putchar('"');
++		for (i = 0; argv[i]; i++) {
++			if (i)
++				putchar(' ');
++			fputs(argv[i], stdout);
++		}
++		fputs("\"}\n", stdout);
++	} else {
++		printf("runs=%u ok=%u failed=%u min_ms=%lld.%03lld median_ms=%lld.%03lld "
++				"max_ms=%lld.%03lld\n",
++				n, ok, failed,
++				min / 1000, min % 1000,
++				t[n / 2] / 1000, t[n / 2] % 1000,
++				max / 1000, max % 1000);
++	}
++	fflush_stdout_and_exit(rc);
++}
