@@ -1,9 +1,9 @@
 diff --git a/coreutils/run.c b/coreutils/run.c
 new file mode 100644
-index 0000000..f8de7db
+index 0000000..d5f5470
 --- /dev/null
 +++ b/coreutils/run.c
-@@ -0,0 +1,1061 @@
+@@ -0,0 +1,1073 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * run - captured execution with retrievable evidence.
@@ -42,6 +42,7 @@ index 0000000..f8de7db
 +//usage:     "\n	-d, --cwd DIR		Working directory for the child"
 +//usage:     "\n	-s, --shell		Run the rest through sh -c"
 +//usage:     "\n	-i, --stdin FILE	Feed FILE as the child's stdin"
++//usage:     "\n	-P, --pgid		Print the child's process group id"
 +//usage:     "\n	-F, --format FMT	text (default) or json"
 +//usage:     "\n"
 +//usage:     "\nExit: the child's status when it exits on its own, 3 when this"
@@ -70,6 +71,8 @@ index 0000000..f8de7db
 +	DEFAULT_CONTEXT = 3,
 +	MAX_RANGES = 200,
 +};
++
++static long child_pgid;
 +
 +struct meta {
 +	char *cmd;
@@ -173,11 +176,11 @@ index 0000000..f8de7db
 +		int n = snprintf(buf, sizeof(buf),
 +				"cmd=%s\ncwd=%s\nduration_ms=%ld\nexit_code=%d\n"
 +				"signal=%d\ntimed_out=%d\ncancelled=%d\n"
-+				"capture_complete=%d\nstdout_bytes=%llu\nstderr_bytes=%llu\n",
++				"capture_complete=%d\nstdout_bytes=%llu\nstderr_bytes=%llu\npgid=%ld\n",
 +				m->cmd ? m->cmd : "", m->cwd ? m->cwd : "",
 +				m->duration_ms, m->exit_code, m->term_sig,
 +				m->timed_out, m->cancelled, m->capture_complete,
-+				m->out_bytes, m->err_bytes);
++				m->out_bytes, m->err_bytes, child_pgid);
 +		if (n > 0)
 +			full_write(fd, buf, (size_t)n);
 +		close(fd);
@@ -384,6 +387,7 @@ index 0000000..f8de7db
 +	char *opt_timeout = NULL, *opt_kill = NULL, *opt_bytes = NULL;
 +	char *opt_capture = NULL, *opt_dir = NULL, *opt_cwd = NULL, *opt_fmt = NULL;
 +	char *opt_stdin = NULL;
++	int opt_pgid = 0;
 +	unsigned opts;
 +	long deadline_ms = 0, budget = DEFAULT_VIEW, capture_limit = DEFAULT_CAPTURE;
 +	int kill_after = 2000, json = 0, use_shell = 0;
@@ -407,14 +411,18 @@ index 0000000..f8de7db
 +		"shell\0"         No_argument       "s"
 +		"format\0"        Required_argument "F"
 +		"stdin\0"         Required_argument "i"
++		"pgid\0"          No_argument       "P"
 +		;
 +
 +	xfunc_error_retval = 2;
 +
-+	opts = getopt32long(argv, "T:k:B:C:D:d:sF:i:", run_longopts,
++	opts = getopt32long(argv, "T:k:B:C:D:d:sF:i:P", run_longopts,
 +			&opt_timeout, &opt_kill, &opt_bytes, &opt_capture,
 +			&opt_dir, &opt_cwd, &opt_fmt, &opt_stdin);
 +	use_shell = (opts & (1 << 6)) != 0;   /* s */
++	{
++		opt_pgid = (opts & (1 << 9)) != 0;   /* P */
++	}
 +	argv += optind;
 +
 +	if (opt_fmt) {
@@ -547,6 +555,7 @@ index 0000000..f8de7db
 +		_exit(127);
 +	}
 +	setpgid(pid, pid);              /* both sides: no window where pgid is unset */
++	child_pgid = (long)pid;
 +	close(outp[1]);
 +	close(errp[1]);
 +	{
@@ -605,6 +614,7 @@ index 0000000..f8de7db
 +		if (json) {
 +			printf("{\"schema\":1,\"run\":\"R%u\",\"dir\":", id);
 +			json_write_str(dir);
++			printf(",\"pgid\":%ld", child_pgid);
 +			printf(",\"exit_code\":%d,\"timed_out\":%s,\"cancelled\":%s,"
 +					"\"capture_complete\":%s,\"duration_ms\":%ld,"
 +					"\"stdout_bytes\":%llu,\"stderr_bytes\":%llu,"
@@ -638,6 +648,8 @@ index 0000000..f8de7db
 +					(m.out_bytes + m.err_bytes) > (unsigned long long)budget
 +						? "true" : "false");
 +			printf("stdout_artifact=%s\nstderr_artifact=%s\n", p1, p2);
++			if (opt_pgid)
++				printf("pgid=%ld\n", child_pgid);
 +			fputs("--- stdout ---\n", stdout);
 +			shown = dump_bounded(p1, (size_t)budget, 0, "stdout");
 +			if (!shown)
