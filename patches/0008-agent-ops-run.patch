@@ -1,9 +1,9 @@
 diff --git a/coreutils/run.c b/coreutils/run.c
 new file mode 100644
-index 0000000..85d8922
+index 0000000..2838b41
 --- /dev/null
 +++ b/coreutils/run.c
-@@ -0,0 +1,1347 @@
+@@ -0,0 +1,1572 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * run - captured execution with retrievable evidence.
@@ -44,9 +44,13 @@ index 0000000..85d8922
 +//usage:     "\n	-i, --stdin FILE	Feed FILE as the child's stdin"
 +//usage:     "\n	-P, --pgid		Print the child's process group id"
 +//usage:     "\n	-e, --env NAME=VALUE	Set NAME for the child (repeatable)"
++//usage:     "\n	-I, --error-ids	Child gets BUSYBOX_ERROR_IDS=1: ids to stdout,\""
++//usage:     "\n			messages to stderr, and \"codes\" in --format json"
 +//usage:     "\n	-r, --prune N		Keep only the newest N runs"
 +//usage:     "\n	-q, --quiet		Print the captured streams only, no summary"
 +//usage:     "\n	-j, --brief-json	Emit brief's JSON (schema 1) as the body"
++//usage:     "\n	-t, --timestamps	Prefix every line with its time and stream,"
++//usage:     "\n			in one interleaved stream (dmesg style)"
 +//usage:     "\n	-b, --brief WHICH	Reduce the view through brief -d:"
 +//usage:     "\n			stdout (default), stderr or both"
 +//usage:     "\n	-F, --format FMT	text (default) or json"
@@ -81,6 +85,7 @@ index 0000000..85d8922
 +static long child_pgid;
 +static char **child_env;   /* NAME=VALUE pairs from --env, NULL-terminated */
 +static int n_child_env;
++static int error_ids;
 +
 +struct meta {
 +	char *cmd;
@@ -198,6 +203,119 @@ index 0000000..85d8922
 +
 +/* ---------- run: capture ---------- */
 +
++/* ---------- timeline: one line, one timestamp, both streams ---------- */
++
++/* The two pipes are separate, so byte order between them is not recoverable;
++ * what IS recoverable is the order in which this process read each complete
++ * line. Stamping at read time is the honest approximation, and it is far
++ * better than the two-section view, which loses the interleaving entirely.
++ * Timestamps are CLOCK_MONOTONIC microseconds since the child was forked. */
++struct tlrec {
++	unsigned long long us;
++	char stream;      /* 'o' or 'e' */
++	char *text;
++};
++
++static struct {
++	struct tlrec *v;
++	unsigned n, cap;
++	size_t bytes, budget;
++	int truncated;
++	unsigned long long start_us;
++	char *part[2];    /* partial line per stream */
++	size_t plen[2], pcap[2];
++	int on;
++} tl;
++
++static void tl_put(int i, const char *p, size_t n, unsigned long long us)
++{
++	struct tlrec *r;
++
++	if (tl.bytes + n + 1 > tl.budget) {
++		tl.truncated = 1;
++		return;
++	}
++	if (tl.n == tl.cap) {
++		tl.cap = tl.cap ? tl.cap * 2 : 256;
++		tl.v = xrealloc(tl.v, tl.cap * sizeof(tl.v[0]));
++	}
++	r = &tl.v[tl.n++];
++	r->us = us;
++	r->stream = i ? 'e' : 'o';
++	r->text = xmalloc(n + 1);
++	memcpy(r->text, p, n);
++	r->text[n] = '\0';
++	tl.bytes += n + 1;
++}
++
++/* Assemble lines per stream; a line is stamped when its newline arrives. */
++static void tl_feed(int i, const char *p, size_t n)
++{
++	unsigned long long us;
++
++	if (!tl.on)
++		return;
++	us = monotonic_us() - tl.start_us;
++	while (n) {
++		const char *nl = memchr(p, '\n', n);
++		size_t take = nl ? (size_t)(nl - p) : n;
++
++		if (tl.plen[i] + take + 1 > tl.pcap[i]) {
++			tl.pcap[i] = (tl.plen[i] + take + 1) * 2;
++			tl.part[i] = xrealloc(tl.part[i], tl.pcap[i]);
++		}
++		memcpy(tl.part[i] + tl.plen[i], p, take);
++		tl.plen[i] += take;
++		p += take;
++		n -= take;
++		if (nl) {
++			tl_put(i, tl.part[i], tl.plen[i], us);
++			tl.plen[i] = 0;
++			p++;
++			n--;
++		}
++	}
++}
++
++static void tl_flush_partials(void)
++{
++	int i;
++
++	for (i = 0; i < 2; i++) {
++		if (tl.plen[i]) {
++			tl_put(i, tl.part[i], tl.plen[i], monotonic_us() - tl.start_us);
++			tl.plen[i] = 0;
++		}
++	}
++}
++
++static void tl_print_text(void)
++{
++	unsigned i;
++
++	for (i = 0; i < tl.n; i++)
++		printf("[%4llu.%06llu %s] %s\n",
++				tl.v[i].us / 1000000, tl.v[i].us % 1000000,
++				tl.v[i].stream == 'e' ? "err" : "out", tl.v[i].text);
++	if (tl.truncated)
++		printf("... [timeline truncated at %u bytes] ...\n", (unsigned)tl.budget);
++}
++
++static void tl_print_json(void)
++{
++	unsigned i;
++
++	printf("\"timeline\":[");
++	for (i = 0; i < tl.n; i++) {
++		printf("%s{\"us\":%llu,\"stream\":\"%s\",\"text\":",
++				i ? "," : "", tl.v[i].us,
++				tl.v[i].stream == 'e' ? "err" : "out");
++		json_write_str(tl.v[i].text);
++		putchar('}');
++	}
++	printf("],\"timeline_truncated\":%s", tl.truncated ? "true" : "false");
++}
++
 +static void pump(int fds[2], int arts[2], long deadline_ms, int kill_after_ms,
 +		long capture_limit, pid_t pid, struct meta *m)
 +{
@@ -282,9 +400,11 @@ index 0000000..85d8922
 +			}
 +			if (quota_used[i] >= capture_limit && (size_t)r > (size_t)w)
 +				m->capture_complete = 0;
++			tl_feed(i, buf, (size_t)r);
 +		}
 +	}
 +	(void)captured;
++	tl_flush_partials();
 +}
 +
 +/* Bound head+tail into ONE string, so JSON gets a single scalar. */
@@ -515,6 +635,69 @@ index 0000000..85d8922
 +	return removed;
 +}
 +
++/* Collect the diagnostic ids a child wrote to its stdout ("E NOT_FOUND"), in
++ * order, deduped, capped: the answer to "what went wrong" without the prose.
++ * Ids are matched by shape, not by a list, so an applet that learns a new code
++ * needs no change here. */
++#define CODES_MAX 8
++static void put_codes(const char *path)
++{
++	char buf[4096];
++	char *seen[CODES_MAX];
++	int nseen = 0, first = 1, fd, n;
++
++	fd = open(path, O_RDONLY);
++	putchar('[');
++	while (fd >= 0 && (n = safe_read(fd, buf, sizeof(buf) - 1)) > 0) {
++		char *p = buf, *end = buf + n;
++		int j;
++
++		buf[n] = '\0';
++		while (p < end) {
++			char *nl = memchr(p, '\n', (size_t)(end - p));
++			char *sp;
++			int len;
++
++			if (!nl)   /* a partial line: ignore it, ids are short */
++				break;
++			len = (int)(nl - p);
++			sp = p + 2;   /* skip "E " */
++			if (len >= 4 && (p[0] == 'E' || p[0] == 'W' || p[0] == 'I')
++			 && p[1] == ' '
++			 && (nl - sp) > 0 && (nl - sp) < 40
++			) {
++				int ok = 1;
++				for (j = 0; j < (int)(nl - sp); j++) {
++					char c = sp[j];
++					if (!((c >= 'A' && c <= 'Z') || c == '_' || (c >= '0' && c <= '9')))
++						ok = 0;
++				}
++				if (ok) {
++					int k, dup = 0;
++					for (k = 0; k < nseen; k++)
++						if ((int)strlen(seen[k]) == len && memcmp(seen[k], p, (size_t)len) == 0)
++							dup = 1;
++					if (!dup && nseen < CODES_MAX) {
++						seen[nseen++] = xstrndup(p, (size_t)len);
++						if (!first)
++							putchar(',');
++						json_write_str(seen[nseen - 1]);
++						first = 0;
++					}
++				}
++			}
++			p = nl + 1;
++		}
++		if (nseen >= CODES_MAX)
++			break;
++	}
++	if (fd >= 0)
++		close(fd);
++	while (nseen > 0)
++		free(seen[--nseen]);
++	putchar(']');
++}
++
 +static char *json_join_argv(char **argv)
 +{
 +		size_t len = 0;
@@ -573,6 +756,7 @@ index 0000000..85d8922
 +		"prune\0"         Required_argument "r"
 +		"quiet\0"         No_argument       "q"
 +		"brief-json\0"    No_argument       "j"
++	"timestamps\0"    No_argument       "t"
 +		"brief\0"         Required_argument "b"
 +		;
 +
@@ -583,6 +767,16 @@ index 0000000..85d8922
 +
 +		child_env = xzalloc(sizeof(char *) * (argc + 1));
 +		for (i = 1; argv[i]; i++) {
++			/* -I/--error-ids is BUSYBOX_ERROR_IDS=1 for the child: the
++			 * applet writes ids to its own stdout and the messages, id
++			 * first, to its stderr. Off by default. */
++			if (strcmp(argv[i], "--error-ids") == 0 || strcmp(argv[i], "-I") == 0) {
++				/* xstrdup: the child writes a NUL into the entry to
++				 * split NAME=VALUE, so a string literal would crash it. */
++				child_env[n_child_env++] = xstrdup("BUSYBOX_ERROR_IDS=1");
++				error_ids = 1;
++				continue;
++			}
 +			if ((strcmp(argv[i], "--env") == 0 || strcmp(argv[i], "-e") == 0)
 +			 && argv[i + 1]
 +			) {
@@ -596,7 +790,7 @@ index 0000000..85d8922
 +		}
 +		argv[j] = NULL;
 +	}
-+	opts = getopt32long(argv, "T:k:B:C:D:d:sF:i:Pr:b:qj", run_longopts,
++	opts = getopt32long(argv, "T:k:B:C:D:d:sF:i:Pr:b:qjt", run_longopts,
 +			&opt_timeout, &opt_kill, &opt_bytes, &opt_capture,
 +			&opt_dir, &opt_cwd, &opt_fmt, &opt_stdin, &opt_prune, &opt_brief);
 +	use_shell = (opts & (1 << 6)) != 0;   /* s */
@@ -614,6 +808,13 @@ index 0000000..85d8922
 +	}
 +	{
 +		opt_pgid = (opts & (1 << 9)) != 0;   /* P */
++	}
++	{
++		int want_tl = (opts & (1 << 14)) != 0;   /* t: 15th letter */
++
++		tl.on = want_tl;
++		if (want_tl)
++			tl.start_us = monotonic_us();
 +	}
 +	argv += optind;
 +
@@ -638,6 +839,8 @@ index 0000000..85d8922
 +	}
 +	if (opt_bytes)
 +		budget = strtol(opt_bytes, NULL, 10);
++		if (budget < 0)
++			budget = 0;
 +	if (opt_capture)
 +		capture_limit = strtol(opt_capture, NULL, 10);
 +	if (!argv[0])
@@ -709,6 +912,8 @@ index 0000000..85d8922
 +
 +	bb_signals((1 << (SIGINT - 1)) | (1 << (SIGTERM - 1)), on_sig);
 +
++	if (tl.on)
++		tl.budget = (size_t)budget;   /* the same budget the view gets */
 +	started = now_ms();
 +	pid = fork();
 +	if (pid < 0)
@@ -860,8 +1065,28 @@ index 0000000..85d8922
 +				free(vo);
 +				free(ve);
 +			}
++			if (error_ids) {
++				/* The child's ids, deduped and bounded: this is what a
++				 * reader branches on without parsing any message. */
++				fputs(",\"codes\":", stdout);
++				put_codes(p1);
++			}
++			if (tl.on) {
++				putchar(',');
++				tl_print_json();
++			}
 +			putchar('}');
 +			putchar('\n');
++		} else if (tl.on) {
++			printf("run=R%u exit_code=%d timed_out=%s cancelled=%s duration_ms=%ld\n",
++					id, m.exit_code, m.timed_out ? "true" : "false",
++					m.cancelled ? "true" : "false", m.duration_ms);
++			printf("timeline_lines=%u bytes=%u truncated=%s\n",
++					tl.n, (unsigned)tl.bytes, tl.truncated ? "true" : "false");
++			printf("--- timeline ---\n");
++			tl_print_text();
++			if (opt_pgid)
++				printf("pgid=%ld\n", child_pgid);
 +		} else if (quiet) {
 +			if (brief_out) {
 +				char *bv = brief_reduce(p1, (size_t)budget, brief_json);

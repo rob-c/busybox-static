@@ -3917,7 +3917,7 @@ index 6cdd641..5c0252f 100644
  {
  #if FIXED_HEADER
 diff --git a/shell/ash.c b/shell/ash.c
-index 9afeaed..aad7c06 100644
+index 9afeaed..cfbbb0d 100644
 --- a/shell/ash.c
 +++ b/shell/ash.c
 @@ -906,8 +906,8 @@ out2str(const char *p)
@@ -4372,7 +4372,7 @@ index 9afeaed..aad7c06 100644
  			case '%':
  			case '#':
  				subtype = (c == '#' ? VSTRIMLEFT : VSTRIMRIGHT);
-@@ -15173,6 +15507,225 @@ extern int etext();
+@@ -15173,6 +15507,242 @@ extern int etext();
   * exception occurs.  When an exception occurs the variable "state"
   * is used to figure out how far we had gotten.
   */
@@ -4384,6 +4384,7 @@ index 9afeaed..aad7c06 100644
 +static char *ash_format_opt;        /* --format text|json   */
 +static char *ash_max_bytes_opt;     /* --max-bytes N        */
 +static char *ash_capture_limit_opt; /* --capture-limit N    */
++static int ash_timestamps;          /* --timestamps         */
 +
 +#if ENABLE_BRIEF
 +int brief_main_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
@@ -4402,7 +4403,7 @@ index 9afeaed..aad7c06 100644
 +	char **av;
 +	int i, k, n = 0;
 +	int applet;
-+	int quiet = !ash_format_opt;
++	int quiet = !ash_format_opt && !ash_timestamps;
 +
 +	if (!argv[1]) {
 +		xfunc_error_retval = 2;
@@ -4437,6 +4438,8 @@ index 9afeaed..aad7c06 100644
 +	/* --quiet keeps the plain-shell output when nothing else was asked for */
 +	if (quiet)
 +		av[k++] = (char *)"--quiet";
++	if (ash_timestamps)
++		av[k++] = (char *)"--timestamps";
 +	if (ash_brief_which) {
 +		av[k++] = (char *)"--brief";
 +		av[k++] = ash_brief_which;
@@ -4478,6 +4481,10 @@ index 9afeaed..aad7c06 100644
 +			done = 1;                        /* a script path */
 +			continue;
 +		}
++		if (strcmp(argv[i], "--timestamps") == 0) {
++			ash_timestamps = 1;
++			continue;
++		}
 +		if (strcmp(argv[i], "--format") == 0 && argv[i + 1]) {
 +			ash_format_opt = argv[++i];
 +			continue;
@@ -4500,8 +4507,18 @@ index 9afeaed..aad7c06 100644
 +			continue;
 +		}
 +		if (strcmp(argv[i], "--brief") == 0) {
-+			ash_brief_which = (argv[i + 1] && argv[i + 1][0] != '-')
-+					? argv[++i] : (char *)"stdout";
++			/* Only an explicit stream word is a value; a script name is not. */
++			char *nx = argv[i + 1];
++
++			if (nx && (strcmp(nx, "stdout") == 0
++				|| strcmp(nx, "stderr") == 0
++				|| strcmp(nx, "both") == 0)
++			) {
++				ash_brief_which = nx;
++				i++;
++			} else {
++				ash_brief_which = (char *)"stdout";
++			}
 +			continue;
 +		}
 +		argv[j++] = argv[i];
@@ -4598,12 +4615,12 @@ index 9afeaed..aad7c06 100644
  int ash_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
  #if NUM_SCRIPTS > 0
  int ash_main(int argc, char **argv)
-@@ -15187,6 +15740,13 @@ int ash_main(int argc UNUSED_PARAM, char **argv)
+@@ -15187,6 +15757,13 @@ int ash_main(int argc UNUSED_PARAM, char **argv)
  
  	dbg_show_dirtymem("dirtymem at main start");
  
 +	ash_strip_agent_opts(argv);
-+	if (ash_timeout_opt || ash_format_opt
++	if (ash_timeout_opt || ash_format_opt || ash_timestamps
 +	 || ash_max_bytes_opt || ash_capture_limit_opt
 +	) {
 +		ash_dispatch_run(argv);       /* does not return */
@@ -4612,7 +4629,7 @@ index 9afeaed..aad7c06 100644
  	/* Initialize global data */
  	INIT_G_misc();
  	INIT_G_memstack();
-@@ -15241,6 +15801,7 @@ int ash_main(int argc UNUSED_PARAM, char **argv)
+@@ -15241,6 +15818,7 @@ int ash_main(int argc UNUSED_PARAM, char **argv)
  		minusc = get_script_content(-argc - 1);
  #endif
  	login_sh = procargs(argv);
@@ -4620,7 +4637,6 @@ index 9afeaed..aad7c06 100644
  #if DEBUG
  	TRACE(("Shell args: "));
  	trace_puts_args(argv);
-
 diff --git a/shell/hush.c b/shell/hush.c
 index afed0b5..6e337e7 100644
 --- a/shell/hush.c
@@ -4861,7 +4877,6 @@ index 0000000..84b0e4f
 +
 +	return EXIT_SUCCESS;
 +}
-
 diff --git a/util-linux/fallocate.c b/util-linux/fallocate.c
 index d5c2589..58e1db8 100644
 --- a/util-linux/fallocate.c

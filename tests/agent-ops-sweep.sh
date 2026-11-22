@@ -764,5 +764,49 @@ ck "run -t --quiet still shows the timeline" "1" \
 ck "run -t with --timeout still exits 3" "3" \
 	"$("$BB" run -t -T 1 -- "$BB" sleep 5 >/dev/null 2>&1; echo $?)"
 
+sec "25. timestamps survive in JSON and in the evidence on disk"
+rm -rf "$T/tart"
+"$BB" run -t -F json -D "$T/tart" -- "$BB" sh -c 'echo a; echo b >&2' > "$T/tj2" 2>/dev/null
+ck "json timeline keeps microseconds" "1" "$("$BB" grep -c '"us":[0-9][0-9]' "$T/tj2")"
+ck "json timeline keeps the stream tag" "1" "$("$BB" grep -c '"stream":"err"' "$T/tj2")"
+ck "json timeline keeps the text" "1" "$("$BB" grep -c '"text":"a"' "$T/tj2")"
+ck "json carries a wall-clock origin" "1" "$("$BB" grep -c '"started_unix_us":[0-9][0-9][0-9][0-9]' "$T/tj2")"
+ck "json carries the line count" "1" "$("$BB" grep -c '"timeline_lines":2' "$T/tj2")"
+ck "json carries the shown count" "1" "$("$BB" grep -c '"timeline_shown":2' "$T/tj2")"
+ck "json flags no truncation" "1" "$("$BB" grep -c '"timeline_truncated":false' "$T/tj2")"
+ck "json timeline order is out then err" "1" \
+	"$("$BB" awk '{o=index($0,"\"stream\":\"out\""); e=index($0,"\"stream\":\"err\""); print (o<e && o>0)?1:0}' "$T/tj2")"
+# the timeline is evidence: it stays on disk, complete, next to stdout/stderr
+tlart=$("$BB" ls "$T"/tart/R*/timeline 2>/dev/null | "$BB" head -1)
+ck "timeline artifact exists" "1" "$([ -n "$tlart" ] && echo 1)"
+ck "timeline artifact stamps every line" "2" "$("$BB" grep -Ec '^\[ *[0-9]+\.[0-9]{6} (out|err)\] ' "$tlart")"
+ck "timeline artifact keeps the streams apart" "1" "$("$BB" grep -c 'err\] b' "$tlart")"
+# a small view budget shortens the view, never the evidence
+rm -rf "$T/tart2"
+"$BB" run -t -B 8 -D "$T/tart2" -- "$BB" sh -c 'for i in 1 2 3 4 5; do echo l$i; done' > "$T/t5" 2>/dev/null
+ck "small budget shows at least one line" "1" "$("$BB" grep -c '^\[ .* out\] l1$' "$T/t5")"
+ck "small budget reports truncated" "1" "$("$BB" grep -c 'truncated=true' "$T/t5")"
+ck "small budget says how many shown" "1" "$("$BB" grep -c 'timeline truncated: 1 of 5' "$T/t5")"
+ck "small budget keeps all five in evidence" "5" \
+	"$("$BB" grep -Ec '^\[ *[0-9]+\.[0-9]{6} out\] l[0-9]$' "$T/tart2"/R*/timeline)"
+"$BB" run -t -B 8 -F json -- "$BB" sh -c 'for i in 1 2 3; do echo l$i; done' > "$T/t5j" 2>/dev/null
+ck "json small budget keeps one record" "1" "$("$BB" grep -c '"timeline_shown":1' "$T/t5j")"
+ck "json small budget flags truncation" "1" "$("$BB" grep -c '"timeline_truncated":true' "$T/t5j")"
+ck "json small budget still counts all lines" "1" "$("$BB" grep -c '"timeline_lines":3' "$T/t5j")"
+# ... and log can read the timeline back
+RTL=$("$BB" sed -n 's/.*"run":"\(R[0-9]*\)".*/\1/p' "$T/tj2")
+ck "log -s timeline rc" "0" "$("$BB" log -D "$T/tart" "$RTL" -s timeline > "$T/lgt" 2>/dev/null; echo $?)"
+ck "log -s timeline shows the stamps" "1" "$("$BB" grep -c 'out\] a' "$T/lgt")"
+ck "log -s timeline is bounded" "1" "$("$BB" grep -c 'shown_bytes=' "$T/lgt")"
+ck "log -s timeline filters" "1" \
+	"$("$BB" log -D "$T/tart" "$RTL" -s timeline -m 'err]' 2>/dev/null | "$BB" grep -c 'err\] b')"
+ck "log -s bogus is a usage error" "2" \
+	"$("$BB" log -D "$T/tart" "$RTL" -s nosuch >/dev/null 2>&1; echo $?)"
+# a run without -t has no timeline artifact to read
+rm -rf "$T/tart3"
+"$BB" run -D "$T/tart3" -- "$BB" true >/dev/null 2>&1
+ck "no -t, no timeline artifact" "1" \
+	"$([ -z "$("$BB" ls "$T"/tart3/R*/timeline 2>/dev/null)" ] && echo 1)"
+
 printf '\n%d passed, %d failed, %d skipped\n' "$pass" "$fail" "$skips"
 [ "$fail" -eq 0 ]
