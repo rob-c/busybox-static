@@ -67,6 +67,7 @@ if [[ -n "$ZIGTRIPLE" ]]; then
 		"CONFIG_RUN=y"
 		"CONFIG_LOG=y"
 		"CONFIG_DOCTOR=y"
+		"CONFIG_WHY=y"
 		"CONFIG_WAITFOR=y"
 		# tc.c still uses the CBQ qdisc API, removed from Linux kernel headers
 		# (sched_cbq was deleted in Linux 6.x), so it cannot compile here.
@@ -99,6 +100,7 @@ else
 		"CONFIG_RUN=y"
 		"CONFIG_LOG=y"
 		"CONFIG_DOCTOR=y"
+		"CONFIG_WHY=y"
 		"CONFIG_WAITFOR=y"
 		# Applets ported to macOS in patch 0004.  They must be listed here,
 		# not just edited into build/<target>/.config: build-all.sh wipes the
