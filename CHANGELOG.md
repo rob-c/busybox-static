@@ -4,6 +4,62 @@ Project releases of `busybox-static` on top of upstream busybox
 (`1.39.0.git`). The upstream applet set is unchanged except where noted; the
 `patches/` series is the record of every local change.
 
+## 0.4.0 — deadline control, output reduction, contract audit
+
+Second agent-facing release. Everything below is carried in `patches/`
+(`0004` shell and libbb ergonomics, `0006` core ops, `0008` run/log,
+`0015` runlevel) and verified by four suites on darwin-arm64 and, for the
+deadline work, in `almalinux:9`.
+
+### Deadlines that hold when the guest fights back
+
+- `run --timeout SECS` exits **3** on expiry, never 124 and never 128+N;
+  `--kill-after` (default 2 s) escalates SIGTERM to SIGKILL for the whole
+  process group.
+- `run --timeout 0` means "the deadline has already passed".
+- `sh --timeout SECS` gives the shell the same guarantee. It is implemented by
+  dispatching to `run --timeout --quiet` in-process, because ash resets signal
+  dispositions while it waits on a child — an in-shell alarm measurably returned
+  142/143/158 and could never produce exit 3.
+- New `run --quiet`: captured streams only, no summary, so a dispatching
+  wrapper is output-identical to a plain shell.
+
+### Output reduction built in
+
+- `run --brief stdout|stderr|both` and `sh --brief [stream]` pipe a stream
+  through `brief -d`; `--brief-json` emits brief's schema-1 payload instead of
+  the text view, and `run --format json` adds nested `stdout_brief` /
+  `stderr_brief` objects.
+- `sh --brief` accepts only `stdout`, `stderr` or `both` as a value, so
+  `sh --brief script.sh` runs the script instead of eating its name.
+
+### Shell and applet behaviour
+
+- `log --stream timeline` interleaves stdout and stderr by timestamp, with a
+  separate printed budget so a small budget shortens the view and not the
+  evidence on disk.
+- `runlevel` writes its failure diagnostic to stderr (patch 0015).
+- `peek -p --format json` now emits `preview` (hex) and `guessed_type`, so a
+  binary file is describable instead of merely flagged.
+- `replace --sha256` accepts the 12-digit prefix `peek` prints.
+- `replace --request` continues past `INVALID_ARGUMENT` but stops on
+  `STALE_INPUT`/`NOT_FOUND`, reporting how many edits were skipped.
+- `log --stream both --format json` emits two objects instead of text inside
+  the array; `log NOSUCH` carries a `message`; `waitfor --timeout 0` performs a
+  single attempt.
+
+### Tests
+
+- `tests/streams.sh` — 37 checks on stdout/stderr discipline and error ids.
+- `tests/timeout-resilience.sh` — 50 checks: guests that trap TERM, ignore
+  TERM/INT/HUP, exit 0 on TERM, leave grandchildren, plus sub-second deadlines.
+- `tests/timeout-resilience-matrix.sh` — 200 checks: 10 hostile guests × 4
+  invocation paths × 5 assertions. Survivors are found by pid file and
+  `kill -0`, because a command-line scan goes blind once the guest exec()s its
+  last command; both suites refuse to run unless a deliberately leaked process
+  is detected first.
+- Existing suites unchanged: `test.sh` 198, `tests/agent-ops.sh` 1299.
+
 ## 0.3.0-dev — agent operations (patches 0006-0008)
 
 Adds the agent-facing surface specified in `AGENT-FEATURES.md`: bounded reads
