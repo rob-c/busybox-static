@@ -75,6 +75,9 @@ if [[ -n "$ZIGTRIPLE" ]]; then
 		# generic readable-compression filter (patch 0014)
 		"CONFIG_BRIEF=y"
 		"CONFIG_SNAPSHOT=y"
+		"CONFIG_MARK=y"
+		"CONFIG_OUTLINE=y"
+		"CONFIG_PATCHAPPLY=y"
 		"CONFIG_CHECKTBL=y"
 		# tc.c still uses the CBQ qdisc API, removed from Linux kernel headers
 		# (sched_cbq was deleted in Linux 6.x), so it cannot compile here.
@@ -115,6 +118,9 @@ else
 		# generic readable-compression filter (patch 0014)
 		"CONFIG_BRIEF=y"
 		"CONFIG_SNAPSHOT=y"
+		"CONFIG_MARK=y"
+		"CONFIG_OUTLINE=y"
+		"CONFIG_PATCHAPPLY=y"
 		"CONFIG_CHECKTBL=y"
 		# Applets ported to macOS in patch 0004.  They must be listed here,
 		# not just edited into build/<target>/.config: build-all.sh wipes the
@@ -183,6 +189,12 @@ set_cfg() {
 }
 
 for kv in "${EXTRA_CONFIG[@]}"; do
+	set_cfg "${kv%%=*}" "${kv#*=}"
+done
+
+# kconfig re-derives CONFIG_FEATURE_DEFAULT_PASSWD_ALGO during oldconfig, so
+# the value has to be written after it or mkpasswd --help shows "(default )".
+for kv in "CONFIG_FEATURE_DEFAULT_PASSWD_ALGO=\"des\""; do
 	set_cfg "${kv%%=*}" "${kv#*=}"
 done
 
