@@ -1,9 +1,9 @@
 diff --git a/coreutils/run.c b/coreutils/run.c
 new file mode 100644
-index 0000000..c974675
+index 0000000..fed62d9
 --- /dev/null
 +++ b/coreutils/run.c
-@@ -0,0 +1,2765 @@
+@@ -0,0 +1,2849 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * run - captured execution with retrievable evidence.
@@ -37,6 +37,7 @@ index 0000000..c974675
 +//usage:     "\n	-T, --timeout SECS	Kill the process group after SECS"
 +//usage:     "\n	-k, --kill-after SECS	Grace period before SIGKILL (default 2)"
 +//usage:     "\n	-W, --idle-timeout SECS	Kill after SECS without any output"
++//usage:     "\n	-J, --jsonl		Emit one JSON object per line, as it arrives"
 +//usage:     "\n	-B, --max-bytes N	View budget (default 12000)"
 +//usage:     "\n	-C, --capture-limit N	Captured bytes per stream (default 64 MiB)"
 +//usage:     "\n	-D, --dir PATH		Artifact root (default $TMPDIR/busybox-run)"
@@ -652,6 +653,70 @@ index 0000000..c974675
 + * The fds array is rewritten as streams reach EOF, so the caller can close
 + * anything the loop left open.
 + */
++
++/* --jsonl: one object per line as it arrives, so a harness can watch a long
++ * command instead of waiting for the document at exit. Lines are reassembled
++ * across read() boundaries; a partial line is held until its newline (or the
++ * stream's end, which flushes it). */
++static int jsonl_on;
++static unsigned long long jsonl_start_us;
++static char *jsonl_part[2];
++static size_t jsonl_plen[2];
++
++static void jsonl_emit(unsigned stream, const char *text, size_t len)
++{
++	struct timespec now;
++	unsigned long long us;
++
++	clock_gettime(CLOCK_MONOTONIC, &now);
++	us = (unsigned long long)now.tv_sec * 1000000ULL
++			+ (unsigned long long)now.tv_nsec / 1000ULL;
++	if (!jsonl_start_us)
++		jsonl_start_us = us;      /* first event defines t=0 */
++	us = (us >= jsonl_start_us) ? us - jsonl_start_us : 0;
++	printf("{\"t\":%llu,\"s\":\"%s\",\"line\":", us, stream ? "err" : "out");
++	json_write_str(xstrndup(text, len));
++	printf("}\n");
++	fflush(stdout);
++}
++
++static void jsonl_feed(unsigned stream, const char *buf, size_t len)
++{
++	size_t i = 0;
++
++	while (i < len) {
++		const char *nl = memchr(buf + i, '\n', len - i);
++		size_t take = nl ? (size_t)(nl - (buf + i)) : len - i;
++
++		if (take) {
++			jsonl_part[stream] = xrealloc(jsonl_part[stream],
++					jsonl_plen[stream] + take + 1);
++			memcpy(jsonl_part[stream] + jsonl_plen[stream], buf + i, take);
++			jsonl_plen[stream] += take;
++		}
++		if (nl) {
++			jsonl_part[stream] = xrealloc(jsonl_part[stream],
++					jsonl_plen[stream] + 1);
++			jsonl_part[stream][jsonl_plen[stream]] = '\0';
++			jsonl_emit(stream, jsonl_part[stream], jsonl_plen[stream]);
++			jsonl_plen[stream] = 0;
++		}
++		i += take + (nl ? 1 : 0);
++	}
++}
++
++static void jsonl_flush_parts(void)
++{
++	unsigned i;
++
++	for (i = 0; i < 2; i++) {
++		if (jsonl_plen[i]) {
++			jsonl_emit(i, jsonl_part[i], jsonl_plen[i]);
++			jsonl_plen[i] = 0;
++		}
++	}
++}
++
 +static void pump(int fds[3], int arts[3], int nr, int feed_to, int feed_from,
 +		int feed_always, long deadline_ms, int kill_after_ms,
 +		long capture_limit, pid_t pid, struct meta *m)
@@ -683,6 +748,8 @@ index 0000000..c974675
 +			term_at = now;
 +			phase = 1;
 +		}
++		if (idle_ms > 0 && last_data == 0)
++			last_data = now;   /* silence counts from the start, not from data */
 +		if (phase == 0 && idle_ms > 0 && last_data
 +		 && (long)now - (long)last_data >= idle_ms
 +		) {
@@ -815,10 +882,14 @@ index 0000000..c974675
 +			if (quota_used[i] >= capture_limit && (size_t)r > (size_t)w)
 +				m->capture_complete = 0;
 +			tl_feed(i, buf, (size_t)r);
++			if (jsonl_on)
++				jsonl_feed((unsigned)i, buf, (size_t)r);
 +		}
 +	}
 +	(void)captured;
 +	tl_flush_partials();
++	if (jsonl_on)
++		jsonl_flush_parts();
 +}
 +
 +/* Bound head+tail into ONE string, so JSON gets a single scalar. */
@@ -904,6 +975,8 @@ index 0000000..c974675
 +		return NULL;
 +	}
 +	fflush_all();
++	if (jsonl_on)
++		jsonl_start_us = monotonic_us();
 +	pid = fork();
 +	if (pid == 0) {
 +		dup2(fd, 0);
@@ -1230,6 +1303,7 @@ index 0000000..c974675
 +		"timeout\0"       Required_argument "T"
 +		"kill-after\0"    Required_argument "k"
 +		"idle-timeout\0"  Required_argument "W"
++		"jsonl\0"         No_argument       "J"
 +		"max-bytes\0"     Required_argument "B"
 +		"capture-limit\0" Required_argument "C"
 +		"dir\0"           Required_argument "D"
@@ -1306,13 +1380,14 @@ index 0000000..c974675
 +		}
 +		argv[j] = NULL;
 +	}
-+	opts = getopt32long(argv, "T:k:B:C:D:d:sF:i:Pr:b:qjtYn", run_longopts,
++	opts = getopt32long(argv, "T:k:B:C:D:d:sF:i:Pr:b:qjtYnW:J", run_longopts,
 +			&opt_timeout, &opt_kill, &opt_bytes, &opt_capture,
 +			&opt_dir, &opt_cwd, &opt_fmt, &opt_stdin, &opt_prune, &opt_brief,
 +			&opt_idle);
 +	use_shell = (opts & (1 << 6)) != 0;   /* s */
 +	quiet = (opts & (1 << 12)) != 0;      /* q: 13th letter of the optstring */
 +	brief_json = (opts & (1 << 13)) != 0; /* j: 14th */
++	jsonl_on = (opts & (1 << 18)) != 0;   /* J: 19th letter of the optstring */
 +	if ((opts & (1 << 15)) != 0)          /* Y: 16th letter */
 +		pty_mode = 1;
 +	if (opt_brief) {
@@ -1784,6 +1859,8 @@ index 0000000..c974675
 +			}
 +			putchar('}');
 +			putchar('\n');
++		} else if (jsonl_on) {
++			/* nothing: a NDJSON consumer reads the events and the exit event */
 +		} else if (tl.on) {
 +			printf("run=R%u exit_code=%d timed_out=%s cancelled=%s idle=%s duration_ms=%ld\n",
 +					id, m.exit_code, m.timed_out ? "true" : "false",
@@ -1866,6 +1943,13 @@ index 0000000..c974675
 +			if ((m.out_bytes + m.err_bytes) > (unsigned long long)budget)
 +				printf("... view truncated; `log R%u --match ...' has the rest\n", id);
 +		}
++	}
++	if (jsonl_on) {
++		printf("{\"event\":\"exit\",\"run\":\"R%u\",\"exit_code\":%d,"
++				"\"timed_out\":%s,\"cancelled\":%s,\"idle\":%s,\"duration_ms\":%ld}\n",
++				id, m.exit_code, m.timed_out ? "true" : "false",
++				m.cancelled ? "true" : "false",
++				m.idle_out ? "true" : "false", m.duration_ms);
 +	}
 +	if (opt_prune) {
 +		unsigned keep = (unsigned)strtoul(opt_prune, NULL, 10);

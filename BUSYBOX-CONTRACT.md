@@ -512,13 +512,18 @@ log RUN --sample 40 [--stream stderr] --format json
 ```
 Pinned by `tests/timeline-query.sh` section Q4.
 
-### 9.5 Streaming consumption
+### 9.5 Streaming consumption — [done]
 
 ```sh
-run --jsonl -- make -j8    # {"t":1234,"s":"out","line":"…"} per event, flushed
+run --jsonl -- make -j8
+# {"t":0,"s":"out","line":"compiling a.c"}
+# {"t":230093,"s":"err","line":"warning: …"}
+# {"event":"exit","run":"R7","exit_code":0,"timed_out":false,"cancelled":false,"idle":false,"duration_ms":252}
 ```
 
-For harnesses that want to watch rather than wait; today the JSON document appears only at exit.
+One object per line, flushed as it arrives; `t` is microseconds from the first event, lines
+are reassembled across read() boundaries, stderr is tagged `"s":"err"`, and the human summary
+is suppressed so the stream stays parseable. Pinned by `tests/timeline-query.sh` section Q7.
 
 ### 9.6 Patch application with preconditions
 

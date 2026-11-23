@@ -70,7 +70,17 @@ ck "idle.output_kept"    "1" "$("$BB" grep -c '^start$' idle.out)"
 ck "idle.active_completes" "0" "$?"
 ck "idle.bad_value"      "2" "$("$BB" run --idle-timeout 0 -- true >/dev/null 2>&1; echo $?)"
 
-sec "Q7. --caps advertises what the build has"
+sec "Q7. --jsonl streams one object per line, flushed"
+"$BB" run --jsonl -- "$BB" sh -c 'echo one; echo bad >&2; sleep 0.1; echo two' > jl.out 2>/dev/null
+ck "jsonl.line_count"      "3" "$("$BB" grep -c '^{"t":' jl.out)"
+ck "jsonl.first_is_zero"   "1" "$("$BB" grep -c '^{"t":0,"s":"out","line":"one"}' jl.out)"
+ck "jsonl.stderr_tagged"   "1" "$("$BB" grep -c '"s":"err","line":"bad"' jl.out)"
+ck "jsonl.monotonic_t"     "1" "$("$BB" awk -F'"t":' '/^{"t":/{split($2,a,","); if (a[1]+0 >= prev) prev=a[1]+0; else bad=1} END{print bad?0:1}' jl.out)"
+ck "jsonl.exit_event"      "1" "$("$BB" grep -c '^{"event":"exit","run":"R[0-9]*","exit_code":0' jl.out)"
+ck "jsonl.all_valid_json"  "0" "$(while read -r l; do printf '%s\n' "$l" > jl.one; "$BB" json -f jl.one >/dev/null 2>&1 || echo bad; done < jl.out | "$BB" wc -l | tr -d ' ')"
+ck "jsonl.no_summary"      "0" "$("$BB" grep -c '^run=R[0-9]* exit_code=' jl.out)"
+
+sec "Q8. --caps advertises what the build has"
 for f in brief timeline pty brief-json error-ids stamp-ns idle-timeout log-query; do
 	ck "caps.$f" "1" "$("$BB" --caps --format json | "$BB" grep -c "\"$f\"")"
 done
