@@ -1,0 +1,31 @@
+diff --git a/libbb/time.c b/libbb/time.c
+index f09ef5d..8628e5a 100644
+--- a/libbb/time.c
++++ b/libbb/time.c
+@@ -305,8 +305,26 @@ char* FAST_FUNC strftime_YYYYMMDDHHMMSS(char *buf, unsigned len, time_t *tp)
+ 
+ static void get_mono(struct timespec *ts)
+ {
++#if defined(__APPLE__)
++# ifndef CLOCK_MONOTONIC_RAW
++/* Darwin has the raw mach clock, but the name sits outside the POSIX
++ * namespace, so a build that defines _POSIX_C_SOURCE will not see it. The
++ * value is ABI, not policy: without it the stamps fall back to CLOCK_MONOTONIC,
++ * which is quantised to 1 us here (measured: RAW=41 ns, MONOTONIC=1000 ns). */
++#  define CLOCK_MONOTONIC_RAW 4
++# endif
++	/* Darwin's CLOCK_MONOTONIC is quantised to 1 us (measured), which would
++	 * throw away the nanosecond stamps the timeline exists to provide;
++	 * CLOCK_MONOTONIC_RAW gives the 24 MHz tick, 41.7 ns. The cost is that
++	 * RAW keeps counting while the machine sleeps, unlike Linux's
++	 * CLOCK_MONOTONIC, so a stamp spanning a suspend differs by the sleep
++	 * time. Resolution wins: a timeline is read for ordering and spacing. */
++	if (clock_gettime(CLOCK_MONOTONIC_RAW, ts))
++		bb_simple_error_msg_and_die("clock_gettime(MONOTONIC_RAW) failed");
++#else
+ 	if (clock_gettime(CLOCK_MONOTONIC, ts))
+ 		bb_simple_error_msg_and_die("clock_gettime(MONOTONIC) failed");
++#endif
+ }
+ unsigned long long FAST_FUNC monotonic_ns(void)
+ {
