@@ -1045,10 +1045,10 @@ index 0000000..1a1b177
 +}
 diff --git a/include/error_ids.h b/include/error_ids.h
 new file mode 100644
-index 0000000..2278cf3
+index 0000000..4e79f14
 --- /dev/null
 +++ b/include/error_ids.h
-@@ -0,0 +1,31 @@
+@@ -0,0 +1,32 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * Opt-in diagnostic ids: the same message on stderr with its id in front, and
@@ -1074,6 +1074,7 @@ index 0000000..2278cf3
 +#define ERROR_IDS_H
 +
 +extern int bb_error_ids;      /* nonzero: ids on (environment or --error-ids) */
++extern int bb_error_ids_sent;   /* an id already went to stdout for this diagnostic */
 +extern int bb_perror_errno;   /* errno at the last bb_perror_msg* call, else 0 */
 +extern const char *bb_error_code; /* applet-set code for the next message */
 +
@@ -1140,7 +1141,7 @@ index 0000000..15c6aee
 +
 +#endif
 diff --git a/libbb/appletlib.c b/libbb/appletlib.c
-index 34b74c3..021f3b0 100644
+index 34b74c3..9fe8674 100644
 --- a/libbb/appletlib.c
 +++ b/libbb/appletlib.c
 @@ -28,9 +28,12 @@
@@ -1163,7 +1164,7 @@ index 34b74c3..021f3b0 100644
 +	/* --error-ids: a usage error is one diagnostic, so it gets one id, and
 +	 * only when the text went to stderr (an error, not --help). */
 +	bb_error_ids_init();
-+	if (bb_error_ids && xfunc_error_retval) {
++	if (bb_error_ids && xfunc_error_retval && !bb_error_ids_sent) {
 +		char id[32];
 +		int n = sprintf(id, "E %s\n", bb_error_code ? bb_error_code : "USAGE");
 +		fflush_all();
@@ -1912,7 +1913,7 @@ index fa1f0d3..866adeb 100644
  	xfunc_die();
  }
 diff --git a/libbb/verror_msg.c b/libbb/verror_msg.c
-index 74b608f..79c6f1a 100644
+index 74b608f..986d19f 100644
 --- a/libbb/verror_msg.c
 +++ b/libbb/verror_msg.c
 @@ -7,6 +7,7 @@
@@ -1923,11 +1924,12 @@ index 74b608f..79c6f1a 100644
  #if ENABLE_FEATURE_SYSLOG
  # include <syslog.h>
  #endif
-@@ -17,6 +18,96 @@ static smallint syslog_level = LOG_ERR;
+@@ -17,6 +18,98 @@ static smallint syslog_level = LOG_ERR;
  smallint logmode = LOGMODE_STDIO;
  const char *msg_eol = "\n";
  
 +int bb_error_ids;
++int bb_error_ids_sent;
 +int bb_perror_errno;
 +const char *bb_error_code;
 +
@@ -2000,6 +2002,7 @@ index 74b608f..79c6f1a 100644
 +	if (n >= 0) {
 +		full_write(STDOUT_FILENO, line, (size_t)n);
 +		free(line);
++		bb_error_ids_sent = 1;
 +	}
 +	free(body);
 +}
@@ -2020,7 +2023,7 @@ index 74b608f..79c6f1a 100644
  void FAST_FUNC bb_verror_msg(const char *s, va_list p, const char* strerr)
  {
  	char *msg, *msg1;
-@@ -26,6 +117,14 @@ void FAST_FUNC bb_verror_msg(const char *s, va_list p, const char* strerr)
+@@ -26,6 +119,14 @@ void FAST_FUNC bb_verror_msg(const char *s, va_list p, const char* strerr)
  	if (!logmode)
  		return;
  
