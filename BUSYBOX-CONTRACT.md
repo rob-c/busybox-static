@@ -5,9 +5,9 @@ this plugin actually executes and parses, captured from a real build rather than
 from the design notes. If a change to the binary breaks one of these, the plugin
 breaks silently — most of these fields are read with a default when missing.
 
-- **Build this was verified against:** `1.39.0.git` (2026-11-22 02:59:37 GMT),
-  `dist/darwin-universal/bin/busybox`, **269 applets**, `--caps` features
-  `gnu-long-opts,peek,replace,waitfor,run,log,doctor,json`.
+- **Build this was verified against:** project release **v0.5.0**, busybox
+  `1.39.0.git`, asset `busybox-static-1.39.0-aac079e-darwin-universal`, **276 applets**,
+  `--caps` features `gnu-long-opts,peek,replace,waitfor,run,log,doctor,json`.
 - **Plugin side:** `src/agentops.ts` (argv building, payload parsing, salvage) and
   the three tools in `src/extension.ts`.
 - **Re-capture it yourself:** `./scripts/capture-busybox-contract.sh` in this repo
@@ -24,6 +24,7 @@ retries a mutation and never infers success from log text.
 | call | what the plugin reads |
 |---|---|
 | `busybox --list` | applet names, one per line; used to build the symlinked applet directory |
+| the release's asset list (`GET /repos/rob-c/busybox-static/releases/tags/v0.4.0`) | the asset to download, matched by `^busybox-static-[\d.]+(-[0-9a-f]+)?-<target>$` — the project version is in the tag, the *busybox* version is in the asset name |
 | `busybox --caps --format json` | `.version`, `.count`, `.features[]` — printed by `/managed-tools status` |
 
 `--list` output must stay newline-separated bare names: the plugin intersects it with
@@ -32,6 +33,14 @@ that disappears from `--list` silently loses its bare name on `PATH`.
 
 `--caps` is the only honest source for "which build is installed": the plugin's state
 file records the release tag, and a hand-installed build is often ahead of it.
+
+**Keep the asset naming as it is and say so if it changes.** Since 0.4.0 the tag is the
+project version (`v0.4.0`) while the assets carry the busybox version
+(`busybox-static-1.39.0-aac079e-darwin-universal`). The plugin therefore matches the
+asset by pattern instead of constructing it from the tag, and treats a recorded
+`1.39.0-aac079e` (the old scheme, which sorts *above* 0.4.0) as older than any release.
+The `-pure` asset must stay distinguishable by name: it drops `nslookup`, which the
+curated applet set uses, so the pattern deliberately does not match `…-universal-pure`.
 
 ```json
 {"schema":1,"version":"1.39.0.git","platform":"darwin","arch":"arm64","count":269,
@@ -134,19 +143,63 @@ that resolution would be redundant but harmless.
 Invocations:
 
 ```sh
-busybox run [--timeout SECS] [--max-bytes N] [--cwd DIR] [--shell] --format json -- ARGV…
-busybox run --pty [--pty-raw] [--pty-split] [--pty-size COLSxROWS] --format json -- ARGV…
-busybox log RUN [--lines A:B] [--match STR] [--context N] [--stream stdout|stderr|both] \
-                [--meta] [--max-bytes N] --format json
+busybox run [--timeout SECS|-T] [--kill-after SECS|-k] [--max-bytes N|-B] \
+            [--capture-limit N|-C] [--dir PATH|-D] [--cwd DIR|-d] [--shell|-s] \
+            [--stdin FILE|-i] [--pgid|-P] [--env NAME=VALUE|-e] [--prune N|-r] \
+            [--quiet|-q] [--timestamps|-t] [--brief-json|-j] \
+            [--brief stdout|stderr|both|-b] [--error-ids|-I] [--format text|json|-F] \
+            -- ARGV…
+# the timeline, which the plugin turns on for every bash call:
+busybox run --timestamps --max-bytes 48000 --env PYTHONUNBUFFERED=1 -- /bin/bash -c '…'
+busybox log RUN [--lines A:B] [--match STR] [--context N] \
+                [--stream stdout|stderr|timeline|both] [--meta] [--diff R1:R2] \
+                [-B N] --format json
 ```
+
+`-Y/--pty`, `--pty-raw`, `--pty-split` and `--pty-size COLSxROWS` give the child a
+pseudo-terminal. The plugin uses **`--pty-split`** for every bash call: stdout on the pty
+(so libc line-buffers and the offsets are real), stderr on its own pipe (unbuffered
+anyway, and it keeps the `err` tag). Measured with a C program that `printf`s three lines
+1.2 s apart, built `-O0` without an `fflush`: on a pipe every line carried `3.740564`; on
+the pty the lines carried `0.004561 / 1.209525 / 2.414571`. Python and Ruby have their own
+switches (the wrapper sets those too); C stdio, Java and Go's `bufio` have only the
+terminal. `isatty()` is true for the child in pty mode — the
+environment is otherwise untouched, and `--pty-split` keeps the streams apart. stdin is
+fed through the master and terminated with `VEOF`, so a prompt sees EOF instead of
+hanging. `--format json` reports `"pty":true`, and the timeline is unchanged.
+
+`-t/--timestamps` prints one interleaved line per record, `[   0.011354 out] text`;
+`--quiet` drops the summary but is ignored when `-t` is set; `--brief WHICH` reduces a
+stream through `brief -d` and is *also* ignored when `-t` is set (the timeline branch is
+taken first). The plugin therefore uses `-t` for the timeline modes and `--brief` only
+for its `brief` verbosity, which has no timeline. `brief` is reachable on its own too
+(`busybox brief -d -t 5`), and prints a `[brief] lines_in=… records=… merged=…` marker
+line of its own.
 
 `run` payload for a complete view (intact, this is the shape relied on):
 
 ```json
-{"schema":1,"run":"R12","dir":"/…/busybox-run/R12","exit_code":0,"timed_out":false,
- "cancelled":false,"capture_complete":true,"duration_ms":20,"stdout_bytes":5,
- "stderr_bytes":5,"view_truncated":false,"stdout_view":"out1\n","stderr_view":"err1\n"}
+{"schema":1,"run":"R12","cmd":"sh -c echo out1","dir":"/…/busybox-run/R12","pgid":55107,
+ "exit_code":0,"timed_out":false,"cancelled":false,"capture_complete":true,"duration_ms":20,
+ "stdout_bytes":5,"stderr_bytes":5,"view_truncated":false,
+ "stdout_view":"out1\n","stderr_view":"err1\n"}
 ```
+
+With `-t` the payload gains the timing the plugin cares about (microseconds from
+process start, one entry per line, both streams in arrival order):
+
+```json
+{"schema":1,"run":"R111","started_unix_us":1795375794796448,
+ "timeline":[{"us":6926,"stream":"out","text":"x"},{"us":6952,"stream":"err","text":"y"}],
+ "timeline_lines":2,"timeline_shown":2,"timeline_truncated":false, …}
+```
+
+`log --stream timeline` replays that view from the run directory (it needs a run created
+with `-t`: without it the artifact does not exist and the answer is
+`{"status":"error","code":"NOT_FOUND","message":"run not found or stream missing"}`);
+`--stream both --format json` returns two objects. A truncated `stdout_view` is a single
+JSON string with an in-band marker — `… line 5\n... [310 bytes] ...\ne 34 …` — which is
+valid JSON since 0.4.0.
 
 `log` payloads:
 
@@ -156,32 +209,16 @@ busybox log RUN [--lines A:B] [--match STR] [--context N] [--stream stdout|stder
 {"schema":1,"stream":"stdout","status":"error","code":"NOT_FOUND","message":"no match"}
 ```
 
-A pty run answers the same payload plus the terminal it built:
-
-```json
-{"schema":1,"run":"R13","dir":"/…/busybox-run/R13","pgid":4711,"pty":true,
- "pty_slave":"/dev/pts/3","pty_cols":80,"pty_rows":24,"pty_raw":false,
- "stderr_merged":true,"exit_code":0,…,"stdout_view":"hi\n","stderr_view":""}
-```
-
-`pty:false` and no `pty_*` keys are emitted for a pipe run, so a reader that does
-not know about ptys is unaffected. With `stderr_merged:true` the guest's stderr
-went to its terminal, so `stdout_view` carries both streams in arrival order and
-`stderr_view` is empty; `--pty-split` restores two streams with
-`stderr_merged:false`. `meta` gains `pty`, `pty_slave`, `pty_rows`, `pty_cols`
-and `stderr_merged` lines.
-
 **Fields depended on:** `run`, `dir`, `exit_code`, `timed_out`, `cancelled`,
 `capture_complete`, `duration_ms`, `stdout_bytes`, `stderr_bytes`, `view_truncated`,
 `stdout_view`, `stderr_view`; for `log`: `stream`, `status`, `code`, `message`,
-`lines`, `content[].n/.text`, `shown_bytes`, `truncated`, `meta`; optionally
-`pty`, `pty_slave`, `pty_cols`, `pty_rows`, `pty_raw`, `stderr_merged`.
+`lines`, `content[].n/.text`, `shown_bytes`, `truncated`, `meta`.
 
 `run`'s exit code is passed through to the tool result but **is not** read as success
 or failure: `exit_code: 3` with `timed_out:false` is a child that exited 3. Only
 `timed_out`, `cancelled` and an unparseable payload mark a wrapper failure.
 
-### Defect 1 (blocks a clean tool result): `run --format json` is invalid when the view is truncated
+### Fixed in 0.4.0: `run --format json` was invalid when the view was truncated
 
 `dump_bounded()` prints the head with `json_write_str()`, then the tail with
 `json_write_str()` again, producing two adjacent quoted strings at the seam:
@@ -192,10 +229,10 @@ busybox run --max-bytes 120 --format json -- sh -c 'i=0; while [ $i -lt 40 ]; do
 {"schema":1,"run":"R16",…,"view_truncated":true,"stdout_view":"line 0\n…\nlin""e 34\n…","stderr_view":""}
 ```
 
-The scalars before the seam are intact and `capture_complete` is true, so the plugin
-recovers them (`salvageRunPayload()`), reports `exit_code`/`timed_out`/byte counts,
-and points the caller at `busybox log RUN` for the view. It deliberately does **not**
-re-run the command to obtain a parseable answer — the command may have side effects.
+0.4.0 emits a single string with an omission marker (`... [310 bytes] ...`), which
+parses. `salvageRunPayload()` in `src/agentops.ts` is kept as the fallback for older
+builds: it recovers the scalars from the text and points at `busybox log RUN`, and
+deliberately never re-runs the command (the command may have side effects).
 
 Expected fix: build one buffer (head + an omission marker + tail), escape it once, and
 keep `stdout_view` a single JSON string. A schema-compatible alternative is an array of
@@ -215,6 +252,99 @@ missing binary from a child that chose 127, and must not guess from the
 
 ---
 
+### Closed in 0.5.0: an external signal used to leak the child
+
+```sh
+busybox run --timestamps -- sleep 30 & pid=$!
+kill -TERM $pid ; wait $pid        # exit=143, and `sleep 30` is still running
+pgrep -fl "sleep 30"               # 68292 sleep 30
+```
+
+0.5.0 fixes the two causes named here. `run` installed its handler on SIGHUP/SIGALRM
+(`bb_signals()` takes `1 << signo`, and `run` passed `1 << (signo - 1)`), so a SIGTERM
+killed it outright; and a watchdog in its own process group now kills the command's group
+when the wrapper disappears for any reason, SIGKILL included. Both verified on 0.5.0:
+
+```sh
+run -- sh -c 'sleep 31337' & kill -TERM $!   # exit 3, cancelled=true, no survivor
+run -- sh -c 'sleep 31337' & kill -9   $!    # no survivor after the watchdog fires
+```
+
+What the plugin still does, now as belt-and-braces rather than necessity:
+
+- takes pi's per-call deadline over one second earlier (`--timeout N-1`), so the applet
+  owns the deadline and the timeline is still printed when it expires;
+- for its own tools, `runApplet()` stops waiting three seconds after its TERM and resolves
+  the tool call regardless, so a wedged wrapper cannot hold a tool open.
+
+Also fixed in 0.5.0: two concurrent runs in one artifact root could pick the same run id
+and truncate each other's artifacts. pi issues bash calls in parallel, so this mattered.
+
+### Defect (open): `unzip -d DIR` extracts nothing and exits 0
+
+```sh
+busybox unzip -q pkg.zip -d out ; echo $?    # 0, and `out` is empty
+busybox unzip -q pkg.zip                     # extracts into cwd, correctly
+```
+
+Same archive, same binary: with `-d` nothing is written, without it the files appear. This
+is the applet the plugin links as a bare `unzip`, and the one its own zip installer used to
+resolve — which silently broke every zip-based install (ast-grep, ninja, gh) once the applet
+directory was on PATH. The plugin now resolves a system unzip/bsdtar first, so it is only a
+model-facing annoyance, but a model that runs `unzip -d out pkg.zip` gets an empty directory
+and a success code.
+
+### Defect (open): `--prune N` is ignored whenever `--timestamps` is set
+
+```sh
+for i in $(seq 30); do run -q --prune 5 -- true ; done   # 5 directories left
+for i in $(seq 30); do run -t --prune 5 -- true ; done   # 30 directories left
+```
+
+The wrapper always asks for the timeline, so its `--prune` never took effect and a session
+left hundreds of run directories behind. The plugin sweeps the root itself now (newest 20,
+`R<number>` directories only, symlinks untouched). Worth fixing in `run`: the option should
+either work in both branches or say it does not apply.
+
+### Behaviour worth stating: the text timeline keeps only the head
+
+`run -t` prints `timeline_lines=N shown=M truncated=true` and then the first M lines — no
+tail, unlike the JSON `stdout_view`, which keeps head and tail around an omission marker.
+For a failing test suite the interesting part is the end, so the plugin's digest names
+`busybox log RUN --lines <N-40>:<N>`. A `--tail-lines N` (or head+tail in text mode) would
+remove that round trip.
+
+### Defect (open): `-B 0` shows nothing, while the JSON hint calls it "no limit"
+
+```sh
+brief -B 0 pytest.log            # marker only: shown_lines=0 bytes=0 truncated=1 truncated_by=budget
+brief -B 40000 pytest.log        # the whole body (33719 bytes) — a big number is how you say "all"
+brief -d -B 400 -F json …        # hints: ["the byte budget stopped the view: raise -B, or -B 0 for no limit"]
+```
+
+The hint tells the caller to use `-B 0` for "no limit"; `-B 0` is a *zero* budget. Either
+the flag should treat 0 as unlimited (matching the hint) or the hint should stop saying so.
+The plugin's skills document the real behaviour, since the hint is the thing a model reads.
+
+### Behaviour worth stating: `-R` matches literal text, not a regex
+
+```sh
+brief -R '^FAILED' pytest.log    # matched=1, shown_lines=0 — the caret is part of the string
+brief -R FAILED pytest.log       # the failure record through the next match, as intended
+```
+
+`-R STR` is documented as "containing STR", which is accurate, but an anchored pattern is
+the natural thing to write and it yields `matched=1, shown_lines=0, truncated_by=record_size`
+— a match reported, nothing shown. The skills say "literal,
+not a regex" and a test forbids an anchored `-R` in an example.
+
+### Behaviour worth stating: split streams can tie
+
+With `--pty-split` a stdout line and a stderr line written in the same instant can be
+ordered either way by a few hundred microseconds, because they travel via different kernel
+paths. The timestamps show the tie (`0.226112` vs `0.226200`); only `--pty` (merged) gives a
+single-kernel-path order. Do not promise a strict cross-stream order for concurrent writes.
+
 ## 5. `waitfor` / `doctor` — informational
 
 Not wrapped as tools yet; they are linked as bare names and only need their current
@@ -228,7 +358,7 @@ shapes stabilised:
 
 ---
 
-## 6. Defect 3: a 0-match `replace` is `INVALID_ARGUMENT` with an empty message
+## 6. Fixed in 0.4.0: a 0-match `replace` reported `INVALID_ARGUMENT` with no message
 
 ```sh
 busybox replace r5.ts --old zzzz --new x --format json ; echo $?
@@ -236,15 +366,24 @@ busybox replace r5.ts --old zzzz --new x --format json ; echo $?
 1
 ```
 
-The design notes said 0 matches → `NOT_FOUND` with the candidates. Today it is
-`INVALID_ARGUMENT` with no message, so the plugin can only show
-`"(the build sent no message)"`. Either is workable; a message is not.
+0.4.0 answers `NOT_FOUND` with `"expected 1 occurrence(s), found none"`, and
+`--sha256` now accepts the 12-character prefix `peek` prints (the plugin still resolves
+a prefix itself, which is harmless and keeps 0.3.x usable). `peek -p --format json` also
+emits `preview` (hex) and `guessed_type`, which the peek formatter already renders.
 
 Related: in `--request` mode the loop continues past `INVALID_ARGUMENT` and only
 breaks on `STALE_INPUT`/`NOT_FOUND`. The plugin's batch summary therefore says
 "check each result", not "later edits were skipped".
 
 ---
+
+## 6b. `run --help` does not list the options that exist
+
+0.5.0 added `-Y`, `--pty-raw`, `--pty-split` and `--pty-size` to `run --help`, but
+`-t/--timestamps`, `-q/--quiet`, `-j/--brief-json` and `-I/--error-ids` are still missing
+from it while being accepted by `getopt32long`, and `log --help` still describes `--stream`
+without `timeline`. The plugin documents these itself, but a binary should not hide its own
+features.
 
 ## 7. Compatibility checklist
 
@@ -261,6 +400,13 @@ Safe to change without telling anyone:
 - `--lines`/`--around` no longer being mutually exclusive;
 - `version` becoming a range hash instead of a whole-file hash;
 - `run`'s wrapper failure no longer being distinguishable from a child's exit status;
+- `--timestamps`/`--brief` precedence changing (today the timeline wins and `--brief` is
+  ignored), or the timeline prefix format `[   0.012345 out] ` changing — the bash
+  renderer strips exactly that shape for the human;
+- `--pty-split` semantics changing (stdout a terminal, stderr a pipe, environment
+  untouched): the wrapper's honest timing depends on stdout being a tty, and every
+  command's `isatty()` answer depends on `--pty-split` staying the split one;
+- the `"pty"` field, the watchdog's behaviour on SIGKILL, or `run`'s exit 3 on a signal;
 - `--list`, `--caps --format json`, or `log --meta` changing shape;
 - exit codes leaving the 0/1/2/3 set, or truncation ceasing to be exit 0.
 

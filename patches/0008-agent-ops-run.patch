@@ -1,9 +1,9 @@
 diff --git a/coreutils/run.c b/coreutils/run.c
 new file mode 100644
-index 0000000..33e2228
+index 0000000..4b4499c
 --- /dev/null
 +++ b/coreutils/run.c
-@@ -0,0 +1,2218 @@
+@@ -0,0 +1,2267 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * run - captured execution with retrievable evidence.
@@ -351,7 +351,7 @@ index 0000000..33e2228
 +	out[n] = '\0';
 +}
 +
-+static unsigned tl_shown_count(void)
++static unsigned tl_head_count(size_t budget)
 +{
 +	size_t used = 0;
 +	unsigned i;
@@ -359,7 +359,7 @@ index 0000000..33e2228
 +	for (i = 0; i < tl.n; i++) {
 +		int n = tl_line_len(&tl.v[i]);
 +
-+		if (i && used + (size_t)n > tl.out_budget) {
++		if (i && used + (size_t)n > budget) {
 +			tl.out_truncated = 1;
 +			break;
 +		}
@@ -368,26 +368,75 @@ index 0000000..33e2228
 +	return i;
 +}
 +
-+static void tl_print_text(void)
++static unsigned tl_shown_count(void)
 +{
-+	unsigned i, show = tl_shown_count();
++	return tl_head_count(tl.out_budget);
++}
++
++/* Newest lines that fit the budget: the failing assertion is at the end. */
++static unsigned tl_tail_count(size_t budget)
++{
 +	size_t used = 0;
++	unsigned i = tl.n;
 +
-+	for (i = 0; i < show; i++) {
-+		int n = tl_line_len(&tl.v[i]);
++	while (i > 0) {
++		int n = tl_line_len(&tl.v[i - 1]);
 +
-+		{
-+			char st[40];
-+
-+			tl_stamp(st, tl.v[i].ns);
-+			fputs(st, stdout);
-+		}
-+		printf("%s] %s\n", tl.v[i].stream == 'e' ? "err" : "out", tl.v[i].text);
++		if (used + (size_t)n > budget)
++			break;
 +		used += (size_t)n;
++		i--;
 +	}
-+	if (show < tl.n)
-+		printf("... [timeline truncated: %u of %u lines shown] ...\n",
-+				show, tl.n);
++	return tl.n - i;
++}
++
++/*
++ * Text mode shows head and tail, like the JSON view: a head-only view of a
++ * failing suite hides the failure. Three quarters of the budget goes to the
++ * head, the rest to the tail, and the omitted middle is one marker line.
++ */
++static unsigned tl_text_head(void)
++{
++	return tl_head_count(tl.out_budget * 3 / 4);
++}
++
++static unsigned tl_text_shown(void)
++{
++	unsigned head = tl_text_head();
++
++	if (head >= tl.n)
++		return head;
++	return head + tl_tail_count(tl.out_budget - tl.out_budget * 3 / 4);
++}
++
++static void tl_print_one(unsigned i)
++{
++	char st[40];
++
++	tl_stamp(st, tl.v[i].ns);
++	fputs(st, stdout);
++	printf("%s] %s\n", tl.v[i].stream == 'e' ? "err" : "out", tl.v[i].text);
++}
++
++static void tl_print_text(unsigned id)
++{
++	unsigned head = tl_text_head();
++	unsigned tail = 0;
++	unsigned i;
++
++	if (head < tl.n)
++		tail = tl_tail_count(tl.out_budget - tl.out_budget * 3 / 4);
++	if (head + tail > tl.n)
++		tail = tl.n - head;
++
++	for (i = 0; i < head; i++)
++		tl_print_one(i);
++	if (head + tail < tl.n)
++		printf("... [timeline truncated: %u of %u lines shown"
++				" (%u omitted); `log R%u --stream timeline' has them] ...\n",
++				head + tail, tl.n, tl.n - head - tail, id);
++	for (i = tl.n - tail; tail && i < tl.n; i++)
++		tl_print_one(i);
 +}
 +
 +/* the same records, written once, unbounded, as evidence */
@@ -1714,11 +1763,11 @@ index 0000000..33e2228
 +					id, m.exit_code, m.timed_out ? "true" : "false",
 +					m.cancelled ? "true" : "false", m.duration_ms);
 +			printf("timeline_lines=%u shown=%u truncated=%s stamp=%s res_ns=%u\n",
-+					tl.n, tl_shown_count(),
++					tl.n, tl_text_shown(),
 +					(tl.truncated || tl.n > tl_shown_count()) ? "true" : "false",
 +					tl.nanosec ? "ns" : "us", tl.res_ns);
 +			printf("--- timeline ---\n");
-+			tl_print_text();
++			tl_print_text(id);
 +			if (opt_pgid)
 +				printf("pgid=%ld\n", child_pgid);
 +		} else if (quiet) {
@@ -2222,7 +2271,6 @@ index 0000000..33e2228
 +	fflush(stdout);
 +	return rc;
 +}
-
 diff --git a/miscutils/doctor.c b/miscutils/doctor.c
 new file mode 100644
 index 0000000..5b607d5
