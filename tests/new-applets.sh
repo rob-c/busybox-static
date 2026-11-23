@@ -46,6 +46,24 @@ ck "patch.prefix_applied"  "y" "$(cat g.txt)"
 ck "patch.json"        "1" "$(printf -- '--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-one\n+ONE\n' > q.patch; "$BB" patchapply -n -F json q.patch | "$BB" grep -c '"status":"ok"')"
 ck "patch.invalid"     "1" "$(printf 'not a diff\n' > b.patch; "$BB" patchapply b.patch >/dev/null 2>&1; echo $?)"
 
+sec "N. patchapply creates, and takes several preconditions"
+printf -- '--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1,2 @@\n+alpha\n+beta\n' > n.patch
+ck "patch.create_rc"    "0" "$("$BB" patchapply n.patch >/dev/null 2>&1; echo $?)"
+ck "patch.create_body"  "alpha" "$(sed -n 1p new.txt 2>/dev/null)"
+ck "patch.create_count" "2" "$(wc -l < new.txt | tr -d ' ')"
+printf 'a\n' > h1; printf 'b\n' > h2
+V1=$("$BB" peek h1 --format json | sed -n 's/.*"version":"\(sha256:[0-9a-f]*\)".*/\1/p' | cut -c1-19)
+V2=$("$BB" peek h2 --format json | sed -n 's/.*"version":"\(sha256:[0-9a-f]*\)".*/\1/p' | cut -c1-19)
+printf -- '--- a/h1\n+++ b/h1\n@@ -1 +1 @@\n-a\n+A\n' > two.patch
+ck "patch.two_preconditions" "0" "$("$BB" patchapply -c "h1=$V1" -c "h2=$V2" two.patch >/dev/null 2>&1; echo $?)"
+ck "patch.two_applied"       "A" "$(cat h1)"
+ck "patch.second_stale"      "1" "$("$BB" patchapply -c "h2=sha256:dead" two.patch >/dev/null 2>&1; echo $?)"
+
+sec "O2. outline finds a C definition whose brace is on the next line"
+printf 'int add(int a)\n{\n}\nint proto(int a);\n' > fn.c
+ck "outline.c_function" "1" "$("$BB" outline fn.c | "$BB" grep -c ':function:.*add')"
+ck "outline.c_prototype_skipped" "0" "$("$BB" outline fn.c | "$BB" grep -c 'proto')"
+
 sec "H. the binary documents its own flags"
 ck "help.log_since"       "1" "$("$BB" log --help 2>&1 | "$BB" grep -c -- '--since')"
 ck "help.log_summary"     "1" "$("$BB" log --help 2>&1 | "$BB" grep -c -- '--summary')"

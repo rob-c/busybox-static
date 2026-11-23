@@ -1,9 +1,9 @@
 diff --git a/editors/patchapply.c b/editors/patchapply.c
 new file mode 100644
-index 0000000..d10917a
+index 0000000..f652bcd
 --- /dev/null
 +++ b/editors/patchapply.c
-@@ -0,0 +1,419 @@
+@@ -0,0 +1,453 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * patchapply - apply a unified diff, all or nothing, with preconditions.
@@ -126,6 +126,7 @@ index 0000000..d10917a
 +	size_t i = 0;
 +	struct pfile *cur = NULL;
 +	int in_hunk = 0;
++	char *old_side = NULL;
 +	struct hunk *h = NULL;
 +	size_t buf_cap = 0, buf_len = 0;
 +	char *buf = NULL;
@@ -139,6 +140,11 @@ index 0000000..d10917a
 +		if (i < len)
 +			i++;
 +
++		if (l >= 4 && memcmp(data + start, "--- ", 4) == 0) {
++			free(old_side);
++			old_side = strip_prefix(data + start + 4, l - 4);
++			continue;
++		}
 +		if (l >= 4 && memcmp(data + start, "+++ ", 4) == 0) {
 +			char *p;
 +
@@ -147,8 +153,10 @@ index 0000000..d10917a
 +			cur = &files[(*nfiles)++];
 +			memset(cur, 0, sizeof(*cur));
 +			p = strip_prefix(data + start + 4, l - 4);
++			if (old_side && strcmp(old_side, "/dev/null") == 0)
++				cur->is_new = 1;   /* creation: the old side is /dev/null */
 +			if (strcmp(p, "/dev/null") == 0) {
-+				cur->is_new = 1;
++				cur->is_delete = 1; /* deletion: the new side is */
 +				free(p);
 +				p = NULL;
 +			}
@@ -218,6 +226,8 @@ index 0000000..d10917a
 +		"format\0"   Required_argument "F"
 +		;
 +	char *opt_sha = NULL, *opt_fmt = NULL;
++	char **shas;
++	unsigned nshas = 0;
 +	unsigned opts;
 +	int dry_run, json = 0, i, rc = 0;
 +	struct pfile files[MAX_FILES];
@@ -226,6 +236,24 @@ index 0000000..d10917a
 +	size_t plen = 0;
 +
 +	xfunc_error_retval = 2;
++	{
++		/* -c/--sha256 repeats: one precondition per file it names. */
++		int i, j = 1;
++
++		shas = xzalloc(sizeof(char *) * ((unsigned)argc + 1));
++		for (i = 1; argv[i]; i++) {
++			if ((strcmp(argv[i], "--sha256") == 0 || strcmp(argv[i], "-c") == 0)
++			 && argv[i + 1]
++			) {
++				shas[nshas++] = argv[i + 1];
++				i++;
++				continue;
++			}
++			argv[j++] = argv[i];
++		}
++		argv[j] = NULL;
++		(void)opt_sha;
++	}
 +	opts = getopt32long(argv, "nc:F:", patch_longopts, &opt_sha, &opt_fmt);
 +	dry_run = (opts & 1) != 0;
 +	argv += optind;
@@ -254,26 +282,28 @@ index 0000000..d10917a
 +		return 1;
 +	}
 +
-+	/* Precondition first: a stale file aborts everything before a write. */
-+	if (opt_sha) {
-+		char *eq = strchr(opt_sha, '=');
++	/* Preconditions first: a stale file aborts everything before a write. */
++	for (i = 0; i < (int)nshas; i++) {
++		char *spec = shas[i];
++		char *eq = strchr(spec, '=');
 +		char *want = eq ? xstrdup(eq + 1) : NULL;
 +		size_t wlen = want ? strlen(want) : 0;
++		char *target;
 +
-+		if (!eq) {
++		if (!eq)
 +			bb_simple_error_msg_and_die("--sha256 wants PATH=HASH");
-+		}
 +		*eq = '\0';
++		target = spec;
 +		{
 +			size_t len = 0;
-+			char *data = read_text(opt_sha, &len);
++			char *data = read_text(target, &len);
 +			char hex[65];
 +
 +			if (!data) {
 +				if (json)
 +					printf("{\"schema\":1,\"status\":\"error\",\"code\":\"NOT_FOUND\"}\n");
 +				else
-+					bb_perror_msg("%s", opt_sha);
++					bb_perror_msg("%s", target);
 +				return 1;
 +			}
 +			hex_sha256(data, len, hex);
@@ -288,7 +318,7 @@ index 0000000..d10917a
 +							"\"message\":\"content version is sha256:%s\"}\n", hex);
 +				} else {
 +					bb_error_msg("%s: STALE_INPUT (content version is sha256:%s)",
-+							opt_sha, hex);
++							target, hex);
 +				}
 +				return 1;
 +			}
@@ -306,6 +336,10 @@ index 0000000..d10917a
 +		int ok = 1;
 +
 +		data = f->path ? read_text(f->path, &len) : NULL;
++		if (!data && f->is_new) {
++			data = xzalloc(1);   /* creation: nothing on disk yet */
++			len = 0;
++		}
 +		if (!data) {
 +			if (json)
 +				printf("%s{\"path\":\"%s\",\"status\":\"error\",\"code\":\"NOT_FOUND\"}",
@@ -500,10 +534,10 @@ index 0000000..745847d
 +}
 diff --git a/miscutils/outline.c b/miscutils/outline.c
 new file mode 100644
-index 0000000..ca3d33d
+index 0000000..ca0d5b7
 --- /dev/null
 +++ b/miscutils/outline.c
-@@ -0,0 +1,287 @@
+@@ -0,0 +1,295 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * outline - definitions in a file, with line, byte offset and version.
@@ -638,7 +672,7 @@ index 0000000..ca3d33d
 +			: is_prefixed_with(p, "union ") ? "union" : "type";
 +		const char *q;
 +
-+		p += strlen(k) + (is_prefixed_with(p, "type ") ? 1 : 1);
++		p += strlen(k);
 +		while (p < end && (*p == ' ' || *p == '\t'))
 +			p++;
 +		q = p;
@@ -652,7 +686,8 @@ index 0000000..ca3d33d
 +		return NULL;
 +	}
 +
-+	/* A line ending in ') {' or ')': a function definition, not a prototype. */
++	/* A line ending in ')' — with the brace here or on the next line — is a
++	 * definition; a line ending in ';' is a prototype and is skipped. */
 +	{
 +		const char *brace = NULL;
 +		const char *q;
@@ -662,8 +697,15 @@ index 0000000..ca3d33d
 +				brace = q;
 +				break;
 +			}
-+		if (!brace)
-+			return NULL;
++		if (!brace) {
++			const char *e = end;
++
++			while (e > p && (e[-1] == ' ' || e[-1] == '\t'))
++				e--;
++			if (e == p || e[-1] != ')' || memchr(p, ';', (size_t)(end - p)))
++				return NULL;
++			brace = e;   /* a definition whose body opens on the next line */
++		}
 +		for (q = brace; q > p; q--)
 +			if (*q == ')')
 +				break;
