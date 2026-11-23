@@ -5,7 +5,7 @@ this plugin actually executes and parses, captured from a real build rather than
 from the design notes. If a change to the binary breaks one of these, the plugin
 breaks silently — most of these fields are read with a default when missing.
 
-- **Build this was verified against:** project release **v0.5.0**, busybox
+- **Build this was verified against:** the **0.5.1** tree, busybox
   `1.39.0.git`, asset `busybox-static-1.39.0-aac079e-darwin-universal`, **276 applets**,
   `--caps` features `gnu-long-opts,peek,replace,waitfor,run,log,doctor,json`.
 - **Plugin side:** `src/agentops.ts` (argv building, payload parsing, salvage) and
@@ -144,6 +144,7 @@ Invocations:
 
 ```sh
 busybox run [--timeout SECS|-T] [--kill-after SECS|-k] [--max-bytes N|-B] \
+            [--timestamps|-t] [--stamp-ns|-n] \
             [--capture-limit N|-C] [--dir PATH|-D] [--cwd DIR|-d] [--shell|-s] \
             [--stdin FILE|-i] [--pgid|-P] [--env NAME=VALUE|-e] [--prune N|-r] \
             [--quiet|-q] [--timestamps|-t] [--brief-json|-j] \
@@ -168,7 +169,12 @@ environment is otherwise untouched, and `--pty-split` keeps the streams apart. s
 fed through the master and terminated with `VEOF`, so a prompt sees EOF instead of
 hanging. `--format json` reports `"pty":true`, and the timeline is unchanged.
 
-`-t/--timestamps` prints one interleaved line per record, `[   0.011354 out] text`;
+`-t/--timestamps` prints one interleaved line per record, `[   0.011354 out] text`.
+`-n/--stamp-ns` widens that stamp to nine digits and declares the clock's own granularity
+(`stamp=ns res_ns=41` on Apple Silicon and on ARM Linux; the Darwin build needs
+`CLOCK_MONOTONIC_RAW`, because `CLOCK_MONOTONIC` is quantised to 1 µs there). **`-n` is
+accepted but missing from `run --help`** — a known gap, not a hidden feature to rely on
+silently.
 `--quiet` drops the summary but is ignored when `-t` is set; `--brief WHICH` reduces a
 stream through `brief -d` and is *also* ignored when `-t` is set (the timeline branch is
 taken first). The plugin therefore uses `-t` for the timeline modes and `--brief` only
@@ -196,7 +202,11 @@ process start, one entry per line, both streams in arrival order):
 
 `log --stream timeline` replays that view from the run directory (it needs a run created
 with `-t`: without it the artifact does not exist and the answer is
-`{"status":"error","code":"NOT_FOUND","message":"run not found or stream missing"}`);
+`{"status":"error","code":"NOT_FOUND","message":"run not found or stream missing"}`).
+`--match`, `--lines` and `--context` all apply to it; the default context is 3, so
+`--match STR` alone also returns the neighbouring lines — use `--context 0` when only the
+hit is wanted. An earlier draft of this document reported `--match` as ignored on the
+timeline stream; that was a misreading of exactly this default, and the claim is withdrawn.
 `--stream both --format json` returns two objects. A truncated `stdout_view` is a single
 JSON string with an in-band marker — `… line 5\n... [310 bytes] ...\ne 34 …` — which is
 valid JSON since 0.4.0.
@@ -280,12 +290,24 @@ What the plugin still does, now as belt-and-braces rather than necessity:
 Also fixed in 0.5.0: two concurrent runs in one artifact root could pick the same run id
 and truncate each other's artifacts. pi issues bash calls in parallel, so this mattered.
 
-### Defect (open): `unzip -d DIR` extracts nothing and exits 0
+### Fixed in 0.5.1: `unzip -d DIR` extracted nothing and exited 0
 
 ```sh
 busybox unzip -q pkg.zip -d out ; echo $?    # 0, and `out` is empty
 busybox unzip -q pkg.zip                     # extracts into cwd, correctly
 ```
+
+**Fixed in 0.5.1.** BSD getopt stops at the first non-option while glibc permutes, so
+`-d out` after the archive was read as member names on macOS only. `-d DIR`, `-dDIR` and
+`-qd DIR` are now peeled out of argv wherever they appear:
+
+```sh
+unzip -q pkg.zip -d out && ls out    # 1 file        (0.5.1)
+unzip -q -d out pkg.zip              # same
+unzip -q pkg.zip -dout               # attached form
+```
+
+Pinned by `tests/plugin-reports.sh` section R2.
 
 Same archive, same binary: with `-d` nothing is written, without it the files appear. This
 is the applet the plugin links as a bare `unzip`, and the one its own zip installer used to
@@ -294,27 +316,41 @@ directory was on PATH. The plugin now resolves a system unzip/bsdtar first, so i
 model-facing annoyance, but a model that runs `unzip -d out pkg.zip` gets an empty directory
 and a success code.
 
-### Defect (open): `--prune N` is ignored whenever `--timestamps` is set
+### Fixed in 0.5.1: `--prune N` was ignored whenever `--timestamps` was set
 
 ```sh
 for i in $(seq 30); do run -q --prune 5 -- true ; done   # 5 directories left
 for i in $(seq 30); do run -t --prune 5 -- true ; done   # 30 directories left
 ```
 
+**Fixed in 0.5.1.** `prune_runs()` unlinked a fixed list (`stdout`, `stderr`, `meta`) and then
+`rmdir` failed on the extra `timeline` file; it now empties the directory entry by entry.
+Measured: eight runs with `-t -q --prune 3` leave three directories. Pinned by
+`tests/plugin-reports.sh` section R1.
+
 The wrapper always asks for the timeline, so its `--prune` never took effect and a session
 left hundreds of run directories behind. The plugin sweeps the root itself now (newest 20,
 `R<number>` directories only, symlinks untouched). Worth fixing in `run`: the option should
 either work in both branches or say it does not apply.
 
-### Behaviour worth stating: the text timeline keeps only the head
+### Fixed in 0.5.1: the text timeline kept only the head
 
 `run -t` prints `timeline_lines=N shown=M truncated=true` and then the first M lines — no
 tail, unlike the JSON `stdout_view`, which keeps head and tail around an omission marker.
 For a failing test suite the interesting part is the end, so the plugin's digest names
-`busybox log RUN --lines <N-40>:<N>`. A `--tail-lines N` (or head+tail in text mode) would
-remove that round trip.
+`busybox log RUN --lines <N-40>:<N>`. **Fixed in 0.5.1.** The text view now spends three quarters of `--max-bytes` on the head and
+one quarter on the tail, with one marker between them, and reports `shown=` as head+tail:
 
-### Defect (open): `-B 0` shows nothing, while the JSON hint calls it "no limit"
+```text
+[00000.011425 out] line 11
+... [timeline truncated: 16 of 40 lines shown (24 omitted); `log R1 --stream timeline' has them] ...
+[00000.011642 out] line 36
+```
+
+The phrase `timeline truncated: N of M lines shown` is kept on purpose — existing greps and
+the plugin's digest look for it. Pinned by `tests/plugin-reports.sh` section R4.
+
+### Fixed in 0.5.1: the `-B 0` hint claimed "no limit"
 
 ```sh
 brief -B 0 pytest.log            # marker only: shown_lines=0 bytes=0 truncated=1 truncated_by=budget
@@ -322,7 +358,9 @@ brief -B 40000 pytest.log        # the whole body (33719 bytes) — a big number
 brief -d -B 400 -F json …        # hints: ["the byte budget stopped the view: raise -B, or -B 0 for no limit"]
 ```
 
-The hint tells the caller to use `-B 0` for "no limit"; `-B 0` is a *zero* budget. Either
+**Fixed in 0.5.1.** `-B 0` stays a zero budget (consistent with `peek`/`run`) and the hint now
+reads `the byte budget stopped the view: raise -B (-B 0 is a zero budget)`. Pinned by
+`tests/plugin-reports.sh` section R3. Either
 the flag should treat 0 as unlimited (matching the hint) or the hint should stop saying so.
 The plugin's skills document the real behaviour, since the hint is the thing a model reads.
 
@@ -418,3 +456,111 @@ this document, including the broken `run` payload as a fixture. The end-to-end c
 is a real pi session running: `busybox_peek` → `busybox_replace` with the returned
 version → `busybox_run` of a failing command → `busybox_run run_id=… match=…` → the
 same `busybox_replace` again, which must answer `STALE_INPUT` and change nothing.
+
+---
+
+## 9. Proposed additions — **not in this build**
+
+Nothing below exists yet. Do not code against it; each item names the measurement that
+motivated it and the shape it would take, so the plugin side can say "yes/not yet" before
+anyone writes C. Ordering is by value per unit of risk.
+
+### 9.1 Time-addressed retrieval (highest value)
+
+The timeline is captured well and read badly: the plugin re-parses `[   0.011354 out] …`
+with a regex because `log --stream timeline --format json` returns `content[].text`
+strings. The question after a summary is *what happened between 6.1 s and 8.4 s*.
+
+```sh
+log RUN --stream timeline --since 6.1 --until 8.4 --format json
+log RUN --stream timeline --around-gap 0.5 --limit 3 --format json   # the 3 longest silences
+log RUN --summary --format json      # total, lines, first out/err, longest gap, errors, exit
+```
+
+Adds `events:[{n,us,stream,text}]` beside `content[]` (additive), `gaps:[{from_us,to_us,lines}]`,
+and a `summary` object. Removes `timing.ts`'s parser and `summarizeTiming` from the plugin.
+
+### 9.2 A deadline that distinguishes "stuck" from "slow"
+
+The plugin now applies a **120 s default deadline** to every wrapped bash call, so a long
+build that is working fine dies like a hang. `--idle-timeout` separates them:
+
+```sh
+run --timeout 600 --idle-timeout 60 -- make -j8
+# no output for 60 s -> code:"IDLE_TIMEOUT", exit 3, partial capture kept
+```
+
+### 9.3 Instrumented guests
+
+```sh
+run --env BUSYBOX_RUN_ID=$run -- bash -c 'mark phase:build; make; mark phase:test'
+log RUN --stream timeline --marks      # phase:build 0.42s -> 12.8s (12.4s)
+```
+
+A tiny `mark` applet writing one named event with the run's own clock. Turns "which phase
+was slow" from a reading exercise into a lookup, and needs no ptrace, no /proc, no LD_PRELOAD.
+
+### 9.4 Bounded sample for high-entropy output
+
+`brief` handles repeats; a compiler that says 40 000 different things is immune.
+
+```sh
+log RUN --sample 40 --format json     # 40 head, one marker, 40 tail, deterministic
+```
+
+### 9.5 Streaming consumption
+
+```sh
+run --jsonl -- make -j8    # {"t":1234,"s":"out","line":"…"} per event, flushed
+```
+
+For harnesses that want to watch rather than wait; today the JSON document appears only at exit.
+
+### 9.6 Patch application with preconditions
+
+`replace` takes single literals; models emit unified diffs.
+
+```sh
+patchapply --dry-run --sha256 pkg.ts=sha256:750d… change.patch --format json
+# results:[{path,status,code,changes}] per file, atomic temp+rename, refuses stale input
+```
+
+### 9.7 Navigation without reading a file
+
+```sh
+outline src/app.ts --format json
+# [{name,kind,line,byte,version}] for functions/classes/headings/rules
+peek src/app.ts --from-byte 4120    # jumps straight to the body
+```
+
+### 9.8 Change detection across runs
+
+```sh
+log --diff-timeline R12:R18 --format json   # lines/s, gaps, first stderr, exit delta
+```
+
+"Slower than before" answered without a second full read.
+
+### 9.9 Feature advertisement
+
+`--caps .features` still reads `gnu-long-opts,peek,replace,waitfor,run,log,doctor,json`
+while the build also has `brief`, `pty`, `timeline`, `brief-json`, `error-ids`, `stamp-ns`.
+A client cannot feature-detect what is not listed.
+
+### 9.10 Smaller, already-defined gaps
+
+- `run --help` omits `-n/--stamp-ns` (accepted, undocumented).
+- `waitfor --timeout 0` means "one attempt"; `run --timeout 0` means "already expired" —
+  consistent only if written down, which this section does.
+
+## 10. How this side verifies the contract now
+
+```sh
+./tests/plugin-reports.sh dist/<target>/bin/busybox   # 26 checks, one per reported defect
+./tests/agent-ops.sh      dist/<target>/bin/busybox   # 1299 payload/exit-code checks
+./tests/streams.sh        dist/<target>/bin/busybox   # 37 stdout/stderr + error-id checks
+```
+
+`tests/plugin-reports.sh` is the file to extend when this document gains a defect: each
+section (R1…R5) is named after the report it guards, so a regression fails with the reason
+attached rather than as a shape mismatch three layers away.
