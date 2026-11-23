@@ -135,6 +135,7 @@ Invocations:
 
 ```sh
 busybox run [--timeout SECS] [--max-bytes N] [--cwd DIR] [--shell] --format json -- ARGV…
+busybox run --pty [--pty-raw] [--pty-split] [--pty-size COLSxROWS] --format json -- ARGV…
 busybox log RUN [--lines A:B] [--match STR] [--context N] [--stream stdout|stderr|both] \
                 [--meta] [--max-bytes N] --format json
 ```
@@ -155,10 +156,26 @@ busybox log RUN [--lines A:B] [--match STR] [--context N] [--stream stdout|stder
 {"schema":1,"stream":"stdout","status":"error","code":"NOT_FOUND","message":"no match"}
 ```
 
+A pty run answers the same payload plus the terminal it built:
+
+```json
+{"schema":1,"run":"R13","dir":"/…/busybox-run/R13","pgid":4711,"pty":true,
+ "pty_slave":"/dev/pts/3","pty_cols":80,"pty_rows":24,"pty_raw":false,
+ "stderr_merged":true,"exit_code":0,…,"stdout_view":"hi\n","stderr_view":""}
+```
+
+`pty:false` and no `pty_*` keys are emitted for a pipe run, so a reader that does
+not know about ptys is unaffected. With `stderr_merged:true` the guest's stderr
+went to its terminal, so `stdout_view` carries both streams in arrival order and
+`stderr_view` is empty; `--pty-split` restores two streams with
+`stderr_merged:false`. `meta` gains `pty`, `pty_slave`, `pty_rows`, `pty_cols`
+and `stderr_merged` lines.
+
 **Fields depended on:** `run`, `dir`, `exit_code`, `timed_out`, `cancelled`,
 `capture_complete`, `duration_ms`, `stdout_bytes`, `stderr_bytes`, `view_truncated`,
 `stdout_view`, `stderr_view`; for `log`: `stream`, `status`, `code`, `message`,
-`lines`, `content[].n/.text`, `shown_bytes`, `truncated`, `meta`.
+`lines`, `content[].n/.text`, `shown_bytes`, `truncated`, `meta`; optionally
+`pty`, `pty_slave`, `pty_cols`, `pty_rows`, `pty_raw`, `stderr_merged`.
 
 `run`'s exit code is passed through to the tool result but **is not** read as success
 or failure: `exit_code: 3` with `timed_out:false` is a child that exited 3. Only

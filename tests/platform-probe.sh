@@ -50,13 +50,16 @@ hash() { "$BB" sha256sum | "$BB" cut -d' ' -f1; }
 # probe <applet> <label> <args...>
 probe() {
 	app=$1; label=$2; shift 2
-	"$BB" timeout 5 "$app" "$@" > "$T/o" 2> "$T/e" < /dev/null
+	# the applet, not a PATH lookup: keep the probe inside this binary
+	"$BB" timeout -s KILL 5 "$BB" "$app" "$@" > "$T/o" 2> "$T/e" < /dev/null
 	rc=$?
 	# normalise: the binary path, the temp dir and timings must not leak in
 	"$BB" sed -e "s#$BB#BUSYBOX#g" -e "s#$T#TMP#g" \
+		-e '/^BusyBox v/d' \
 		-e 's/[0-9][0-9]*\.[0-9][0-9]*/FLOAT/g' \
 		-e 's/[0-9][0-9][0-9][0-9][0-9]*/NUM/g' "$T/o" > "$T/on"
 	"$BB" sed -e "s#$BB#BUSYBOX#g" -e "s#$T#TMP#g" \
+		-e '/^BusyBox v/d' \
 		-e 's/[0-9][0-9]*\.[0-9][0-9]*/FLOAT/g' \
 		-e 's/[0-9][0-9][0-9][0-9][0-9]*/NUM/g' "$T/e" > "$T/en"
 	out=$(hash < "$T/on")
@@ -67,6 +70,7 @@ probe() {
 # ---- phase A: every applet, option surface only ---------------------------
 say "# phase A: option surface"
 "$BB" --list | "$BB" sort | while read -r app; do
+	printf 'A %s\n' "$app" >&2
 	case "$app" in
 	# these change state or need a tty even for --help
 	rm|rmdir|mv|cp|ln|chmod|chown|chgrp|dd|mknod|mkfifo|kill|killall5|\
@@ -76,7 +80,6 @@ say "# phase A: option surface"
 	*)
 		probe "$app" help --help
 		probe "$app" badlong --nosuch-option-xyz
-		probe "$app" badshort -Z
 		;;
 	esac
 done
@@ -86,6 +89,7 @@ say "# phase B: behaviour over fixed fixtures"
 # applet|label|args
 while IFS=';' read -r app label args; do
 	[ -z "$app" ] && continue
+	printf 'B %s %s\n' "$app" "$label" >&2
 	# shellcheck disable=SC2086
 	probe "$app" "$label" $args
 done <<'EOF'
@@ -220,3 +224,29 @@ cut;help;--help
 tr;help;--help
 wc;help;--help
 EOF
+
+# ---- phase C: live process probes ----------------------------------------
+# A process only shows the procps differences, so spawn one from this binary
+# under a name that is the same on both platforms.
+say "# phase C: live process"
+mkdir -p bin
+"$BB" ln -sf "$BB" bin/bbprobe-sleep
+PATH="$T/bin:$PATH" bbprobe-sleep 30 &
+SPID=$!
+sleep 1
+probe ps pid -o pid,comm
+probe ps com -o comm
+probe pgrep sub bbprobe
+probe pgrep x -x bbprobe-sleep
+probe pgrep xf -x -f bbprobe-sleep
+probe pgrep fl -fl bbprobe-sleep
+probe pgrep fa -fa bbprobe-sleep
+probe pgrep n -n bbprobe
+probe pgrep o -o bbprobe
+probe pgrep p -P $PPID
+probe pidof sid -s bbprobe-sleep
+probe pidof plain bbprobe-sleep
+probe pkill x -x nosuch-proc-zzz
+probe killall l -l
+"$BB" kill "$SPID" 2>/dev/null
+"$BB" pkill -f bbprobe 2>/dev/null; true

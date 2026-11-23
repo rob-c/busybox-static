@@ -1,9 +1,9 @@
 diff --git a/coreutils/run.c b/coreutils/run.c
 new file mode 100644
-index 0000000..8a203a4
+index 0000000..4682a51
 --- /dev/null
 +++ b/coreutils/run.c
-@@ -0,0 +1,1712 @@
+@@ -0,0 +1,2149 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * run - captured execution with retrievable evidence.
@@ -51,6 +51,12 @@ index 0000000..8a203a4
 +//usage:     "\n	-j, --brief-json	Emit brief's JSON (schema 1) as the body"
 +//usage:     "\n	-t, --timestamps	Prefix every line with its time and stream,"
 +//usage:     "\n			in one interleaved stream (dmesg style)"
++//usage:     "\n	-Y, --pty		Give the child a new pty as its controlling"
++//usage:     "\n			terminal (0,1,2 on the slave, stderr merged)"
++//usage:     "\n	--pty-raw		--pty, but with the line discipline raw"
++//usage:     "\n	--pty-split		--pty, but stderr keeps its own pipe"
++//usage:     "\n	--pty-size COLSxROWS	Terminal size for the pty (default: the"
++//usage:     "\n			parent's terminal, else 80x24)"
 +//usage:     "\n	-b, --brief WHICH	Reduce the view through brief -d:"
 +//usage:     "\n			stdout (default), stderr or both"
 +//usage:     "\n	-F, --format FMT	text (default) or json"
@@ -73,6 +79,8 @@ index 0000000..8a203a4
 +//usage:     "\n	-D, --dir PATH		Artifact root"
 +//usage:     "\n	-F, --format FMT	text (default) or json"
 +
++#include <termios.h>
++#include <sys/ioctl.h>
 +#include "libbb.h"
 +
 +enum {
@@ -80,6 +88,8 @@ index 0000000..8a203a4
 +	DEFAULT_CAPTURE = 64 * 1024 * 1024,
 +	DEFAULT_CONTEXT = 3,
 +	MAX_RANGES = 200,
++	DEFAULT_COLS = 80,
++	DEFAULT_ROWS = 24,
 +};
 +
 +static long child_pgid;
@@ -87,6 +97,11 @@ index 0000000..8a203a4
 +static char **child_env;   /* NAME=VALUE pairs from --env, NULL-terminated */
 +static int n_child_env;
 +static int error_ids;
++static int pty_mode;       /* -Y: the guest runs under a terminal */
++static int pty_raw;        /* --pty-raw: no line discipline at all */
++static int pty_split;      /* --pty-split: stderr keeps its own pipe */
++static int pty_req_cols;   /* --pty-size */
++static int pty_req_rows;
 +
 +struct meta {
 +	char *cmd;
@@ -99,6 +114,11 @@ index 0000000..8a203a4
 +	int capture_complete;
 +	unsigned long long out_bytes;
 +	unsigned long long err_bytes;
++	int pty;
++	const char *pty_slave;
++	int pty_rows;
++	int pty_cols;
++	int stderr_merged;
 +};
 +
 +struct rng {
@@ -186,15 +206,19 @@ index 0000000..8a203a4
 +	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
 +
 +	if (fd >= 0) {
-+		char buf[512];
++		char buf[1024];
 +		int n = snprintf(buf, sizeof(buf),
 +				"cmd=%s\ncwd=%s\nduration_ms=%ld\nexit_code=%d\n"
 +				"signal=%d\ntimed_out=%d\ncancelled=%d\n"
-+				"capture_complete=%d\nstdout_bytes=%llu\nstderr_bytes=%llu\npgid=%ld\n",
++				"capture_complete=%d\nstdout_bytes=%llu\nstderr_bytes=%llu\npgid=%ld\n"
++				"pty=%d\npty_slave=%s\npty_rows=%d\npty_cols=%d\n"
++				"stderr_merged=%d\n",
 +				m->cmd ? m->cmd : "", m->cwd ? m->cwd : "",
 +				m->duration_ms, m->exit_code, m->term_sig,
 +				m->timed_out, m->cancelled, m->capture_complete,
-+				m->out_bytes, m->err_bytes, child_pgid);
++				m->out_bytes, m->err_bytes, child_pgid,
++				m->pty, m->pty_slave ? m->pty_slave : "",
++				m->pty_rows, m->pty_cols, m->stderr_merged);
 +		if (n > 0)
 +			full_write(fd, buf, (size_t)n);
 +		close(fd);
@@ -381,19 +405,184 @@ index 0000000..8a203a4
 +			tl.n, i, (tl.truncated || tl.out_truncated) ? "true" : "false");
 +}
 +
-+static void pump(int fds[2], int arts[2], long deadline_ms, int kill_after_ms,
++/* ---------- pty: the guest gets a terminal of its own ---------- */
++
++/*
++ * A pty run is the same execution with one substitution: instead of two pipes,
++ * the guest's fds 0/1/2 are the slave side of a fresh pty, and this process
++ * reads the master. Everything the guest writes to its terminal, including what
++ * it writes to /dev/tty, arrives there in order. The environment is untouched -
++ * fork/exec inherits it - so a pty run and a pipe run differ only where the
++ * guest itself notices isatty().
++ *
++ * Two platform facts shape the code below, both measured, not assumed:
++ *   - When the guest closes its side, Linux returns EIO from read(master) and
++ *     Darwin returns a 0-length read. Both mean EOF.
++ *   - Writing to the master after the guest's side is gone is EIO on Darwin and
++ *     a silent success on Linux, so a failed feed stops the feed on both.
++ */
++struct pty_box {
++	int master;
++	char slave[128];
++	int cols;
++	int rows;
++};
++
++/* Allocate master + slave. Both platforms have /dev/ptmx; grantpt/unlockpt are
++ * POSIX and Darwin aliases them. */
++static int pty_alloc(struct pty_box *pb)
++{
++	int m;
++	const char *name;
++
++	m = open("/dev/ptmx", O_RDWR | O_NOCTTY);
++	if (m < 0)
++		return -1;
++	if (grantpt(m) != 0 || unlockpt(m) != 0) {
++		close(m);
++		return -1;
++	}
++	name = ptsname(m);
++	if (!name || strlen(name) >= sizeof(pb->slave)) {
++		close(m);
++		return -1;
++	}
++	strcpy(pb->slave, name);
++	pb->master = m;
++	return 0;
++}
++
++/* The size the guest's terminal reports. An explicit --pty-size wins; otherwise
++ * the parent's own terminal is inherited (that is the "parent environment" a
++ * full-screen guest actually cares about); otherwise the classic 80x24, so
++ * `stty size` answers instead of printing 0 0. */
++static void pty_pick_size(struct pty_box *pb)
++{
++	int i, cols = pty_req_cols, rows = pty_req_rows;
++
++	if (!(cols > 0 && rows > 0)) {
++		struct winsize ws;
++
++		for (i = 0; i <= 2; i++) {
++			if (isatty(i) && ioctl(i, TIOCGWINSZ, &ws) == 0
++			 && ws.ws_col > 0 && ws.ws_row > 0
++			) {
++				cols = ws.ws_col;
++				rows = ws.ws_row;
++				break;
++			}
++		}
++	}
++	if (!(cols > 0 && rows > 0)) {
++		cols = DEFAULT_COLS;
++		rows = DEFAULT_ROWS;
++	}
++	pb->cols = cols;
++	pb->rows = rows;
++}
++
++/*
++ * Line discipline. The point is that the captured bytes are the guest's own:
++ * no echo (a terminal would otherwise repeat the fed stdin into the capture)
++ * and no ONLCR (a terminal would otherwise turn every "\n" into "\r\n", so a
++ * pty run and a pipe run of the same command would disagree). ICANON and ISIG
++ * stay on, so a guest that reads a line still gets line editing and a real EOF
++ * from VEOF. --pty-raw turns all of it off, for byte-transparent transports.
++ */
++static void pty_apply_termios(int fd)
++{
++	struct termios tio;
++
++	if (tcgetattr(fd, &tio) != 0)
++		return;
++	if (pty_raw) {
++		tio.c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP
++				| INLCR | IGNCR | ICRNL | IXON);
++		tio.c_oflag &= ~OPOST;
++		tio.c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
++		tio.c_cflag &= ~(CSIZE | PARENB);
++		tio.c_cflag |= CS8;
++	} else {
++		tio.c_oflag &= ~(ONLCR | OCRNL);
++		tio.c_lflag &= ~(ECHO | ECHONL);
++	}
++	tio.c_cc[VMIN] = 1;
++	tio.c_cc[VTIME] = 0;
++	tcsetattr(fd, TCSANOW, &tio);
++}
++
++/*
++ * Child side. Order matters twice:
++ *   - setsid() must precede the slave open, or the tty joins the parent's
++ *     session instead of becoming the guest's controlling terminal;
++ *   - setsid() fails for a process-group leader, which is why the parent does
++ *     NOT setpgid() in pty mode. After setsid() the guest's own pgid is its
++ *     pid, so the group kill the reaper uses still reaches it.
++ * TIOCSCTTY is asked for explicitly on both platforms so the controlling
++ * terminal does not depend on whether the open happened to be first.
++ */
++static void pty_child_setup(struct pty_box *pb, int set_stderr)
++{
++	int fd;
++
++	close(pb->master);
++	setsid();
++	fd = open(pb->slave, O_RDWR | O_NOCTTY);
++	if (fd < 0) {
++		bb_perror_msg("can't open %s", pb->slave);
++		_exit(126);
++	}
++	if (ioctl(fd, TIOCSCTTY, 0) != 0) {
++		bb_perror_msg("can't make %s the controlling terminal", pb->slave);
++		_exit(126);
++	}
++	pty_apply_termios(fd);
++	{
++		struct winsize ws;
++
++		memset(&ws, 0, sizeof(ws));
++		ws.ws_col = (unsigned short)pb->cols;
++		ws.ws_row = (unsigned short)pb->rows;
++		ioctl(fd, TIOCSWINSZ, &ws);
++	}
++	dup2(fd, 0);
++	dup2(fd, 1);
++	if (set_stderr)
++		dup2(fd, 2);
++	if (fd > 2)
++		close(fd);
++}
++
++/*
++ * Drain the guest's streams until they are all closed, holding the deadline,
++ * the cancel signal and the capture quota while doing it.
++ *
++ *   fds[i]    stream to read (a pipe, or the pty master)
++ *   arts[i]   artifact to append it to
++ *   feed_to   master to write fed stdin into, or -1
++ *   feed_from stdin to copy into feed_to, or -1
++ *
++ * The fds array is rewritten as streams reach EOF, so the caller can close
++ * anything the loop left open.
++ */
++static void pump(int fds[3], int arts[3], int nr, int feed_to, int feed_from,
++		int feed_always, long deadline_ms, int kill_after_ms,
 +		long capture_limit, pid_t pid, struct meta *m)
 +{
-+	struct pollfd pfd[2];
++	struct pollfd pfd[4];
 +	unsigned long long captured = 0, term_at = 0;
-+	long quota_used[2] = { 0, 0 };
-+	int open_count = 2, phase = 0, i;
++	long quota_used[3] = { 0, 0, 0 };
++	int open_count = 0, phase = 0, i;
 +	char buf[16384];
++	char feed[4096];
++	size_t feed_len = 0, feed_off = 0;
++	int feed_done = (feed_to < 0 || feed_from < 0);
++	int feed_on_line = 1;   /* every byte fed so far ended on a newline */
 +
-+	pfd[0].fd = fds[0];
-+	pfd[0].events = POLLIN;
-+	pfd[1].fd = fds[1];
-+	pfd[1].events = POLLIN;
++	for (i = 0; i < nr; i++) {
++		if (fds[i] >= 0)
++			open_count++;
++	}
 +
 +	while (open_count > 0) {
 +		unsigned long long now = now_ms();
@@ -419,15 +608,77 @@ index 0000000..8a203a4
 +			phase = 2;
 +		}
 +
-+		rc = poll(pfd, 2, 100);
++		for (i = 0; i < nr; i++) {
++			pfd[i].fd = fds[i];
++			pfd[i].events = POLLIN;
++			pfd[i].revents = 0;
++			/* the master is non-blocking: finish a partial feed only
++			 * when the terminal has room for it */
++			if (fds[i] == feed_to && feed_len > feed_off)
++				pfd[i].events |= POLLOUT;
++		}
++		/* The feed source is polled only when nothing is still pending: a
++		 * queue that took half of the last chunk must be given the other
++		 * half before the next read, or the bytes are lost. */
++		pfd[nr].fd = (feed_done || feed_off < feed_len) ? -1 : feed_from;
++		pfd[nr].events = POLLIN;
++		pfd[nr].revents = 0;
++
++		rc = poll(pfd, nr + 1, 100);
 +		if (rc < 0) {
 +			if (errno == EINTR)
 +				continue;
 +			break;
 +		}
++		/* rc == 0 is only "no stream is ready": the feed still gets its turn. */
++
++		/* stdin first: a guest that prompts has the answer waiting.
++		 * Any readiness event counts, not just POLLIN: Darwin reports
++		 * POLLNVAL for /dev/null, which is very much a readable "no
++		 * input", and a FIFO with no writer reports POLLHUP. */
++		if (pfd[nr].fd >= 0 && (feed_always || pfd[nr].revents != 0)) {
++			ssize_t r = safe_read(feed_from, feed, sizeof(feed));
++
++			if (r > 0) {
++				feed_len = (size_t)r;
++				feed_off = 0;
++				feed_on_line = (feed[feed_len - 1] == '\n');
++			} else if (r == 0 || (errno != EINTR && errno != EAGAIN)) {
++				/* End of input. Under --pty-raw there is no line
++				 * discipline to carry a VEOF, so the feed just stops. */
++				feed_done = 1;
++				feed_len = feed_off = 0;
++				if (!pty_raw) {
++					/* One VEOF is EOF when the queue stopped on a line
++					 * boundary; with a trailing partial line the first
++					 * one only flushes that line, so a second is needed -
++					 * the two-Ctrl-D rule of a real terminal. */
++					feed[0] = '\004';
++					feed_len = 1;
++					if (!feed_on_line) {
++						feed[1] = '\004';
++						feed_len = 2;
++					}
++				}
++			}
++		}
++		if (feed_len > feed_off) {
++			ssize_t w = write(feed_to, feed + feed_off, feed_len - feed_off);
++
++			if (w > 0)
++				feed_off += (size_t)w;
++			else if (w < 0 && (errno == EAGAIN || errno == EINTR))
++				;   /* retried when the master reports POLLOUT */
++			else {
++				/* the guest's side is gone (EIO on Darwin) */
++				feed_done = 1;
++				feed_len = feed_off = 0;
++			}
++		}
++
 +		if (rc == 0)
 +			continue;
-+		for (i = 0; i < 2; i++) {
++		for (i = 0; i < nr; i++) {
 +			ssize_t r, w = 0;
 +
 +			if (pfd[i].fd < 0)
@@ -435,16 +686,14 @@ index 0000000..8a203a4
 +			if (!(pfd[i].revents & (POLLIN | POLLHUP | POLLERR)))
 +				continue;
 +			r = read(pfd[i].fd, buf, sizeof(buf));
-+			if (r < 0) {
-+				if (errno == EINTR)
-+					continue;
-+				close(pfd[i].fd);
-+				pfd[i].fd = -1;
-+				open_count--;
++			if (r < 0 && (errno == EINTR || errno == EAGAIN))
 +				continue;
-+			}
-+			if (r == 0) {
++			if (r <= 0) {
++				/* r == 0 is EOF; r < 0 is EIO on Linux, which is
++				 * what a pty master reports once the guest's side
++				 * of the terminal is closed. Same meaning. */
 +				close(pfd[i].fd);
++				fds[i] = -1;
 +				pfd[i].fd = -1;
 +				open_count--;
 +				continue;
@@ -847,7 +1096,11 @@ index 0000000..8a203a4
 +	const char *root, *dir;
 +	unsigned id;
 +	struct meta m;
-+	int outp[2], errp[2], art_out, art_err;
++	int outp[2] = { -1, -1 }, errp[2] = { -1, -1 }, art_out, art_err;
++	struct pty_box pb;
++	int feed_from = -1;
++	int ready[2] = { -1, -1 };
++	int pty_child_lost = 0;
 +	pid_t pid;
 +	int status = 0;
 +	unsigned long long started;
@@ -870,6 +1123,7 @@ index 0000000..8a203a4
 +		"brief-json\0"    No_argument       "j"
 +	"timestamps\0"    No_argument       "t"
 +		"brief\0"         Required_argument "b"
++		"pty\0"           No_argument       "Y"
 +		;
 +
 +	xfunc_error_retval = 2;
@@ -889,6 +1143,35 @@ index 0000000..8a203a4
 +				error_ids = 1;
 +				continue;
 +			}
++			/* The pty long options are peeled here because getopt32long
++			 * has one letter per option and these three are modifiers of
++			 * -Y, not options of their own. */
++			if (strcmp(argv[i], "--pty-raw") == 0) {
++				pty_mode = 1;
++				pty_raw = 1;
++				continue;
++			}
++			if (strcmp(argv[i], "--pty-split") == 0) {
++				pty_mode = 1;
++				pty_split = 1;
++				continue;
++			}
++			if (strcmp(argv[i], "--pty-size") == 0) {
++				char *sp;
++
++				pty_mode = 1;
++				if (!argv[i + 1])
++					bb_error_msg_and_die("--pty-size needs COLSxROWS");
++				sp = strpbrk(argv[i + 1], "xX");
++				if (!sp)
++					bb_error_msg_and_die("--pty-size needs COLSxROWS");
++				pty_req_cols = atoi(argv[i + 1]);
++				pty_req_rows = atoi(sp + 1);
++				if (!(pty_req_cols > 0 && pty_req_rows > 0))
++					bb_error_msg_and_die("--pty-size needs COLSxROWS");
++				i++;
++				continue;
++			}
 +			if ((strcmp(argv[i], "--env") == 0 || strcmp(argv[i], "-e") == 0)
 +			 && argv[i + 1]
 +			) {
@@ -902,12 +1185,14 @@ index 0000000..8a203a4
 +		}
 +		argv[j] = NULL;
 +	}
-+	opts = getopt32long(argv, "T:k:B:C:D:d:sF:i:Pr:b:qjt", run_longopts,
++	opts = getopt32long(argv, "T:k:B:C:D:d:sF:i:Pr:b:qjtY", run_longopts,
 +			&opt_timeout, &opt_kill, &opt_bytes, &opt_capture,
 +			&opt_dir, &opt_cwd, &opt_fmt, &opt_stdin, &opt_prune, &opt_brief);
 +	use_shell = (opts & (1 << 6)) != 0;   /* s */
 +	quiet = (opts & (1 << 12)) != 0;      /* q: 13th letter of the optstring */
 +	brief_json = (opts & (1 << 13)) != 0; /* j: 14th */
++	if ((opts & (1 << 15)) != 0)          /* Y: 16th letter */
++		pty_mode = 1;
 +	if (opt_brief) {
 +		if (strcmp(opt_brief, "both") == 0)
 +			brief_out = brief_err = 1;
@@ -1000,10 +1285,24 @@ index 0000000..8a203a4
 +	if (mkdir(root, 0700) != 0 && errno != EEXIST)
 +		bb_perror_msg_and_die("mkdir %s", root);
 +	chmod(root, 0700);              /* captured output may hold secrets */
++	/* Claim the id with mkdir, which is atomic. Tolerating EEXIST here would
++	 * let two concurrent runs share one directory and truncate each other's
++	 * artifacts; instead, re-scan and take the next free id. */
 +	id = next_run_id(root);
 +	dir = xasprintf("%s/R%u", root, id);
-+	if (mkdir(dir, 0700) != 0 && errno != EEXIST)
-+		bb_perror_msg_and_die("mkdir %s", dir);
++	{
++		int tries = 0;
++
++		while (mkdir(dir, 0700) != 0) {
++			if (errno != EEXIST)
++				bb_perror_msg_and_die("mkdir %s", dir);
++			if (++tries > 1000)
++				bb_error_msg_and_die("cannot claim a run id under %s", root);
++			free(dir);
++			id = next_run_id(root);
++			dir = xasprintf("%s/R%u", root, id);
++		}
++	}
 +
 +	art_out = open(art_path(dir, "stdout"), O_WRONLY | O_CREAT | O_TRUNC, 0600);
 +	art_err = open(art_path(dir, "stderr"), O_WRONLY | O_CREAT | O_TRUNC, 0600);
@@ -1025,10 +1324,36 @@ index 0000000..8a203a4
 +	m.cmd = cmdline ? cmdline : xstrdup("");
 +	write_meta(dir, &m);
 +
-+	if (pipe(outp) != 0 || pipe(errp) != 0)
++	/* Two pipes normally; under a pty the guest's stdout and stderr come back
++	 * through the master as one stream, so only stderr-as-its-own-pipe
++	 * (--pty-split) needs a pipe at all. */
++	if (pty_mode) {
++		memset(&pb, 0, sizeof(pb));
++		pb.master = -1;
++		if (pty_alloc(&pb) != 0)
++			bb_perror_msg_and_die("cannot allocate a pty");
++		pty_pick_size(&pb);
++		m.pty = 1;
++		m.pty_slave = pb.slave;
++		m.pty_rows = pb.rows;
++		m.pty_cols = pb.cols;
++		m.stderr_merged = !pty_split;
++		if (pty_split && pipe(errp) != 0)
++			bb_perror_msg_and_die("pipe");
++		/* One byte from the child once the terminal is set up. Without it the
++		 * parent can feed stdin into a pty whose line discipline is still the
++		 * kernel default (echo on), and the fed bytes come back as echo. */
++		if (pipe(ready) != 0)
++			bb_perror_msg_and_die("pipe");
++	} else if (pipe(outp) != 0 || pipe(errp) != 0) {
 +		bb_perror_msg_and_die("pipe");
++	}
 +
-+	bb_signals((1 << (SIGINT - 1)) | (1 << (SIGTERM - 1)), on_sig);
++	/* bb_signals() takes 1 << signo (see BB_FATAL_SIGS in libbb.h), not
++	 * 1 << (signo - 1): the off-by-one installed this handler on SIGHUP and
++	 * SIGALRM, so a SIGTERM to the wrapper killed it outright and the run
++	 * never reached its documented exit 3. */
++	bb_signals((1 << SIGINT) | (1 << SIGTERM), on_sig);
 +
 +	if (tl.on) {
 +		/* hold everything the capture holds, but never more than 8 MiB */
@@ -1043,12 +1368,32 @@ index 0000000..8a203a4
 +		char **shv;
 +		int i;
 +
-+		setpgid(0, 0);          /* own group: one killpg reaches descendants */
-+		close(outp[0]);
-+		close(errp[0]);
-+		xmove_fd(outp[1], 1);
-+		xmove_fd(errp[1], 2);
-+		if (opt_stdin) {
++		if (pty_mode) {
++			/* stderr first: pty_child_setup owns 0 and 1 (and 2 unless
++			 * split), and errp[1] must survive the dup2s. */
++			if (pty_split) {
++				close(errp[0]);
++				xmove_fd(errp[1], 2);
++			}
++			pty_child_setup(&pb, !pty_split);
++			if (ready[1] >= 0) {
++				/* "the terminal is ready", then get out of the way */
++				full_write(ready[1], "1", 1);
++				close(ready[1]);
++				ready[1] = -1;
++			}
++			close(ready[0]);
++			ready[0] = -1;
++		} else {
++			setpgid(0, 0);  /* own group: one killpg reaches descendants */
++			close(outp[0]);
++			close(errp[0]);
++			xmove_fd(outp[1], 1);
++			xmove_fd(errp[1], 2);
++		}
++		/* Under a pty the parent feeds --stdin through the master, because
++		 * fd 0 is the terminal and must stay one. */
++		if (opt_stdin && !pty_mode) {
 +			int fd = open(opt_stdin, O_RDONLY);
 +			if (fd < 0) {
 +				bb_perror_msg("open %s", opt_stdin);
@@ -1081,7 +1426,11 @@ index 0000000..8a203a4
 +		bb_perror_msg("can't execute '%s'", argv[0]);
 +		_exit(127);
 +	}
-+	setpgid(pid, pid);              /* both sides: no window where pgid is unset */
++	if (!pty_mode)
++		setpgid(pid, pid);      /* both sides: no window where pgid is unset */
++	/* Under a pty the guest is a session leader (setsid in the child), so its
++	 * pgid is its pid already; setpgid(pid, pid) here would fail with EPERM
++	 * and, worse, could run before setsid and make it fail instead. */
 +	child_pgid = (long)pid;
 +	{
 +		/* Survives this process, so even SIGKILL of busybox releases the guest. */
@@ -1092,17 +1441,90 @@ index 0000000..8a203a4
 +		reaper_pid = r;
 +		atexit(stop_reaper);
 +	}
-+	close(outp[1]);
-+	close(errp[1]);
-+	{
-+		int fds[2], arts[2];
++	if (pty_mode) {
++		/* Wait for the child's terminal before feeding or reading anything. A
++		 * 0-length read means the child died before it got there, in which
++		 * case the master will never report EOF on its own. */
++		char c;
 +
-+		fds[0] = outp[0];
-+		fds[1] = errp[0];
-+		arts[0] = art_out;
-+		arts[1] = art_err;
-+		pump(fds, arts, deadline_ms, kill_after, capture_limit, pid, &m);
++		if (ready[1] >= 0) {
++			close(ready[1]);
++			ready[1] = -1;
++		}
++		if (ready[0] >= 0) {
++			if (safe_read(ready[0], &c, 1) <= 0)
++				pty_child_lost = 1;
++			close(ready[0]);
++			ready[0] = -1;
++		}
++		/* the master is non-blocking: a full terminal must not wedge us */
++		fcntl(pb.master, F_SETFL, fcntl(pb.master, F_GETFL) | O_NONBLOCK);
++		if (opt_stdin) {
++			/* Feed the file through the terminal so the guest keeps a tty
++			 * on fd 0; a guest that reads a line sees it, and the VEOF
++			 * the pump sends at the end is its EOF. */
++			/* O_NONBLOCK so a fifo with no writer opens instead of
++			 * blocking forever; the pump reads only when poll is ready. */
++			feed_from = open(opt_stdin, O_RDONLY | O_NONBLOCK);
++			if (feed_from < 0) {
++				bb_perror_msg("open %s", opt_stdin);
++				kill(pid, SIGKILL);
++				waitpid(pid, NULL, 0);
++				return 126;
++			}
++		} else if (!isatty(0)) {
++			/* A pipe or a file as our stdin is what the guest should read.
++			 * A real terminal is NOT forwarded: an agent harness has no
++			 * keystrokes to deliver, and pumping the caller's tty would
++			 * put it in the middle of the capture. */
++			feed_from = 0;
++		}
++	} else {
++		close(outp[1]);
++		close(errp[1]);
 +	}
++	/* The write ends must go, or the read end never sees EOF and the pump
++	 * waits forever (this is the trap a pty run shares with a pipe run). */
++	if (errp[1] >= 0) {
++		close(errp[1]);
++		errp[1] = -1;
++	}
++	{
++		int fds[3] = { -1, -1, -1 }, arts[3] = { -1, -1, -1 }, nr;
++
++		if (pty_mode && pty_child_lost) {
++			/* Nothing to read: the guest never reached its terminal. */
++		} else if (pty_mode) {
++			fds[0] = pb.master;
++			arts[0] = art_out;
++			nr = 1;
++			if (pty_split) {
++				fds[1] = errp[0];
++				arts[1] = art_err;
++				nr = 2;
++			}
++			/* --stdin FILE is always opened O_NONBLOCK (even if it lands
++			 * on fd 0), so it is the non-blocking feed; an inherited stdin
++			 * keeps blocking semantics and stays poll-gated. */
++			pump(fds, arts, nr, pb.master, feed_from,
++					opt_stdin ? 1 : 0,
++					deadline_ms, kill_after, capture_limit, pid, &m);
++		} else {
++			fds[0] = outp[0];
++			arts[0] = art_out;
++			fds[1] = errp[0];
++			arts[1] = art_err;
++			pump(fds, arts, 2, -1, -1, 0,
++					deadline_ms, kill_after, capture_limit, pid, &m);
++		}
++		/* Whatever the loop left open. The master especially: a leaked fd
++		 * here would keep the terminal alive past the guest. */
++		for (nr = 0; nr < 3; nr++)
++			if (fds[nr] >= 0)
++				close(fds[nr]);
++	}
++	if (feed_from > 0)
++		close(feed_from);
 +	{
 +		int killed = 0;
 +		unsigned long long reap_start = now_ms();
@@ -1160,6 +1582,16 @@ index 0000000..8a203a4
 +			fputs(",\"dir\":", stdout);
 +			json_write_str(dir);
 +			printf(",\"pgid\":%ld", child_pgid);
++			printf(",\"pty\":%s", pty_mode ? "true" : "false");
++			if (pty_mode) {
++				fputs(",\"pty_slave\":", stdout);
++				json_write_str(pb.slave);
++				printf(",\"pty_cols\":%d,\"pty_rows\":%d,"
++						"\"pty_raw\":%s,\"stderr_merged\":%s",
++						pb.cols, pb.rows,
++						pty_raw ? "true" : "false",
++						pty_split ? "false" : "true");
++			}
 +			printf(",\"exit_code\":%d,\"timed_out\":%s,\"cancelled\":%s,"
 +					"\"capture_complete\":%s,\"duration_ms\":%ld,"
 +					"\"stdout_bytes\":%llu,\"stderr_bytes\":%llu,"
@@ -1252,6 +1684,11 @@ index 0000000..8a203a4
 +			printf("stdout_artifact=%s\nstderr_artifact=%s\n", p1, p2);
 +			if (opt_pgid)
 +				printf("pgid=%ld\n", child_pgid);
++			if (pty_mode)
++				printf("pty=%s cols=%d rows=%d raw=%s stderr_merged=%s\n",
++						pb.slave, pb.cols, pb.rows,
++						pty_raw ? "true" : "false",
++						pty_split ? "false" : "true");
 +			fputs("--- stdout ---\n", stdout);
 +			if (brief_out) {
 +				char *bv = brief_reduce(p1, (size_t)budget, brief_json);

@@ -48,9 +48,12 @@ sec "1. a diagnostic goes to stderr for every applet that rejects an argument"
 # Also skipped: applets that ignore an unknown argument and produce data or
 # write forever (`yes` produced 650 MB before its timeout), so they cannot be
 # swept this way.
+# linuxrc is in the list because it is a Linux-only applet that swallows
+# SIGTERM: in a container the sweep's own `timeout 2` cannot stop it, and the
+# whole suite hangs at applet 157.
 skip=" resize yes nologin [ [[ ash hush sh vi ed sed awk less more telnet nc su
  login httpd crond inetd telnetd ftpd udhcpd udhcpc syslogd klogd watchdog getty
- chat adduser deluser passwd chpasswd "
+ chat adduser deluser passwd chpasswd linuxrc "
 
 swept=0
 bad=0

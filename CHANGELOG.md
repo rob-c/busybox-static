@@ -4,6 +4,39 @@ Project releases of `busybox-static` on top of upstream busybox
 (`1.39.0.git`). The upstream applet set is unchanged except where noted; the
 `patches/` series is the record of every local change.
 
+## Unreleased — a real terminal for the guest (`run --pty`)
+
+- `run -Y`/`--pty` launches the guest under a fresh pty: the slave is the child's
+  0/1/2, `setsid()` makes the child a session leader and `TIOCSCTTY` makes the
+  slave its controlling terminal, so `isatty()`, `tty`, `/dev/tty`, `stty` and
+  every full-screen tool behave as they would in a terminal. The master is
+  drained like any other stream, so the merged output still lands in the
+  `stdout` artifact and the view budgets are unchanged. `--pty-raw` (line
+  discipline off), `--pty-split` (stderr keeps its own pipe) and
+  `--pty-size COLSxROWS` modify it; `sh --pty` dispatches the whole shell
+  through `run --pty`.
+- The environment is *not* touched by pty mode: the guest sees exactly the
+  variables a pipe run would see (checked byte for byte by the suite), plus the
+  parent's terminal size, which the pty inherits when the parent has one.
+- stdin is fed through the master (`--stdin FILE`, or a piped parent stdin) and
+  terminated with `VEOF` - twice when the input ends mid-line - so line readers
+  get a real EOF rather than a hang. Feeding is byte-exact up to the platform's
+  canonical line limit; `--pty-raw` is byte-exact beyond it.
+- Fixed: `run`'s cancellation was dead code. `bb_signals()` takes `1 << signo`,
+  and `run` passed `1 << (signo - 1)`, so the handler was installed on SIGHUP
+  and SIGALRM: a SIGTERM to the wrapper killed it outright (128+15) instead of
+  recording the cancellation and returning the documented exit 3.
+- Fixed: two concurrent runs in the same artifact root could pick the same run
+  id and truncate each other's artifacts. The id is now claimed with `mkdir`
+  and re-scanned on `EEXIST`.
+- New `tests/pty.sh` — 100 checks on the guest's terminal: identity, capture
+  fidelity (binary, NUL, 228 KB), the option matrix, stdin feeding and EOF,
+  exit codes and deadlines, environment inheritance, JSON/meta surface,
+  concurrency, and fd/artifact hygiene. 100/100 on darwin-arm64, darwin-amd64
+  (Rosetta), linux-arm64 and linux-amd64.
+- `tests/streams.sh` skips `linuxrc`: in a container it swallows `SIGTERM`, so
+  the applet sweep could never get past it.
+
 ## Unreleased — child cleanup when the wrapper is killed
 
 - `run` and `sh` now start a watchdog in its own process group that kills the

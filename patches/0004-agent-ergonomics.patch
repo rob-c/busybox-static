@@ -3917,7 +3917,7 @@ index 6cdd641..5c0252f 100644
  {
  #if FIXED_HEADER
 diff --git a/shell/ash.c b/shell/ash.c
-index 9afeaed..f97a57f 100644
+index 9afeaed..65bc5ae 100644
 --- a/shell/ash.c
 +++ b/shell/ash.c
 @@ -906,8 +906,8 @@ out2str(const char *p)
@@ -4372,7 +4372,7 @@ index 9afeaed..f97a57f 100644
  			case '%':
  			case '#':
  				subtype = (c == '#' ? VSTRIMLEFT : VSTRIMRIGHT);
-@@ -15173,6 +15507,305 @@ extern int etext();
+@@ -15173,6 +15507,343 @@ extern int etext();
   * exception occurs.  When an exception occurs the variable "state"
   * is used to figure out how far we had gotten.
   */
@@ -4385,6 +4385,10 @@ index 9afeaed..f97a57f 100644
 +static char *ash_max_bytes_opt;     /* --max-bytes N        */
 +static char *ash_capture_limit_opt; /* --capture-limit N    */
 +static int ash_timestamps;          /* --timestamps         */
++static int ash_pty;                 /* --pty / --pty-raw    */
++static int ash_pty_raw;             /* --pty-raw            */
++static int ash_pty_split;           /* --pty-split          */
++static char *ash_pty_size_opt;      /* --pty-size COLSxROWS */
 +
 +#if ENABLE_BRIEF
 +int brief_main_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
@@ -4407,7 +4411,7 @@ index 9afeaed..f97a57f 100644
 +
 +	if (!argv[1]) {
 +		xfunc_error_retval = 2;
-+		bb_error_msg_and_die("--timeout/--format need -c CMD or a script");
++		bb_error_msg_and_die("--timeout/--format/--pty need -c CMD or a script");
 +	}
 +	applet = find_applet_by_name("run");
 +	if (applet < 0) {
@@ -4440,6 +4444,21 @@ index 9afeaed..f97a57f 100644
 +		av[k++] = (char *)"--quiet";
 +	if (ash_timestamps)
 +		av[k++] = (char *)"--timestamps";
++	/* --pty gives the shell - and so every guest it starts - a controlling
++	 * terminal. It is dispatched through `run` for the same reason --timeout
++	 * is: allocating a pty, attaching it as the controlling terminal and
++	 * draining its master is one implementation, and it lives in run. */
++	if (ash_pty) {
++		av[k++] = (char *)"--pty";
++		if (ash_pty_raw)
++			av[k++] = (char *)"--pty-raw";
++		if (ash_pty_split)
++			av[k++] = (char *)"--pty-split";
++		if (ash_pty_size_opt) {
++			av[k++] = (char *)"--pty-size";
++			av[k++] = ash_pty_size_opt;
++		}
++	}
 +	if (ash_brief_which) {
 +		av[k++] = (char *)"--brief";
 +		av[k++] = ash_brief_which;
@@ -4483,6 +4502,25 @@ index 9afeaed..f97a57f 100644
 +		}
 +		if (strcmp(argv[i], "--timestamps") == 0) {
 +			ash_timestamps = 1;
++			continue;
++		}
++		if (strcmp(argv[i], "--pty") == 0) {
++			ash_pty = 1;
++			continue;
++		}
++		if (strcmp(argv[i], "--pty-raw") == 0) {
++			ash_pty = 1;
++			ash_pty_raw = 1;
++			continue;
++		}
++		if (strcmp(argv[i], "--pty-split") == 0) {
++			ash_pty = 1;
++			ash_pty_split = 1;
++			continue;
++		}
++		if (strcmp(argv[i], "--pty-size") == 0 && argv[i + 1]) {
++			ash_pty = 1;
++			ash_pty_size_opt = argv[++i];
 +			continue;
 +		}
 +		if (strcmp(argv[i], "--format") == 0 && argv[i + 1]) {
@@ -4678,13 +4716,13 @@ index 9afeaed..f97a57f 100644
  int ash_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
  #if NUM_SCRIPTS > 0
  int ash_main(int argc, char **argv)
-@@ -15187,6 +15820,13 @@ int ash_main(int argc UNUSED_PARAM, char **argv)
+@@ -15187,6 +15858,13 @@ int ash_main(int argc UNUSED_PARAM, char **argv)
  
  	dbg_show_dirtymem("dirtymem at main start");
  
 +	ash_strip_agent_opts(argv);
 +	if (ash_timeout_opt || ash_format_opt || ash_timestamps
-+	 || ash_max_bytes_opt || ash_capture_limit_opt
++	 || ash_max_bytes_opt || ash_capture_limit_opt || ash_pty
 +	) {
 +		ash_dispatch_run(argv);       /* does not return */
 +	}
@@ -4692,7 +4730,7 @@ index 9afeaed..f97a57f 100644
  	/* Initialize global data */
  	INIT_G_misc();
  	INIT_G_memstack();
-@@ -15241,6 +15881,7 @@ int ash_main(int argc UNUSED_PARAM, char **argv)
+@@ -15241,6 +15919,7 @@ int ash_main(int argc UNUSED_PARAM, char **argv)
  		minusc = get_script_content(-argc - 1);
  #endif
  	login_sh = procargs(argv);

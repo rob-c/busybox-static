@@ -352,6 +352,32 @@ one patch per tier so each can be dropped independently:
 | `0007-agent-ops-edit.patch` | **`replace`** — literal, all-or-nothing, `--expect`, `--sha256`, `--dry-run`, symlink policy, atomic temp+rename |
 | `0008-agent-ops-run.patch` | **`run`** (captured execution, process-group kill, artifacts) + **`log`** (bounded retrieval) + **`doctor`** |
 
+### A terminal for the guest (`run --pty`)
+
+`run` normally gives the child two pipes. `-Y`/`--pty` gives it a real terminal
+instead: a fresh pty whose slave is the child's 0, 1 and 2, with the child as
+session leader and the slave as its controlling terminal. Everything the guest
+writes to its terminal - including `/dev/tty` - comes back through the master in
+order and lands in the `stdout` artifact; `stderr` is merged by default, because
+that is what a terminal is. `--pty-split` keeps stderr on its own pipe when the
+two streams must stay apart.
+
+What is deliberately *not* inherited from the parent terminal: echo and CR
+translation are turned off, so a pty run and a pipe run of `echo hi` capture the
+same three bytes and only the guest's `isatty()` sees a difference. What *is*
+inherited: the environment (untouched - no `TERM`, `PATH` or anything else is
+injected), the window size (the parent's, else 80x24, overridable with
+`--pty-size COLSxROWS`), and the process group discipline the reaper relies on.
+
+stdin is fed through the master: `--stdin FILE`, or the parent's stdin when it is
+a pipe or a file. At end of input the wrapper sends `VEOF`, so a guest that reads
+lines sees a real EOF instead of hanging - and two `VEOF`s when the input ends
+mid-line, which is the same two-Ctrl-D rule a terminal user follows. A pty is
+still a canonical terminal: one input line cannot exceed the platform's
+`MAX_CANON` (1024 bytes on macOS, 4096 on Linux), and `--pty-raw` is the
+byte-transparent mode for anything larger. `sh --pty` runs the whole shell under
+the same terminal, by dispatching to `run --pty`.
+
 All six are cross-platform: they use only POSIX and existing `libbb` helpers, and
 `./test.sh` covers them on every target. Exit codes are 0/1/2/3 (never 124 or
 128+N), JSON output is `{"schema":1,...}`, and every output has a byte budget
@@ -470,9 +496,22 @@ Runnable against any built binary:
 ./tests/timeout-resilience-matrix.sh dist/darwin-arm64/bin/busybox # 200 more
 ./tests/wrapper-signals.sh dist/darwin-arm64/bin/busybox # 21 kill-the-wrapper checks
 ./tests/reaper.sh        dist/darwin-arm64/bin/busybox # 50 watchdog checks
+./tests/pty.sh           dist/darwin-arm64/bin/busybox # 100 pty/tty checks
+./tests/streams.sh       dist/darwin-arm64/bin/busybox # 37 stream-discipline checks
+./tests/brief.sh         dist/darwin-arm64/bin/busybox # 910 brief checks
 ./stress.sh                dist/darwin-arm64/bin/busybox   # per-applet stability
 ./adversarial.sh           dist/darwin-arm64/bin/busybox   # ~1270 hostile-input checks
 ```
+
+`tests/pty.sh` is the one suite that must agree across platforms byte for byte:
+100 checks that a guest under `run --pty` (or `sh --pty`) really has a terminal
+(`isatty(0/1/2)`, `/dev/tty`, `stty size`, session leader, pgid == pid), that the
+captured bytes are the guest's own (no echo, no CRLF, binary and NUL round trips,
+228 KB through the stdin feed), that the option matrix behaves (`--pty-raw`,
+`--pty-split`, `--pty-size`, `--timestamps`, `--error-ids`, `--brief`), that exit
+codes and deadlines survive, and that the environment, `/dev/fd` list and
+artifact modes are unchanged from a pipe run. Measured: **100/100 on
+darwin-arm64, darwin-amd64 (Rosetta), linux-arm64 and linux-amd64.**
 
 `tests/timeout-resilience-matrix.sh` multiplies the same idea: 10 hostile guests
 (trap-and-loop, trap-and-exit-0, trap-and-exit-3, ignore TERM/INT/HUP/QUIT,
