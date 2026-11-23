@@ -558,11 +558,17 @@ Pinned by `tests/timeline-query.sh` section Q5.
 `stamp-ns`, `idle-timeout`, `log-query` beside the original eight, so a client can
 feature-detect instead of assuming one build's shape. Pinned by section Q7.
 
-### 9.10 Smaller, already-defined gaps
+### 9.10 Smaller gaps — [done]
 
-- `run --help` omits `-n/--stamp-ns` (accepted, undocumented).
+- `run --help` now documents `-n/--stamp-ns`, and `log --help` documents every query flag
+  it accepts (`--since`, `--until`, `--around-gap`, `--limit`, `--sample`, `--summary`,
+  `--marks`, `--diff-timeline`). The usage text is generated from the `//usage:` blocks, so
+  **a usage edit needs `src/scripts/gen_build_files.sh . .` before the next build** or the
+  binary keeps serving the previous help.
 - `waitfor --timeout 0` means "one attempt"; `run --timeout 0` means "already expired" —
-  consistent only if written down, which this section does.
+  written down here because they deliberately differ.
+- `--caps .features` now lists `mark`, `outline` and `patchapply` too, so all nineteen
+  capabilities are discoverable.
 
 ## 10. How this side verifies the contract now
 

@@ -1,9 +1,9 @@
 diff --git a/coreutils/run.c b/coreutils/run.c
 new file mode 100644
-index 0000000..fed62d9
+index 0000000..31092ce
 --- /dev/null
 +++ b/coreutils/run.c
-@@ -0,0 +1,2849 @@
+@@ -0,0 +1,2914 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * run - captured execution with retrievable evidence.
@@ -78,6 +78,14 @@ index 0000000..fed62d9
 +//usage:     "\n	-s, --stream WHICH	stdout (default), stderr, timeline or both"
 +//usage:     "\n	-M, --meta		Print the run metadata only"
 +//usage:     "\n	--diff R1:R2	Compare the stdout of two runs"
++//usage:     "\n	--diff-timeline R1:R2	Compare two runs by shape (lines, gaps, duration)"
++//usage:     "\n	-S, --since SECS	Timeline from this offset"
++//usage:     "\n	-U, --until SECS	Timeline up to this offset"
++//usage:     "\n	-G, --around-gap SECS	The widest silences (see --limit)"
++//usage:     "\n	-N, --limit N		How many gaps --around-gap reports (default 3)"
++//usage:     "\n	-P, --sample N		First N and last N lines of a stream"
++//usage:     "\n	-Z, --summary		One-line digest: lines, gaps, stderr, exit"
++//usage:     "\n	-K, --marks		Named events recorded by 'mark' (see mark --help)"
 +//usage:     "\n	-B, --max-bytes N	Output budget (default 12000)"
 +//usage:     "\n	-D, --dir PATH		Artifact root"
 +//usage:     "\n	-F, --format FMT	text (default) or json"
@@ -1623,6 +1631,13 @@ index 0000000..fed62d9
 +			bb_perror_msg("cd %s", opt_cwd);
 +			_exit(126);
 +		}
++		{
++			/* A guest may name its own phases: `mark phase:build`. */
++			char *idbuf = xasprintf("BUSYBOX_RUN_ID=R%u", id);
++
++			putenv(idbuf);
++			setenv("BUSYBOX_RUN_DIR", dir, 1);
++		}
 +		for (i = 0; i < n_child_env; i++) {
 +			char *eq = strchr(child_env[i], '=');
 +
@@ -2720,6 +2735,7 @@ index 0000000..fed62d9
 +		"limit\0"     Required_argument "N"
 +		"sample\0"    Required_argument "P"
 +		"summary\0"   No_argument       "Z"
++		"marks\0"     No_argument       "K"
 +		"diff-timeline\0" Required_argument "Q"
 +		;
 +
@@ -2749,7 +2765,7 @@ index 0000000..fed62d9
 +			}
 +		}
 +	}
-+	opts = getopt32long(argv, "l:m:c:s:MB:D:F:S:U:G:N:P:ZQ:", log_longopts,
++	opts = getopt32long(argv, "l:m:c:s:MB:D:F:S:U:G:N:P:ZQ:K", log_longopts,
 +			&opt_lines, &opt_match, &opt_ctx, &opt_stream,
 +			&opt_bytes, &opt_dir, &opt_fmt,
 +			&opt_since, &opt_until, &opt_gap, &opt_limit, &opt_sample,
@@ -2792,6 +2808,55 @@ index 0000000..fed62d9
 +				json, (size_t)budget);
 +	if (summary_only)
 +		return tl_summary(dir, run, json);
++	if (opts & (1 << 15)) { /* K: 16th letter */
++		char *mp = art_path(dir, "marks");
++		char *md = NULL;
++		size_t ml = 0;
++		unsigned long long prev = 0;
++		int first_mark = 1;
++
++		if (read_all(mp, &md, &ml) != 0) {
++			if (json)
++				fputs("{\"schema\":1,\"marks\":[]}\n", stdout);
++			else
++				fputs("no marks\n", stdout);
++			return 0;
++		}
++		if (json)
++			fputs("{\"schema\":1,\"marks\":[", stdout);
++		{
++			char *line = md;
++
++			while (line && *line) {
++				char *nl = strchr(line, '\n');
++				unsigned long long us;
++				char *name;
++
++				if (nl)
++					*nl = '\0';
++				us = strtoull(line, &name, 10);
++				while (*name == ' ')
++					name++;
++				if (json) {
++					printf("%s{\"name\":\"%.*s\",\"us\":%llu,\"delta_us\":%llu}",
++							first_mark ? "" : ",", (int)strlen(name), name,
++							us, prev ? us - prev : 0);
++				} else {
++					printf("%-24s at %llu.%06llu  (%+lld.%06lld from previous)\n",
++							name, us / 1000000ULL, us % 1000000ULL,
++							(long long)((us - (prev ? prev : us)) / 1000000ULL),
++							(long long)((us - (prev ? prev : us)) % 1000000ULL));
++				}
++				first_mark = 0;
++				prev = us;
++				line = nl ? nl + 1 : NULL;
++			}
++		}
++		if (json)
++			fputs("]}\n", stdout);
++		free(md);
++		return 0;
++	}
 +	if (opt_sample)
 +		return dump_sample(dir,
 +				opt_stream && strcmp(opt_stream, "stderr") == 0 ? "stderr" : "stdout",

@@ -1141,7 +1141,7 @@ index 0000000..15c6aee
 +
 +#endif
 diff --git a/libbb/appletlib.c b/libbb/appletlib.c
-index 34b74c3..413edf5 100644
+index 34b74c3..fa74dc0 100644
 --- a/libbb/appletlib.c
 +++ b/libbb/appletlib.c
 @@ -28,9 +28,12 @@
@@ -1216,7 +1216,7 @@ index 34b74c3..413edf5 100644
  	if (!argv[1]) {
  		/* Called without arguments */
  		const char *a;
-@@ -850,6 +891,136 @@ int busybox_main(int argc UNUSED_PARAM, char **argv)
+@@ -850,6 +891,139 @@ int busybox_main(int argc UNUSED_PARAM, char **argv)
  	}
  #  endif
  
@@ -1305,6 +1305,9 @@ index 34b74c3..413edf5 100644
 +			CAP_FEATURE(ENABLE_RUN, "stamp-ns");
 +			CAP_FEATURE(ENABLE_RUN, "idle-timeout");
 +			CAP_FEATURE(ENABLE_LOG, "log-query");
++			CAP_FEATURE(ENABLE_MARK, "mark");
++			CAP_FEATURE(ENABLE_OUTLINE, "outline");
++			CAP_FEATURE(ENABLE_PATCHAPPLY, "patchapply");
 +			{
 +				struct stat st;
 +				long sz = 0;

@@ -46,5 +46,16 @@ ck "patch.prefix_applied"  "y" "$(cat g.txt)"
 ck "patch.json"        "1" "$(printf -- '--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-one\n+ONE\n' > q.patch; "$BB" patchapply -n -F json q.patch | "$BB" grep -c '"status":"ok"')"
 ck "patch.invalid"     "1" "$(printf 'not a diff\n' > b.patch; "$BB" patchapply b.patch >/dev/null 2>&1; echo $?)"
 
+sec "H. the binary documents its own flags"
+ck "help.log_since"       "1" "$("$BB" log --help 2>&1 | "$BB" grep -c -- '--since')"
+ck "help.log_summary"     "1" "$("$BB" log --help 2>&1 | "$BB" grep -c -- '--summary')"
+ck "help.log_marks"       "1" "$("$BB" log --help 2>&1 | "$BB" grep -c -- '--marks')"
+ck "help.log_sample"      "1" "$("$BB" log --help 2>&1 | "$BB" grep -c -- '--sample')"
+ck "help.log_gap"         "2" "$("$BB" log --help 2>&1 | "$BB" grep -c 'around-gap')"
+ck "help.run_stampns"     "1" "$("$BB" run --help 2>&1 | "$BB" grep -c -- '--stamp-ns')"
+ck "caps.mark"            "1" "$("$BB" --caps --format json | "$BB" grep -c '\"mark\"')"
+ck "caps.outline"         "1" "$("$BB" --caps --format json | "$BB" grep -c '\"outline\"')"
+ck "caps.patchapply"      "1" "$("$BB" --caps --format json | "$BB" grep -c '\"patchapply\"')"
+
 printf '== new-applets: %d passed, %d failed ==\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]
