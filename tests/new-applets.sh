@@ -10,6 +10,7 @@ ck() { if [ "$2" = "$3" ]; then pass=$((pass+1)); else fail=$((fail+1)); printf 
 sec() { printf '== %s ==\n' "$1"; }
 
 "$BB" --list | "$BB" grep -qx mark || { echo "skip: applets absent"; exit 0; }
+SRC="${0%/tests/*}/src"
 
 sec "M. mark and log --marks"
 ck "mark.outside_run_prints" "1" "$("$BB" mark phase:x | "$BB" grep -cE '^[0-9]+ phase:x$')"
@@ -90,6 +91,13 @@ ck "outline.no_c_keyword"  "0" "$("$BB" outline real.c | "$BB" grep -c ':functio
 ck "outline.top_struct"    "1" "$("$BB" outline real.c | "$BB" grep -c ':struct:.*:s$')"
 ck "outline.member_skipped" "0" "$("$BB" outline real.c | "$BB" grep -c 'member')"
 ck "outline.export_class"  "1" "$("$BB" outline real.c | "$BB" grep -c ':class:.*:C$')"
+
+sec "O4. outline at scale: no calls, no directives, no keyword noise"
+printf 'if (strcmp(a, b) == 0) {\n}\n\treadtoken() != NULL;\n# include <stdio.h>\n#  define X 1\n# Title\n' > noise.c
+ck "outline.call_not_definition" "0" "$("$BB" outline noise.c | "$BB" grep -cE ':function:.*(strcmp|readtoken)')"
+ck "outline.directive_not_heading" "0" "$("$BB" outline noise.c | "$BB" grep -cE ':heading:.*(include|define)')"
+ck "outline.markdown_heading_still" "1" "$("$BB" outline noise.c | "$BB" grep -c ':heading:.*:Title$')"
+ck "outline.real_ash_no_heading_noise" "0" "$("$BB" outline "$SRC/shell/ash.c" 2>/dev/null | "$BB" grep -c ':heading:')"
 
 sec "H. the binary documents its own flags"
 ck "help.log_since"       "1" "$("$BB" log --help 2>&1 | "$BB" grep -c -- '--since')"

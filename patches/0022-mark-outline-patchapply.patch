@@ -596,10 +596,10 @@ index 0000000..745847d
 +}
 diff --git a/miscutils/outline.c b/miscutils/outline.c
 new file mode 100644
-index 0000000..eb0728c
+index 0000000..4b954ca
 --- /dev/null
 +++ b/miscutils/outline.c
-@@ -0,0 +1,350 @@
+@@ -0,0 +1,397 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * outline - definitions in a file, with line, byte offset and version.
@@ -725,14 +725,33 @@ index 0000000..eb0728c
 +	}
 +
 +	/* Markdown headings */
-+	if (*p == '#') {
++	if (*p == '#' && p + 1 < end && p[1] == ' ') {
 +		const char *h = p;
 +
 +		while (p < end && *p == '#')
 +			p++;
 +		if (p < end && *p == ' ') {
++			static const char *const directives[] = {
++				"include", "define", "undef", "if", "ifdef", "ifndef", "elif",
++				"else", "endif", "pragma", "error", "warning", "line", "import",
++			};
++			const char *t;
++			unsigned d;
++
 +			while (p < end && *p == ' ')
 +				p++;
++			/* '# include <x.h>' is a directive, not a heading */
++			for (d = 0; d < ARRAY_SIZE(directives); d++) {
++				size_t dl = strlen(directives[d]);
++
++				if ((size_t)(end - p) >= dl && strncmp(p, directives[d], dl) == 0
++				 && ((size_t)(end - p) == dl || p[dl] == ' ' || p[dl] == '<'
++				  || p[dl] == '"' || p[dl] == '\t')
++				)
++					return NULL;
++			}
++			for (t = p; t < end && (*t == ' ' || *t == '\t'); t++)
++				continue;
 +			*name = p;
 +			*name_len = (size_t)(end - p);
 +			return "heading";
@@ -831,6 +850,34 @@ index 0000000..eb0728c
 +				id--;
 +			if (id == id_end)
 +				return NULL;
++			{
++				/* 'if (strcmp(…)) {' and 'readtoken() != NULL' both look like
++				 * definitions unless the token before the name is checked. */
++				const char *b = id;
++
++				while (b > p && (b[-1] == ' ' || b[-1] == '\t'))
++					b--;
++				if (b > p && strchr("(,=!&|+-/<>?%", b[-1]))
++					return NULL;
++				if (b > p && b[-2] >= 0 && 0)
++					return NULL;
++				{
++					const char *w = b;
++					size_t wl;
++
++					while (w > p && (isalnum((unsigned char)w[-1]) || w[-1] == '_'))
++						w--;
++					wl = (size_t)(b - w);
++					if ((wl == 2 && strncmp(w, "if", 2) == 0)
++					 || (wl == 5 && strncmp(w, "while", 5) == 0)
++					 || (wl == 3 && strncmp(w, "for", 3) == 0)
++					 || (wl == 6 && strncmp(w, "switch", 6) == 0)
++					 || (wl == 6 && strncmp(w, "return", 6) == 0)
++					 || (wl == 2 && strncmp(w, "do", 2) == 0)
++					)
++						return NULL;
++				}
++			}
 +			{
 +				unsigned w;
 +				size_t nl = (size_t)(id_end - id);
