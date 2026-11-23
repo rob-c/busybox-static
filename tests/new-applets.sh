@@ -99,6 +99,14 @@ ck "outline.directive_not_heading" "0" "$("$BB" outline noise.c | "$BB" grep -cE
 ck "outline.markdown_heading_still" "1" "$("$BB" outline noise.c | "$BB" grep -c ':heading:.*:Title$')"
 ck "outline.real_ash_no_heading_noise" "0" "$("$BB" outline "$SRC/shell/ash.c" 2>/dev/null | "$BB" grep -c ':heading:')"
 
+sec "O5. outline matches a real parser (ast-grep counted, expectations below)"
+printf 'static void multi(int a,\n                  int b,\n                  int c)\n{\n}\nstatic struct item *ret_struct(void)\n{\n}\nint plain(void)\n{\n}\n' > multi.c
+ck "outline.multiline_signature" "1" "$("$BB" outline multi.c | "$BB" grep -c ':function:.*multi')"
+ck "outline.multiline_line"      "1" "$("$BB" outline multi.c | "$BB" grep -c '^1:function:')"
+ck "outline.returns_struct"      "1" "$("$BB" outline multi.c | "$BB" grep -c ':function:.*ret_struct')"
+ck "outline.plain_still"         "1" "$("$BB" outline multi.c | "$BB" grep -c ':function:.*plain')"
+ck "outline.three_functions"     "3" "$("$BB" outline multi.c | "$BB" grep -c ':function:')"
+
 sec "H. the binary documents its own flags"
 ck "help.log_since"       "1" "$("$BB" log --help 2>&1 | "$BB" grep -c -- '--since')"
 ck "help.log_summary"     "1" "$("$BB" log --help 2>&1 | "$BB" grep -c -- '--summary')"

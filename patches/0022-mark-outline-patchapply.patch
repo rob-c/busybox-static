@@ -596,10 +596,10 @@ index 0000000..745847d
 +}
 diff --git a/miscutils/outline.c b/miscutils/outline.c
 new file mode 100644
-index 0000000..4b954ca
+index 0000000..63ad2ec
 --- /dev/null
 +++ b/miscutils/outline.c
-@@ -0,0 +1,397 @@
+@@ -0,0 +1,449 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * outline - definitions in a file, with line, byte offset and version.
@@ -797,11 +797,14 @@ index 0000000..4b954ca
 +		while (p < end && (isalnum((unsigned char)*p) || *p == '_'))
 +			p++;
 +		if (p > q) {
-+			*name = q;
-+			*name_len = (size_t)(p - q);
-+			return k;
++			/* 'struct item *item_new(void)' returns a struct; it is a
++			 * function, so leave it to the function test below. */
++			if (!memchr(q, '(', (size_t)(end - q))) {
++				*name = q;
++				*name_len = (size_t)(p - q);
++				return k;
++			}
 +		}
-+		return NULL;
 +		}
 +	}
 +
@@ -961,8 +964,11 @@ index 0000000..4b954ca
 +		} else {
 +			printf("%s version=sha256:%s\n", *argv, hex);
 +		}
++		char *keep_joined;
 +		while (i < len && defs < MAX_DEFS) {
 +			size_t start = i, l;
++
++			keep_joined = NULL;
 +			const char *name, *kind;
 +			size_t name_len;
 +
@@ -970,7 +976,52 @@ index 0000000..4b954ca
 +				i++;
 +			l = i - start;
 +			line_no++;
-+			kind = kind_of(*argv, data + start, l, &name, &name_len);
++			{
++				/* 'static void pump(int a, int b,' continues on the next line;
++				 * join until the parentheses balance (bounded) so the whole
++				 * signature is classified at its first line. */
++				size_t joined_len = l;
++				char *joined = NULL;
++				const char *src = data + start;
++				int depth = 0;
++				size_t k;
++
++				for (k = 0; k < l; k++) {
++					if (src[k] == '(') depth++;
++					else if (src[k] == ')') depth--;
++				}
++				if (depth > 0) {
++					size_t j = i, extra = 0;
++					char *buf = xzalloc(l + 1);
++
++					memcpy(buf, src, l);
++					extra = l;
++					while (depth > 0 && j < len && extra < 4096) {
++						size_t s2 = j, l2;
++
++						while (j < len && data[j] != '\n')
++							j++;
++						l2 = j - s2;
++						buf = xrealloc(buf, extra + l2 + 2);
++						buf[extra++] = ' ';
++						memcpy(buf + extra, data + s2, l2);
++						extra += l2;
++						for (k = 0; k < l2; k++) {
++							if (data[s2 + k] == '(') depth++;
++							else if (data[s2 + k] == ')') depth--;
++						}
++						if (j < len)
++							j++;
++					}
++					buf[extra] = '\0';
++					joined = buf;
++					joined_len = extra;
++				}
++				kind = kind_of(*argv, joined ? joined : src, joined_len,
++						&name, &name_len);
++				/* `name` points into `joined`: freed after the print below */
++				keep_joined = joined;
++			}
 +			if (kind) {
 +				if (json) {
 +					printf("%s{\"kind\":\"%s\",\"line\":%u,\"byte\":%u,\"name\":",
@@ -983,6 +1034,7 @@ index 0000000..4b954ca
 +				}
 +				defs++;
 +			}
++			free(keep_joined);
 +			if (i < len)
 +				i++;
 +		}
