@@ -459,13 +459,12 @@ same `busybox_replace` again, which must answer `STALE_INPUT` and change nothing
 
 ---
 
-## 9. Proposed additions — **not in this build**
+## 9. Proposed additions — **shipped in the working tree, not yet released**
 
-Nothing below exists yet. Do not code against it; each item names the measurement that
-motivated it and the shape it would take, so the plugin side can say "yes/not yet" before
-anyone writes C. Ordering is by value per unit of risk.
+Items marked **[done]** exist in the working tree and pass `tests/timeline-query.sh`;
+the rest are still proposals. Nothing here is in a published release yet.
 
-### 9.1 Time-addressed retrieval (highest value)
+### 9.1 Time-addressed retrieval — [done]
 
 The timeline is captured well and read badly: the plugin re-parses `[   0.011354 out] …`
 with a regex because `log --stream timeline --format json` returns `content[].text`
@@ -477,18 +476,21 @@ log RUN --stream timeline --around-gap 0.5 --limit 3 --format json   # the 3 lon
 log RUN --summary --format json      # total, lines, first out/err, longest gap, errors, exit
 ```
 
-Adds `events:[{n,us,stream,text}]` beside `content[]` (additive), `gaps:[{from_us,to_us,lines}]`,
-and a `summary` object. Removes `timing.ts`'s parser and `summarizeTiming` from the plugin.
+Adds `events:[{n,us,stream,text}]` beside `content[]` (additive), `gaps:[…]` and `--summary`.
+Shipped: `log RUN --stream timeline --since/--until SECS`, `--around-gap SECS --limit N`,
+`--summary [--format json]`. Pinned by `tests/timeline-query.sh` sections Q1–Q3.
 
-### 9.2 A deadline that distinguishes "stuck" from "slow"
+### 9.2 A deadline that distinguishes "stuck" from "slow" — [done]
 
 The plugin now applies a **120 s default deadline** to every wrapped bash call, so a long
 build that is working fine dies like a hang. `--idle-timeout` separates them:
 
 ```sh
 run --timeout 600 --idle-timeout 60 -- make -j8
-# no output for 60 s -> code:"IDLE_TIMEOUT", exit 3, partial capture kept
+# no output for 60 s -> exit 3, idle=true, partial capture kept
 ```
+Shipped as `-W/--idle-timeout SECS`; the text summary gains `idle=true`, and a guest that
+keeps producing output runs to completion. Pinned by `tests/timeline-query.sh` section Q6.
 
 ### 9.3 Instrumented guests
 
@@ -500,13 +502,15 @@ log RUN --stream timeline --marks      # phase:build 0.42s -> 12.8s (12.4s)
 A tiny `mark` applet writing one named event with the run's own clock. Turns "which phase
 was slow" from a reading exercise into a lookup, and needs no ptrace, no /proc, no LD_PRELOAD.
 
-### 9.4 Bounded sample for high-entropy output
+### 9.4 Bounded sample for high-entropy output — [done]
 
 `brief` handles repeats; a compiler that says 40 000 different things is immune.
 
 ```sh
-log RUN --sample 40 --format json     # 40 head, one marker, 40 tail, deterministic
+log RUN --sample 40 [--stream stderr] --format json
+# {"lines":[…40…],"omitted":N,"tail":[…40…]}   deterministic, no re-read
 ```
+Pinned by `tests/timeline-query.sh` section Q4.
 
 ### 9.5 Streaming consumption
 
@@ -533,19 +537,21 @@ outline src/app.ts --format json
 peek src/app.ts --from-byte 4120    # jumps straight to the body
 ```
 
-### 9.8 Change detection across runs
+### 9.8 Change detection across runs — [done]
 
 ```sh
-log --diff-timeline R12:R18 --format json   # lines/s, gaps, first stderr, exit delta
+log --diff-timeline R12:R18 --format json
+# {"changed":true,"lines":{"a":12,"b":14},"stderr_lines":{…},"longest_gap_us":{…},"duration_ms":{…}}
 ```
+Pinned by `tests/timeline-query.sh` section Q5.
 
 "Slower than before" answered without a second full read.
 
-### 9.9 Feature advertisement
+### 9.9 Feature advertisement — [done]
 
-`--caps .features` still reads `gnu-long-opts,peek,replace,waitfor,run,log,doctor,json`
-while the build also has `brief`, `pty`, `timeline`, `brief-json`, `error-ids`, `stamp-ns`.
-A client cannot feature-detect what is not listed.
+`--caps .features` now lists `brief`, `timeline`, `pty`, `brief-json`, `error-ids`,
+`stamp-ns`, `idle-timeout`, `log-query` beside the original eight, so a client can
+feature-detect instead of assuming one build's shape. Pinned by section Q7.
 
 ### 9.10 Smaller, already-defined gaps
 

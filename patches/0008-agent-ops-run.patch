@@ -1,9 +1,9 @@
 diff --git a/coreutils/run.c b/coreutils/run.c
 new file mode 100644
-index 0000000..4b4499c
+index 0000000..c974675
 --- /dev/null
 +++ b/coreutils/run.c
-@@ -0,0 +1,2267 @@
+@@ -0,0 +1,2765 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * run - captured execution with retrievable evidence.
@@ -36,6 +36,7 @@ index 0000000..4b4499c
 +//usage:       "Run PROG, capture stdout/stderr separately, print a bounded view"
 +//usage:     "\n	-T, --timeout SECS	Kill the process group after SECS"
 +//usage:     "\n	-k, --kill-after SECS	Grace period before SIGKILL (default 2)"
++//usage:     "\n	-W, --idle-timeout SECS	Kill after SECS without any output"
 +//usage:     "\n	-B, --max-bytes N	View budget (default 12000)"
 +//usage:     "\n	-C, --capture-limit N	Captured bytes per stream (default 64 MiB)"
 +//usage:     "\n	-D, --dir PATH		Artifact root (default $TMPDIR/busybox-run)"
@@ -94,7 +95,8 @@ index 0000000..4b4499c
 +};
 +
 +static long child_pgid;
-+static pid_t reaper_pid;   /* kills the guest group if we die; we stop it on exit */
++static pid_t reaper_pid;
++static long idle_ms;          /* --idle-timeout, 0 = off */   /* kills the guest group if we die; we stop it on exit */
 +static char **child_env;   /* NAME=VALUE pairs from --env, NULL-terminated */
 +static int n_child_env;
 +static int error_ids;
@@ -111,6 +113,7 @@ index 0000000..4b4499c
 +	int exit_code;       /* -1 when killed by a signal */
 +	int term_sig;
 +	int timed_out;
++	int idle_out;        /* the idle deadline fired, not the wall one */
 +	int cancelled;
 +	int capture_complete;
 +	unsigned long long out_bytes;
@@ -654,13 +657,14 @@ index 0000000..4b4499c
 +		long capture_limit, pid_t pid, struct meta *m)
 +{
 +	struct pollfd pfd[4];
-+	unsigned long long captured = 0, term_at = 0;
++	unsigned long long captured = 0, term_at = 0, last_data = 0;
 +	long quota_used[3] = { 0, 0, 0 };
 +	int open_count = 0, phase = 0, i;
 +	char buf[16384];
 +	char feed[4096];
 +	size_t feed_len = 0, feed_off = 0;
 +	int feed_done = (feed_to < 0 || feed_from < 0);
++	(void)0;
 +	int feed_on_line = 1;   /* every byte fed so far ended on a newline */
 +
 +	for (i = 0; i < nr; i++) {
@@ -674,6 +678,17 @@ index 0000000..4b4499c
 +
 +		if (phase == 0 && deadline_ms > 0 && (long)now >= deadline_ms) {
 +			m->timed_out = 1;
++			kill(-pid, SIGTERM);
++			kill(pid, SIGTERM);
++			term_at = now;
++			phase = 1;
++		}
++		if (phase == 0 && idle_ms > 0 && last_data
++		 && (long)now - (long)last_data >= idle_ms
++		) {
++			/* The guest is not producing anything: that is the hang, not the
++			 * total runtime, which may be legitimately long. */
++			m->idle_out = 1;
 +			kill(-pid, SIGTERM);
 +			kill(pid, SIGTERM);
 +			term_at = now;
@@ -783,6 +798,7 @@ index 0000000..4b4499c
 +				continue;
 +			}
 +			captured += (unsigned long long)r;
++			last_data = now;      /* the idle deadline measures silence, not runtime */
 +			if (i == 0)
 +				m->out_bytes += (unsigned long long)r;
 +			else
@@ -1189,6 +1205,7 @@ index 0000000..4b4499c
 +	char *opt_stdin = NULL;
 +	int opt_pgid = 0;
 +	char *opt_prune = NULL;
++	char *opt_idle = NULL;
 +	char *opt_brief = NULL;
 +	int brief_out = 0, brief_err = 0;
 +	int quiet = 0, brief_json = 0;
@@ -1212,6 +1229,7 @@ index 0000000..4b4499c
 +	static const char run_longopts[] ALIGN1 =
 +		"timeout\0"       Required_argument "T"
 +		"kill-after\0"    Required_argument "k"
++		"idle-timeout\0"  Required_argument "W"
 +		"max-bytes\0"     Required_argument "B"
 +		"capture-limit\0" Required_argument "C"
 +		"dir\0"           Required_argument "D"
@@ -1290,7 +1308,8 @@ index 0000000..4b4499c
 +	}
 +	opts = getopt32long(argv, "T:k:B:C:D:d:sF:i:Pr:b:qjtYn", run_longopts,
 +			&opt_timeout, &opt_kill, &opt_bytes, &opt_capture,
-+			&opt_dir, &opt_cwd, &opt_fmt, &opt_stdin, &opt_prune, &opt_brief);
++			&opt_dir, &opt_cwd, &opt_fmt, &opt_stdin, &opt_prune, &opt_brief,
++			&opt_idle);
 +	use_shell = (opts & (1 << 6)) != 0;   /* s */
 +	quiet = (opts & (1 << 12)) != 0;      /* q: 13th letter of the optstring */
 +	brief_json = (opts & (1 << 13)) != 0; /* j: 14th */
@@ -1351,6 +1370,13 @@ index 0000000..4b4499c
 +			bb_error_msg_and_die("bad timeout");
 +		/* absolute: pump() compares against monotonic time */
 +		deadline_ms = (long)now_ms() + (long)(s * 1000.0);
++	}
++	if (opt_idle) {
++		double secs = strtod(opt_idle, NULL);
++
++		if (!(secs > 0))
++			bb_error_msg_and_die("bad idle timeout \"%s\"", opt_idle);
++		idle_ms = (long)(secs * 1000.0);
 +	}
 +	if (opt_kill) {
 +		double s = strtod(opt_kill, NULL);
@@ -1759,9 +1785,10 @@ index 0000000..4b4499c
 +			putchar('}');
 +			putchar('\n');
 +		} else if (tl.on) {
-+			printf("run=R%u exit_code=%d timed_out=%s cancelled=%s duration_ms=%ld\n",
++			printf("run=R%u exit_code=%d timed_out=%s cancelled=%s idle=%s duration_ms=%ld\n",
 +					id, m.exit_code, m.timed_out ? "true" : "false",
-+					m.cancelled ? "true" : "false", m.duration_ms);
++					m.cancelled ? "true" : "false",
++					m.idle_out ? "true" : "false", m.duration_ms);
 +			printf("timeline_lines=%u shown=%u truncated=%s stamp=%s res_ns=%u\n",
 +					tl.n, tl_text_shown(),
 +					(tl.truncated || tl.n > tl_shown_count()) ? "true" : "false",
@@ -1790,9 +1817,10 @@ index 0000000..4b4499c
 +			} else
 +				dump_bounded(p2, (size_t)budget / 4, 0, "stderr");
 +		} else {
-+			printf("run=R%u exit_code=%d timed_out=%s cancelled=%s duration_ms=%ld\n",
++			printf("run=R%u exit_code=%d timed_out=%s cancelled=%s idle=%s duration_ms=%ld\n",
 +					id, m.exit_code, m.timed_out ? "true" : "false",
-+					m.cancelled ? "true" : "false", m.duration_ms);
++					m.cancelled ? "true" : "false",
++					m.idle_out ? "true" : "false", m.duration_ms);
 +			printf("captured_bytes=%llu stdout=%llu stderr=%llu capture_complete=%s "
 +					"view_truncated=%s\n",
 +					m.out_bytes + m.err_bytes, m.out_bytes, m.err_bytes,
@@ -1848,12 +1876,13 @@ index 0000000..4b4499c
 +			printf("pruned=%u keep=%u\n", gone, keep);
 +	}
 +	fflush(stdout);
-+	if (m.timed_out || m.cancelled)
++	if (m.timed_out || m.cancelled || m.idle_out)
 +		return 3;
 +	if (m.exit_code < 0)
 +		return 1;
 +	return m.exit_code;
 +}
++
 +
 +/* ---------- log ---------- */
 +
@@ -2072,6 +2101,437 @@ index 0000000..4b4499c
 +}
 +
 +/* log --diff R1:R2: compare two runs' stdout, line by line. */
++/* ---------- time-addressed timeline retrieval ---------- */
++
++/* "[   0.011354 out] text" -> microseconds, and which stream. */
++static long stamp_us(const char *line, size_t len, int *is_err)
++{
++	long sec = 0, frac = 0;
++	size_t i = 0;
++	int digits = 0;
++
++	*is_err = 0;
++	while (i < len && (line[i] == '[' || line[i] == ' '))
++		i++;
++	while (i < len && line[i] >= '0' && line[i] <= '9')
++		sec = sec * 10 + (line[i++] - '0');
++	if (i < len && line[i] == '.') {
++		i++;
++		while (i < len && line[i] >= '0' && line[i] <= '9' && digits < 9) {
++			frac = frac * 10 + (line[i++] - '0');
++			digits++;
++		}
++	}
++	while (digits++ < 9)
++		frac *= 10;
++	for (; i < len; i++)
++		if (line[i] == 'e' && i + 3 < len && memcmp(line + i, "err", 3) == 0) {
++			*is_err = 1;
++			break;
++		}
++	return sec * 1000000L + frac / 1000;
++}
++
++struct tlstat {
++	unsigned lines, err_lines;
++	long first_out, first_err, last;
++	long gap_from, gap_us;
++};
++
++/* Walk the timeline artifact, filling `st` and printing whatever the caller wants. */
++static int tl_query(const char *dir, long since_us, long until_us,
++		double gap_s, long limit, int json, size_t budget)
++{
++	char *path = art_path(dir, "timeline");
++	char *data = NULL;
++	size_t len = 0, starts_n = 0, *starts;
++	unsigned nlines = 0, i, shown = 0;
++	size_t printed = 0;
++	struct tlstat st;
++
++	memset(&st, 0, sizeof(st));
++	st.first_out = -1;
++	st.first_err = -1;
++
++	if (read_all(path, &data, &len) != 0) {
++		if (json)
++			printf("{\"schema\":1,\"stream\":\"timeline\",\"status\":\"error\","
++					"\"code\":\"NOT_FOUND\",\"message\":\"run not found or stream missing\"}");
++		else
++			fprintf(stderr, "%s: NOT_FOUND\n", path);
++		free(path);
++		return 1;
++	}
++	free(path);
++	starts = line_starts(data, len, &nlines);
++
++	for (i = 0; i < nlines; i++) {
++		size_t l = line_len(data, starts, nlines, len, i);
++		int is_err;
++		long us;
++
++		if (l == 0)
++			continue;
++		us = stamp_us(data + starts[i], l, &is_err);
++		st.lines++;
++		if (is_err) {
++			st.err_lines++;
++			if (st.first_err < 0)
++				st.first_err = us;
++		} else if (st.first_out < 0) {
++			st.first_out = us;
++		}
++		if (us > st.last)
++			st.last = us;
++		if (i && st.last > 0) {
++			long prev = 0;
++			int pe;
++			size_t pl = line_len(data, starts, nlines, len, i - 1);
++
++			prev = pl ? stamp_us(data + starts[i - 1], pl, &pe) : 0;
++			if (us - prev > st.gap_us) {
++				st.gap_us = us - prev;
++				st.gap_from = prev;
++			}
++		}
++	}
++
++	if (gap_s > 0) {
++		/* The N widest silences, with the line on each side. */
++		long want = (long)(gap_s * 1000000.0);
++		long shown_gaps = 0;
++
++		if (json)
++			printf("{\"schema\":1,\"stream\":\"timeline\",\"status\":\"ok\",\"gaps\":[");
++		for (i = 1; i < nlines && shown_gaps < (limit > 0 ? limit : 3); i++) {
++			size_t pl = line_len(data, starts, nlines, len, i - 1);
++			size_t cl = line_len(data, starts, nlines, len, i);
++			int pe, ce;
++			long pu, cu;
++
++			if (!pl || !cl)
++				continue;
++			pu = stamp_us(data + starts[i - 1], pl, &pe);
++			cu = stamp_us(data + starts[i], cl, &ce);
++			if (cu - pu < want)
++				continue;
++			if (json) {
++				printf("%s{\"from_us\":%ld,\"to_us\":%ld,\"gap_us\":%ld,\"before\":",
++						shown_gaps ? "," : "", pu, cu, cu - pu);
++				json_write_str(xstrndup(data + starts[i - 1], pl));
++				printf(",\"after\":");
++				json_write_str(xstrndup(data + starts[i], cl));
++				putchar('}');
++			} else {
++				printf("gap %ldus -> %ldus (%ldus)\n", pu, cu, cu - pu);
++			}
++			shown_gaps++;
++		}
++		if (json)
++			printf("],\"lines\":%u,\"stderr_lines\":%u}", st.lines, st.err_lines);
++		else
++			printf("gaps=%ld lines=%u stderr_lines=%u\n", shown_gaps, st.lines, st.err_lines);
++		free(starts);
++		free(data);
++		fflush(stdout);
++		return 0;
++	}
++
++	if (json)
++		printf("{\"schema\":1,\"stream\":\"timeline\",\"status\":\"ok\",\"events\":[");
++	for (i = 0; i < nlines; i++) {
++		size_t l = line_len(data, starts, nlines, len, i);
++		int is_err;
++		long us;
++
++		if (l == 0)
++			continue;
++		us = stamp_us(data + starts[i], l, &is_err);
++		if (since_us >= 0 && us < since_us)
++			continue;
++		if (until_us >= 0 && us > until_us)
++			continue;
++		if (printed + l + 40 > budget) {
++			shown = i;
++			break;
++		}
++		if (json) {
++			char *text = xstrndup(data + starts[i], l);
++			char *body = strchr(text, ']');
++
++			while (body && *body == ']')
++				body++, body += (*body == ' ');
++			printf("%s{\"n\":%u,\"us\":%ld,\"stream\":\"%s\",\"text\":",
++					printed ? "," : "", i + 1, us, is_err ? "err" : "out");
++			json_write_str(body ? body : "");
++			putchar('}');
++			free(text);
++		} else {
++			fwrite(data + starts[i], 1, l, stdout);
++			putchar('\n');
++		}
++		printed += l;
++	}
++	if (json)
++		printf("],\"shown_bytes\":%u,\"truncated\":%s}", (unsigned)printed,
++				shown ? "true" : "false");
++	free(starts);
++	free(data);
++	fflush(stdout);
++	return 0;
++}
++
++
++static int tl_stats(const char *root, const char *run, struct tlstat *st, long *duration_ms)
++{
++	char *dir = xasprintf("%s/%s", root, run);
++	char *path = art_path(dir, "timeline");
++	char *meta = art_path(dir, "meta");
++	char *data = NULL, *m = NULL;
++	size_t len = 0, mlen = 0, *starts;
++	unsigned nlines = 0, i;
++
++	memset(st, 0, sizeof(*st));
++	st->first_out = st->first_err = -1;
++	*duration_ms = 0;
++	if (read_all(path, &data, &len) != 0) {
++		free(dir); free(path); free(meta);
++		return 1;
++	}
++	starts = line_starts(data, len, &nlines);
++	for (i = 0; i < nlines; i++) {
++		size_t l = line_len(data, starts, nlines, len, i);
++		int is_err;
++		long us, prev = 0;
++
++		if (l == 0)
++			continue;
++		us = stamp_us(data + starts[i], l, &is_err);
++		st->lines++;
++		if (is_err) {
++			st->err_lines++;
++			if (st->first_err < 0)
++				st->first_err = us;
++		} else if (st->first_out < 0) {
++			st->first_out = us;
++		}
++		if (i) {
++			size_t pl = line_len(data, starts, nlines, len, i - 1);
++			int pe;
++
++			prev = pl ? stamp_us(data + starts[i - 1], pl, &pe) : 0;
++			if (us - prev > st->gap_us) {
++				st->gap_us = us - prev;
++				st->gap_from = prev;
++			}
++		}
++	}
++	if (read_all(meta, &m, &mlen) == 0) {
++		char *d = strstr(m, "duration_ms=");
++
++		if (d)
++			*duration_ms = strtol(d + 12, NULL, 10);
++	}
++	free(starts);
++	free(data);
++	free(m);
++	free(dir);
++	free(path);
++	free(meta);
++	return 0;
++}
++
++/* One deterministic digest: what the plugin builds in TypeScript today. */
++static int tl_summary(const char *dir, const char *run, int json)
++{
++	char *path = art_path(dir, "timeline");
++	char *meta = art_path(dir, "meta");
++	char *data = NULL;
++	size_t len = 0, *starts;
++	unsigned nlines = 0, i;
++	struct tlstat st;
++	long exit_code = 0, duration_ms = 0;
++	char *m = NULL;
++	size_t mlen = 0;
++	int timed_out = 0;
++
++	memset(&st, 0, sizeof(st));
++	st.first_out = st.first_err = -1;
++	if (read_all(path, &data, &len) != 0) {
++		if (json)
++			printf("{\"schema\":1,\"status\":\"error\",\"code\":\"NOT_FOUND\"}");
++		else
++			fprintf(stderr, "%s: NOT_FOUND\n", path);
++		return 1;
++	}
++	starts = line_starts(data, len, &nlines);
++	for (i = 0; i < nlines; i++) {
++		size_t l = line_len(data, starts, nlines, len, i);
++		int is_err;
++		long us, prev = 0;
++
++		if (l == 0)
++			continue;
++		us = stamp_us(data + starts[i], l, &is_err);
++		st.lines++;
++		if (is_err) {
++			st.err_lines++;
++			if (st.first_err < 0)
++				st.first_err = us;
++		} else if (st.first_out < 0) {
++			st.first_out = us;
++		}
++		if (i) {
++			size_t pl = line_len(data, starts, nlines, len, i - 1);
++			int pe;
++
++			prev = pl ? stamp_us(data + starts[i - 1], pl, &pe) : 0;
++			if (us - prev > st.gap_us) {
++				st.gap_us = us - prev;
++				st.gap_from = prev;
++			}
++		}
++		if (us > st.last)
++			st.last = us;
++	}
++	if (read_all(meta, &m, &mlen) == 0) {
++		char *p = strstr(m, "exit_code=");
++		char *d = strstr(m, "duration_ms=");
++		char *t = strstr(m, "timed_out=");
++
++		if (p) exit_code = strtol(p + 10, NULL, 10);
++		if (d) duration_ms = strtol(d + 12, NULL, 10);
++		if (t) timed_out = (t[10] == '1');
++	}
++	if (json) {
++		printf("{\"schema\":1,\"run\":");
++		json_write_str(run);
++		printf(",\"status\":\"ok\",\"lines\":%u,\"stderr_lines\":%u,"
++				"\"first_out_us\":%ld,\"first_err_us\":%ld,\"last_us\":%ld,"
++				"\"longest_gap\":{\"from_us\":%ld,\"to_us\":%ld,\"gap_us\":%ld},"
++				"\"exit_code\":%ld,\"duration_ms\":%ld,\"timed_out\":%s}",
++				st.lines, st.err_lines, st.first_out, st.first_err, st.last,
++				st.gap_from, st.gap_from + st.gap_us, st.gap_us,
++				exit_code, duration_ms, timed_out ? "true" : "false");
++	} else {
++		printf("run=%s lines=%u stderr=%u first_out_us=%ld first_err_us=%ld "
++				"last_us=%ld longest_gap_us=%ld exit_code=%ld duration_ms=%ld timed_out=%d\n",
++				run, st.lines, st.err_lines, st.first_out, st.first_err,
++				st.last, st.gap_us, exit_code, duration_ms, timed_out);
++	}
++	free(starts);
++	free(data);
++	free(m);
++	fflush(stdout);
++	return 0;
++}
++
++/* First N and last N lines of a stream: the digest for output brief cannot reduce. */
++static int dump_sample(const char *dir, const char *label, long want,
++		size_t budget, int json)
++{
++	char *path = art_path(dir, label);
++	char *data = NULL;
++	size_t len = 0, *starts, printed = 0;
++	unsigned nlines = 0, i, head, tail;
++
++	if (read_all(path, &data, &len) != 0) {
++		if (json)
++			printf("{\"schema\":1,\"stream\":\"%s\",\"status\":\"error\","
++					"\"code\":\"NOT_FOUND\",\"message\":\"run not found or stream missing\"}", label);
++		else
++			fprintf(stderr, "%s: NOT_FOUND\n", path);
++		return 1;
++	}
++	starts = line_starts(data, len, &nlines);
++	head = ((unsigned)want < nlines) ? (unsigned)want : nlines;
++	tail = (nlines > head && (nlines - head) > (unsigned)want) ? (unsigned)want : (nlines - head);
++
++	if (json)
++		printf("{\"schema\":1,\"stream\":\"%s\",\"status\":\"ok\",\"lines\":[", label);
++	for (i = 0; i < head; i++) {
++		size_t l = line_len(data, starts, nlines, len, i);
++
++		if (json) {
++			fputs(i ? "," : "", stdout);
++			json_write_str(xstrndup(data + starts[i], l));
++		} else {
++			fwrite(data + starts[i], 1, l, stdout);
++			putchar('\n');
++		}
++		printed += l;
++	}
++	if (json)
++		printf("],\"omitted\":%u,\"tail\":[", nlines - head - tail);
++	for (i = nlines - tail; tail && i < nlines; i++) {
++		size_t l = line_len(data, starts, nlines, len, i);
++
++		if (json) {
++			fputs(i == nlines - tail ? "" : ",", stdout);
++			json_write_str(xstrndup(data + starts[i], l));
++		} else {
++			fwrite(data + starts[i], 1, l, stdout);
++			putchar('\n');
++		}
++		printed += l;
++	}
++	if (json)
++		printf("],\"shown_bytes\":%u,\"truncated\":%s}", (unsigned)printed,
++				(nlines > head + tail) ? "true" : "false");
++	free(starts);
++	free(data);
++	fflush(stdout);
++	return 0;
++}
++
++
++
++/* Two runs by shape: lines, stderr lines, first stderr, longest gap, duration. */
++static int log_diff_timeline(const char *root, const char *spec, int json)
++{
++	const char *colon = strchr(spec, ':');
++	char *a, *b;
++	struct tlstat sa, sb;
++	long da = 0, dbb = 0;
++	int changed = 0;
++
++	if (!colon || colon == spec || !colon[1]) {
++		fprintf(stderr, "log: --diff-timeline wants RUN1:RUN2\n");
++		return 2;
++	}
++	a = xstrndup(spec, (size_t)(colon - spec));
++	b = xstrdup(colon + 1);
++	if (tl_stats(root, a, &sa, &da) || tl_stats(root, b, &sb, &dbb)) {
++		if (json)
++			printf("{\"schema\":1,\"status\":\"error\",\"code\":\"NOT_FOUND\"}");
++		else
++			fprintf(stderr, "log: one of %s / %s has no timeline\n", a, b);
++		free(a);
++		free(b);
++		return 1;
++	}
++	if (sa.lines != sb.lines || sa.err_lines != sb.err_lines
++	 || sa.gap_us != sb.gap_us || da != dbb)
++		changed = 1;
++	if (json)
++		printf("{\"schema\":1,\"status\":\"ok\",\"a\":\"%s\",\"b\":\"%s\",\"changed\":%s,"
++				"\"lines\":{\"a\":%u,\"b\":%u},\"stderr_lines\":{\"a\":%u,\"b\":%u},"
++				"\"first_err_us\":{\"a\":%ld,\"b\":%ld},"
++				"\"longest_gap_us\":{\"a\":%ld,\"b\":%ld},"
++				"\"duration_ms\":{\"a\":%ld,\"b\":%ld}}",
++				a, b, changed ? "true" : "false",
++				sa.lines, sb.lines, sa.err_lines, sb.err_lines,
++				sa.first_err, sb.first_err, sa.gap_us, sb.gap_us, da, dbb);
++	else
++		printf("%s -> %s lines %u->%u stderr %u->%u gap_us %ld->%ld duration_ms %ld->%ld changed=%s\n",
++				a, b, sa.lines, sb.lines, sa.err_lines, sb.err_lines,
++				sa.gap_us, sb.gap_us, da, dbb, changed ? "true" : "false");
++	free(a);
++	free(b);
++	fflush(stdout);
++	return 0;
++}
++
 +static int log_diff(const char *root, const char *spec, int json)
 +{
 +	char *colon = strchr(spec, ':');
@@ -2151,6 +2611,9 @@ index 0000000..4b4499c
 +{
 +	char *opt_lines = NULL, *opt_match = NULL, *opt_ctx = NULL;
 +	char *opt_stream = NULL, *opt_bytes = NULL, *opt_dir = NULL, *opt_fmt = NULL;
++	char *opt_since = NULL, *opt_until = NULL, *opt_gap = NULL;
++	char *opt_limit = NULL, *opt_sample = NULL, *opt_difftl = NULL;
++	int summary_only = 0;
 +	char *opt_diff = NULL;
 +	unsigned opts;
 +	const char *root, *run, *dir;
@@ -2167,6 +2630,13 @@ index 0000000..4b4499c
 +		"max-bytes\0" Required_argument "B"
 +		"dir\0"       Required_argument "D"
 +		"format\0"    Required_argument "F"
++		"since\0"     Required_argument "S"
++		"until\0"     Required_argument "U"
++		"around-gap\0" Required_argument "G"
++		"limit\0"     Required_argument "N"
++		"sample\0"    Required_argument "P"
++		"summary\0"   No_argument       "Z"
++		"diff-timeline\0" Required_argument "Q"
 +		;
 +
 +	xfunc_error_retval = 2;
@@ -2175,6 +2645,15 @@ index 0000000..4b4499c
 +		int i;
 +
 +		for (i = 1; argv[i]; i++) {
++			if (strcmp(argv[i], "--diff-timeline") == 0 && argv[i + 1]) {
++				int j;
++
++				opt_difftl = argv[i + 1];
++				for (j = i; argv[j + 2]; j++)
++					argv[j] = argv[j + 2];
++				argv[j] = NULL;
++				break;
++			}
 +			if (strcmp(argv[i], "--diff") == 0 && argv[i + 1]) {
 +				int j;
 +
@@ -2186,10 +2665,13 @@ index 0000000..4b4499c
 +			}
 +		}
 +	}
-+	opts = getopt32long(argv, "l:m:c:s:MB:D:F:", log_longopts,
++	opts = getopt32long(argv, "l:m:c:s:MB:D:F:S:U:G:N:P:ZQ:", log_longopts,
 +			&opt_lines, &opt_match, &opt_ctx, &opt_stream,
-+			&opt_bytes, &opt_dir, &opt_fmt);
++			&opt_bytes, &opt_dir, &opt_fmt,
++			&opt_since, &opt_until, &opt_gap, &opt_limit, &opt_sample,
++			&opt_difftl);
 +	meta_only = (opts & (1 << 4)) != 0;   /* M */
++	summary_only = (opts & (1 << 13)) != 0;  /* Z: 14th letter of the optstring */
 +	argv += optind;
 +
 +	if (opt_fmt) {
@@ -2210,10 +2692,26 @@ index 0000000..4b4499c
 +	root = artifact_root(opt_dir);
 +	if (opt_diff)
 +		return log_diff(root, opt_diff, json);
++	if (opt_difftl)
++		return log_diff_timeline(root, opt_difftl, json);
 +	if (!argv[0])
 +		bb_show_usage();
 +	run = argv[0];                 /* was lost in the run.c rewrite */
 +	dir = xasprintf("%s/%s", root, run);
++
++	if (opt_since || opt_until || opt_gap)
++		return tl_query(dir,
++				opt_since ? (long)(strtod(opt_since, NULL) * 1000000.0) : -1,
++				opt_until ? (long)(strtod(opt_until, NULL) * 1000000.0) : -1,
++				opt_gap ? strtod(opt_gap, NULL) : 0.0,
++				opt_limit ? strtol(opt_limit, NULL, 10) : 3,
++				json, (size_t)budget);
++	if (summary_only)
++		return tl_summary(dir, run, json);
++	if (opt_sample)
++		return dump_sample(dir,
++				opt_stream && strcmp(opt_stream, "stderr") == 0 ? "stderr" : "stdout",
++				strtol(opt_sample, NULL, 10), (size_t)budget, json);
 +
 +	if (meta_only) {
 +		char *path = art_path(dir, "meta");
