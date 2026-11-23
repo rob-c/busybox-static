@@ -596,10 +596,10 @@ index 0000000..745847d
 +}
 diff --git a/miscutils/outline.c b/miscutils/outline.c
 new file mode 100644
-index 0000000..63ad2ec
+index 0000000..a56d989
 --- /dev/null
 +++ b/miscutils/outline.c
-@@ -0,0 +1,449 @@
+@@ -0,0 +1,463 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * outline - definitions in a file, with line, byte offset and version.
@@ -703,6 +703,20 @@ index 0000000..63ad2ec
 +	 || *p == '*'
 +	 || (*p == '#' && (p + 1 >= end || p[1] != ' ')))  /* '#' is a heading, not a directive */
 +		return NULL;
++	/* A trailing comment is prose, not code: 'cp -R a b   # keep the (farm)
++	 * links' must not read as a function called farm. */
++	{
++		const char *c;
++
++		for (c = p; c < end; c++) {
++			if (c + 1 < end && c[0] == ' ' && (c[1] == '#' || (c[1] == '/' && c + 2 < end && c[2] == '/')))
++				break;
++			if (c + 1 < end && c[0] == '\t' && c[1] == '#')
++				break;
++		}
++		if (c < end)
++			end = c;
++	}
 +	/* drop declaration qualifiers so 'export class C {' still reads as a class */
 +	for (;;) {
 +		static const char *const qual[] = {

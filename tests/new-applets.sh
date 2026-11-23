@@ -107,6 +107,19 @@ ck "outline.returns_struct"      "1" "$("$BB" outline multi.c | "$BB" grep -c ':
 ck "outline.plain_still"         "1" "$("$BB" outline multi.c | "$BB" grep -c ':function:.*plain')"
 ck "outline.three_functions"     "3" "$("$BB" outline multi.c | "$BB" grep -c ':function:')"
 
+sec "O6. outline across languages (measured, not guessed)"
+printf 'func Hello(a int) string {\n}\n' > x.go
+printf 'fn main() {\n}\npub fn a(x: u8) -> u8 {\n}\n' > x.rs
+printf 'public class C {\n  public void m() {\n  }\n}\n' > X.java
+printf 'cp -R a b   # keep the symlink farm (relative links still resolve)\n' > y.sh
+ck "outline.go_func"      "1" "$("$BB" outline x.go | "$BB" grep -c ':function:.*Hello')"
+ck "outline.rs_fn"        "1" "$("$BB" outline x.rs | "$BB" grep -c ':function:.*main')"
+ck "outline.rs_pub_fn"    "1" "$("$BB" outline x.rs | "$BB" grep -c ':function:.*:a$')"
+ck "outline.java_class"   "1" "$("$BB" outline X.java | "$BB" grep -c ':class:.*C$')"
+ck "outline.java_method"  "1" "$("$BB" outline X.java | "$BB" grep -c ':function:.*:m$')"
+ck "outline.comment_not_fn" "0" "$("$BB" outline y.sh | "$BB" grep -c ':function:')"
+ck "outline.shell_fn"     "1" "$(printf 'go() {\n  :\n}\n' > z.sh; "$BB" outline z.sh | "$BB" grep -c ':function:.*go')"
+
 sec "H. the binary documents its own flags"
 ck "help.log_since"       "1" "$("$BB" log --help 2>&1 | "$BB" grep -c -- '--since')"
 ck "help.log_summary"     "1" "$("$BB" log --help 2>&1 | "$BB" grep -c -- '--summary')"
