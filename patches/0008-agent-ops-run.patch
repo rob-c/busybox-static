@@ -1,9 +1,9 @@
 diff --git a/coreutils/run.c b/coreutils/run.c
 new file mode 100644
-index 0000000..4682a51
+index 0000000..33e2228
 --- /dev/null
 +++ b/coreutils/run.c
-@@ -0,0 +1,2149 @@
+@@ -0,0 +1,2218 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * run - captured execution with retrievable evidence.
@@ -49,6 +49,7 @@ index 0000000..4682a51
 +//usage:     "\n	-r, --prune N		Keep only the newest N runs"
 +//usage:     "\n	-q, --quiet		Print the captured streams only, no summary"
 +//usage:     "\n	-j, --brief-json	Emit brief's JSON (schema 1) as the body"
++//usage:     "\n	-n, --stamp-ns	Stamp with 9 digits instead of 6 (the clock is ns)"
 +//usage:     "\n	-t, --timestamps	Prefix every line with its time and stream,"
 +//usage:     "\n			in one interleaved stream (dmesg style)"
 +//usage:     "\n	-Y, --pty		Give the child a new pty as its controlling"
@@ -236,7 +237,7 @@ index 0000000..4682a51
 + * better than the two-section view, which loses the interleaving entirely.
 + * Timestamps are CLOCK_MONOTONIC microseconds since the child was forked. */
 +struct tlrec {
-+	unsigned long long us;
++	unsigned long long ns;
 +	char stream;      /* 'o' or 'e' */
 +	char *text;
 +};
@@ -246,8 +247,10 @@ index 0000000..4682a51
 +	unsigned n, cap;
 +	size_t bytes, budget;          /* budget: hard cap on held records */
 +	int truncated;
-+	unsigned long long start_us;
++	unsigned long long start_ns;
 +	unsigned long long start_unix_us;
++	int nanosec;                 /* --stamp-ns: 9 digits instead of 6 */
++	unsigned res_ns;
 +	unsigned out_truncated;
 +	size_t out_budget;
 +	char *part[2];    /* partial line per stream */
@@ -255,7 +258,7 @@ index 0000000..4682a51
 +	int on;
 +} tl;
 +
-+static void tl_put(int i, const char *p, size_t n, unsigned long long us)
++static void tl_put(int i, const char *p, size_t n, unsigned long long ns)
 +{
 +	struct tlrec *r;
 +
@@ -268,7 +271,7 @@ index 0000000..4682a51
 +		tl.v = xrealloc(tl.v, tl.cap * sizeof(tl.v[0]));
 +	}
 +	r = &tl.v[tl.n++];
-+	r->us = us;
++	r->ns = ns;
 +	r->stream = i ? 'e' : 'o';
 +	r->text = xmalloc(n + 1);
 +	memcpy(r->text, p, n);
@@ -279,11 +282,11 @@ index 0000000..4682a51
 +/* Assemble lines per stream; a line is stamped when its newline arrives. */
 +static void tl_feed(int i, const char *p, size_t n)
 +{
-+	unsigned long long us;
++	unsigned long long ns;
 +
 +	if (!tl.on)
 +		return;
-+	us = monotonic_us() - tl.start_us;
++	ns = monotonic_ns() - tl.start_ns;
 +	while (n) {
 +		const char *nl = memchr(p, '\n', n);
 +		size_t take = nl ? (size_t)(nl - p) : n;
@@ -297,7 +300,7 @@ index 0000000..4682a51
 +		p += take;
 +		n -= take;
 +		if (nl) {
-+			tl_put(i, tl.part[i], tl.plen[i], us);
++			tl_put(i, tl.part[i], tl.plen[i], ns);
 +			tl.plen[i] = 0;
 +			p++;
 +			n--;
@@ -311,7 +314,7 @@ index 0000000..4682a51
 +
 +	for (i = 0; i < 2; i++) {
 +		if (tl.plen[i]) {
-+			tl_put(i, tl.part[i], tl.plen[i], monotonic_us() - tl.start_us);
++			tl_put(i, tl.part[i], tl.plen[i], monotonic_ns() - tl.start_ns);
 +			tl.plen[i] = 0;
 +		}
 +	}
@@ -321,7 +324,31 @@ index 0000000..4682a51
 + * budget shortens the view without shortening the evidence on disk. */
 +static int tl_line_len(const struct tlrec *r)
 +{
-+	return 22 + (int)strlen(r->text);   /* "[ s.uuuuuu out] " + text + "\n" */
++	return 30 + (int)strlen(r->text);   /* stamp + " out] " + text + "\n" */
++}
++
++/* ns mode: [   0.015623417 out]   us mode: [   0.015623 out] */
++static void tl_stamp(char *out, unsigned long long ns)
++{
++	unsigned long long s = ns / 1000000000ULL;
++	unsigned long long frac = ns % 1000000000ULL;
++	int n = 0, k, digits = tl.nanosec ? 9 : 6;
++	char t[24];
++
++	if (!tl.nanosec)
++		frac /= 1000ULL;             /* microseconds */
++	out[n++] = '[';
++	k = 0;
++	do { t[k++] = (char)('0' + (int)(s % 10)); s /= 10; } while (s);
++	while (k < 5) t[k++] = '0';          /* five columns, dmesg-ish */
++	while (k) out[n++] = t[--k];
++	out[n++] = '.';
++	k = digits;
++	while (k) { t[k - 1] = (char)('0' + (int)(frac % 10)); frac /= 10; k--; }
++	memcpy(out + n, t, (size_t)digits);
++	n += digits;
++	out[n++] = ' ';
++	out[n] = '\0';
 +}
 +
 +static unsigned tl_shown_count(void)
@@ -349,9 +376,13 @@ index 0000000..4682a51
 +	for (i = 0; i < show; i++) {
 +		int n = tl_line_len(&tl.v[i]);
 +
-+		printf("[%4llu.%06llu %s] %s\n",
-+				tl.v[i].us / 1000000, tl.v[i].us % 1000000,
-+				tl.v[i].stream == 'e' ? "err" : "out", tl.v[i].text);
++		{
++			char st[40];
++
++			tl_stamp(st, tl.v[i].ns);
++			fputs(st, stdout);
++		}
++		printf("%s] %s\n", tl.v[i].stream == 'e' ? "err" : "out", tl.v[i].text);
 +		used += (size_t)n;
 +	}
 +	if (show < tl.n)
@@ -371,9 +402,11 @@ index 0000000..4682a51
 +		return;
 +	for (i = 0; i < tl.n; i++) {
 +		char hdr[64];
-+		int n = sprintf(hdr, "[%4llu.%06llu %s] ",
-+				tl.v[i].us / 1000000, tl.v[i].us % 1000000,
-+				tl.v[i].stream == 'e' ? "err" : "out");
++		char st[40];
++		int n;
++
++		tl_stamp(st, tl.v[i].ns);
++		n = sprintf(hdr, "%s%s] ", st, tl.v[i].stream == 'e' ? "err" : "out");
 +
 +		full_write(fd, hdr, (size_t)n);
 +		full_write(fd, tl.v[i].text, strlen(tl.v[i].text));
@@ -388,12 +421,14 @@ index 0000000..4682a51
 +	size_t used = 0;
 +	int first = 1;
 +
-+	printf("\"started_unix_us\":%llu,\"timeline\":[", tl.start_unix_us);
++	printf("\"started_unix_us\":%llu,\"stamp_ns\":%s,\"stamp_res_ns\":%u,"
++			"\"timeline\":[",
++			tl.start_unix_us, tl.nanosec ? "true" : "false", tl.res_ns);
 +	for (i = 0; i < show; i++) {
 +		int n = tl_line_len(&tl.v[i]);
 +
-+		printf("%s{\"us\":%llu,\"stream\":\"%s\",\"text\":",
-+				first ? "" : ",", tl.v[i].us,
++		printf("%s{\"ns\":%llu,\"us\":%llu,\"stream\":\"%s\",\"text\":",
++				first ? "" : ",", tl.v[i].ns, tl.v[i].ns / 1000,
 +				tl.v[i].stream == 'e' ? "err" : "out");
 +		json_write_str(tl.v[i].text);
 +		putchar('}');
@@ -983,12 +1018,30 @@ index 0000000..4682a51
 +	}
 +	for (i = keep; i < n; i++) {
 +		char *dir = xasprintf("%s/R%u", root, ids[i]);
-+		char *p;
++		/* Empty the directory first: a timed run also holds `timeline` (and
++		 * future artifacts), and an unlink list would rot every time one is
++		 * added. rmdir still refuses if anything is left. */
++		DIR *d = opendir(dir);
++		int emptied = 1;
 +
-+		p = art_path(dir, "stdout"); unlink(p); free(p);
-+		p = art_path(dir, "stderr"); unlink(p); free(p);
-+		p = art_path(dir, "meta");   unlink(p); free(p);
-+		if (rmdir(dir) == 0)
++		if (d) {
++			struct dirent *de;
++
++			while ((de = readdir(d)) != NULL) {
++				char *f;
++
++				if (de->d_name[0] == '.'
++				 && (de->d_name[1] == '\0'
++				  || (de->d_name[1] == '.' && de->d_name[2] == '\0')))
++					continue;
++				f = xasprintf("%s/%s", dir, de->d_name);
++				if (unlink(f) != 0)
++					emptied = 0;
++				free(f);
++			}
++			closedir(d);
++		}
++		if (emptied && rmdir(dir) == 0)
 +			removed++;
 +		free(dir);
 +	}
@@ -1122,6 +1175,7 @@ index 0000000..4682a51
 +		"quiet\0"         No_argument       "q"
 +		"brief-json\0"    No_argument       "j"
 +	"timestamps\0"    No_argument       "t"
++	"stamp-ns\0"      No_argument       "n"
 +		"brief\0"         Required_argument "b"
 +		"pty\0"           No_argument       "Y"
 +		;
@@ -1185,7 +1239,7 @@ index 0000000..4682a51
 +		}
 +		argv[j] = NULL;
 +	}
-+	opts = getopt32long(argv, "T:k:B:C:D:d:sF:i:Pr:b:qjtY", run_longopts,
++	opts = getopt32long(argv, "T:k:B:C:D:d:sF:i:Pr:b:qjtYn", run_longopts,
 +			&opt_timeout, &opt_kill, &opt_bytes, &opt_capture,
 +			&opt_dir, &opt_cwd, &opt_fmt, &opt_stdin, &opt_prune, &opt_brief);
 +	use_shell = (opts & (1 << 6)) != 0;   /* s */
@@ -1210,10 +1264,24 @@ index 0000000..4682a51
 +		int want_tl = (opts & (1 << 14)) != 0;   /* t: 15th letter */
 +
 +		tl.on = want_tl;
++		tl.nanosec = (opts & (1 << 16)) != 0;   /* n: 17th letter */
 +		if (want_tl) {
 +			struct timeval tv;
 +
-+			tl.start_us = monotonic_us();
++			tl.start_ns = monotonic_ns();
++			if (tl.nanosec) {
++				/* sample the clock to learn its real granularity */
++				unsigned long long a, b, best = ~0ULL;
++				int k;
++
++				for (k = 0; k < 20000; k++) {
++					a = monotonic_ns();
++					do { b = monotonic_ns(); } while (b == a);
++					if (b - a < best)
++						best = b - a;
++				}
++				tl.res_ns = (unsigned)(best > 1 ? best : 1);
++			}
 +			if (gettimeofday(&tv, NULL) == 0)
 +				tl.start_unix_us = (unsigned long long)tv.tv_sec * 1000000
 +						+ (unsigned long long)tv.tv_usec;
@@ -1645,9 +1713,10 @@ index 0000000..4682a51
 +			printf("run=R%u exit_code=%d timed_out=%s cancelled=%s duration_ms=%ld\n",
 +					id, m.exit_code, m.timed_out ? "true" : "false",
 +					m.cancelled ? "true" : "false", m.duration_ms);
-+			printf("timeline_lines=%u shown=%u truncated=%s\n",
++			printf("timeline_lines=%u shown=%u truncated=%s stamp=%s res_ns=%u\n",
 +					tl.n, tl_shown_count(),
-+					(tl.truncated || tl.n > tl_shown_count()) ? "true" : "false");
++					(tl.truncated || tl.n > tl_shown_count()) ? "true" : "false",
++					tl.nanosec ? "ns" : "us", tl.res_ns);
 +			printf("--- timeline ---\n");
 +			tl_print_text();
 +			if (opt_pgid)
@@ -2153,6 +2222,7 @@ index 0000000..4682a51
 +	fflush(stdout);
 +	return rc;
 +}
+
 diff --git a/miscutils/doctor.c b/miscutils/doctor.c
 new file mode 100644
 index 0000000..5b607d5

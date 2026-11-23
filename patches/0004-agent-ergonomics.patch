@@ -1,5 +1,5 @@
 diff --git a/archival/unzip.c b/archival/unzip.c
-index 8a9a90f..e2db50c 100644
+index 8a9a90f..4e32dbe 100644
 --- a/archival/unzip.c
 +++ b/archival/unzip.c
 @@ -212,6 +212,73 @@ struct BUG {
@@ -76,7 +76,71 @@ index 8a9a90f..e2db50c 100644
  
  /* This value means that we failed to find CDF */
  #define BAD_CDF_OFFSET ((uint32_t)0xffffffff)
-@@ -804,6 +871,15 @@ int unzip_main(int argc, char **argv)
+@@ -488,6 +555,52 @@ static int get_lstat_mode(const char *dst_fn)
+ 	return stat_buf.st_mode;
+ }
+ 
++/*
++ * BSD getopt stops at the first non-option, glibc permutes, so on macOS
++ * `unzip a.zip -d out` treated "-d out" as member names: nothing matched and the
++ * exit status was 0 while Linux worked. Peel -d out of argv wherever it appears
++ * instead of reordering, which keeps both getopt implementations on one path.
++ * Returns the new argc; argv is compacted in place.
++ */
++static int unzip_take_dash_d(int argc, char **argv, char **base_dir)
++{
++	int i, w = 1;
++
++	for (i = 1; i < argc; i++) {
++		char *a = argv[i];
++		char *d;
++
++		if (a[0] != '-' || a[1] == '\0')
++			goto keep;
++		d = strchr(a + 1, 'd');
++		if (!d)
++			goto keep;
++		if (d[1] != '\0') {
++			/* -dDIR (or -qdDIR): the directory is attached */
++			if (base_dir && !*base_dir)
++				*base_dir = d + 1;
++			*d = '\0';
++			if (a[1] != '\0')
++				argv[w++] = a;      /* -qd -> -q */
++			continue;
++		}
++		if (i + 1 < argc) {
++			/* -d DIR (or -qd DIR): the directory is the next word */
++			if (base_dir && !*base_dir)
++				*base_dir = argv[i + 1];
++			i++;
++			*d = '\0';
++			if (a[1] != '\0')
++				argv[w++] = a;      /* -qd -> -q */
++			continue;
++		}
++ keep:
++		argv[w++] = a;
++	}
++	argv[w] = NULL;
++	return w;
++}
++
+ int unzip_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
+ int unzip_main(int argc, char **argv)
+ {
+@@ -566,6 +679,10 @@ int unzip_main(int argc, char **argv)
+ // -X	restore user:group ownership
+ 	opts = 0;
+ 	/* '-' makes getopt return 1 for non-options */
++	/* libc words a bad option differently per platform; keep it quiet */
++	opterr = 0;
++	argc = unzip_take_dash_d(argc, argv, &base_dir);
++	optind = 1;
+ 	while ((i = getopt(argc, argv, "-d:lnotpqxjvK")) != -1) {
+ 		switch (i) {
+ 		case 'd':  /* Extract to base directory */
+@@ -804,6 +921,15 @@ int unzip_main(int argc, char **argv)
  				zip.fmt.cmpsize  = cdf.fmt.cmpsize;
  				zip.fmt.ucmpsize = cdf.fmt.ucmpsize;
  			}
@@ -3917,7 +3981,7 @@ index 6cdd641..5c0252f 100644
  {
  #if FIXED_HEADER
 diff --git a/shell/ash.c b/shell/ash.c
-index 9afeaed..65bc5ae 100644
+index 9afeaed..7f0e753 100644
 --- a/shell/ash.c
 +++ b/shell/ash.c
 @@ -906,8 +906,8 @@ out2str(const char *p)
@@ -4372,7 +4436,7 @@ index 9afeaed..65bc5ae 100644
  			case '%':
  			case '#':
  				subtype = (c == '#' ? VSTRIMLEFT : VSTRIMRIGHT);
-@@ -15173,6 +15507,343 @@ extern int etext();
+@@ -15173,6 +15507,351 @@ extern int etext();
   * exception occurs.  When an exception occurs the variable "state"
   * is used to figure out how far we had gotten.
   */
@@ -4385,6 +4449,7 @@ index 9afeaed..65bc5ae 100644
 +static char *ash_max_bytes_opt;     /* --max-bytes N        */
 +static char *ash_capture_limit_opt; /* --capture-limit N    */
 +static int ash_timestamps;          /* --timestamps         */
++static int ash_stamp_ns;            /* --stamp-ns           */
 +static int ash_pty;                 /* --pty / --pty-raw    */
 +static int ash_pty_raw;             /* --pty-raw            */
 +static int ash_pty_split;           /* --pty-split          */
@@ -4444,6 +4509,8 @@ index 9afeaed..65bc5ae 100644
 +		av[k++] = (char *)"--quiet";
 +	if (ash_timestamps)
 +		av[k++] = (char *)"--timestamps";
++	if (ash_stamp_ns)
++		av[k++] = (char *)"--stamp-ns";
 +	/* --pty gives the shell - and so every guest it starts - a controlling
 +	 * terminal. It is dispatched through `run` for the same reason --timeout
 +	 * is: allocating a pty, attaching it as the controlling terminal and
@@ -4501,6 +4568,11 @@ index 9afeaed..65bc5ae 100644
 +			continue;
 +		}
 +		if (strcmp(argv[i], "--timestamps") == 0) {
++			ash_timestamps = 1;
++			continue;
++		}
++		if (strcmp(argv[i], "--stamp-ns") == 0) {
++			ash_stamp_ns = 1;
 +			ash_timestamps = 1;
 +			continue;
 +		}
@@ -4716,12 +4788,12 @@ index 9afeaed..65bc5ae 100644
  int ash_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
  #if NUM_SCRIPTS > 0
  int ash_main(int argc, char **argv)
-@@ -15187,6 +15858,13 @@ int ash_main(int argc UNUSED_PARAM, char **argv)
+@@ -15187,6 +15866,13 @@ int ash_main(int argc UNUSED_PARAM, char **argv)
  
  	dbg_show_dirtymem("dirtymem at main start");
  
 +	ash_strip_agent_opts(argv);
-+	if (ash_timeout_opt || ash_format_opt || ash_timestamps
++	if (ash_timeout_opt || ash_format_opt || ash_timestamps || ash_stamp_ns
 +	 || ash_max_bytes_opt || ash_capture_limit_opt || ash_pty
 +	) {
 +		ash_dispatch_run(argv);       /* does not return */
@@ -4730,7 +4802,7 @@ index 9afeaed..65bc5ae 100644
  	/* Initialize global data */
  	INIT_G_misc();
  	INIT_G_memstack();
-@@ -15241,6 +15919,7 @@ int ash_main(int argc UNUSED_PARAM, char **argv)
+@@ -15241,6 +15927,7 @@ int ash_main(int argc UNUSED_PARAM, char **argv)
  		minusc = get_script_content(-argc - 1);
  #endif
  	login_sh = procargs(argv);
@@ -4739,7 +4811,7 @@ index 9afeaed..65bc5ae 100644
  	TRACE(("Shell args: "));
  	trace_puts_args(argv);
 diff --git a/shell/hush.c b/shell/hush.c
-index afed0b5..6e337e7 100644
+index afed0b5..8ce234f 100644
 --- a/shell/hush.c
 +++ b/shell/hush.c
 @@ -3021,6 +3021,14 @@ static int i_getch(struct in_str *i)
@@ -4772,6 +4844,15 @@ index afed0b5..6e337e7 100644
  	*p = '\0'; /* replace trailing SPECIAL_VAR_SYMBOL */
  	var = arg;
  	exp_saveptr = arg[1] ? (char*)strchr(VAR_ENCODED_SUBST_OPS, arg[1]) : NULL;
+@@ -11105,6 +11121,8 @@ int hush_main(int argc, char **argv)
+ 	/* http://www.opengroup.org/onlinepubs/9699919799/utilities/sh.html */
+ 	flags = (argv[0] && argv[0][0] == '-') ? OPT_login : 0;
+ 	while (1) {
++	/* libc words a bad option differently per platform; keep it quiet */
++	opterr = 0;
+ 		int opt = getopt(argc, argv, "+" /* stop at 1st non-option */
+ 				"cexinsl"
+ #if !BB_MMU
 diff --git a/util-linux/column.c b/util-linux/column.c
 new file mode 100644
 index 0000000..84b0e4f

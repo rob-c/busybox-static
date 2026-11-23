@@ -1,6 +1,6 @@
 diff --git a/miscutils/brief.c b/miscutils/brief.c
 new file mode 100644
-index 0000000..18a98c6
+index 0000000..5776618
 --- /dev/null
 +++ b/miscutils/brief.c
 @@ -0,0 +1,1148 @@
@@ -59,7 +59,7 @@ index 0000000..18a98c6
 +//usage:     "\n	-m N	Show only groups seen at least N times (implies -d)"
 +//usage:     "\n	-o STR	Show only records containing STR (repeatable, OR)"
 +//usage:     "\n	-x STR	Drop records containing STR (repeatable, OR)"
-+//usage:     "\n	-R STR	A record starts at each line containing STR"
++//usage:     "\n	-R STR	A record starts at each line containing literal STR"
 +//usage:     "\n	-q	Bare records: no \"Nx \" and no \"+ \" prefix"
 +//usage:     "\n	-k STR	Keep records containing STR verbatim, never merged"
 +//usage:     "\n	-f LIST	Show only these 1-based fields (1,3-4); input may be reformatted"
@@ -1042,7 +1042,7 @@ index 0000000..18a98c6
 +		 * from the counters, never canned: a complete view with nothing
 +		 * merged emits an empty array. */
 +		if (trunc_by == TB_BUDGET) {
-+			printf("%s\"the byte budget stopped the view: raise -B, or -B 0 for no limit\"",
++			printf("%s\"the byte budget stopped the view: raise -B (-B 0 is a zero budget)\"",
 +					nhint++ ? "," : "");
 +		} else if (trunc_by == TB_SIZE) {
 +			printf("%s\"records larger than the whole budget were dropped: raise -B\"",
