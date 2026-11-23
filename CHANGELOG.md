@@ -4,7 +4,7 @@ Project releases of `busybox-static` on top of upstream busybox
 (`1.39.0.git`). The upstream applet set is unchanged except where noted; the
 `patches/` series is the record of every local change.
 
-## Unreleased — a real terminal for the guest (`run --pty`)
+## 0.5.0 — a real terminal for the guest (`run --pty`)
 
 - `run -Y`/`--pty` launches the guest under a fresh pty: the slave is the child's
   0/1/2, `setsid()` makes the child a session leader and `TIOCSCTTY` makes the
@@ -37,7 +37,7 @@ Project releases of `busybox-static` on top of upstream busybox
 - `tests/streams.sh` skips `linuxrc`: in a container it swallows `SIGTERM`, so
   the applet sweep could never get past it.
 
-## Unreleased — child cleanup when the wrapper is killed
+### Also in 0.5.0 — child cleanup when the wrapper is killed
 
 - `run` and `sh` now start a watchdog in its own process group that kills the
   command's group when the wrapper disappears for **any** reason, `SIGKILL`
