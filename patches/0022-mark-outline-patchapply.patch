@@ -1,9 +1,9 @@
 diff --git a/editors/patchapply.c b/editors/patchapply.c
 new file mode 100644
-index 0000000..f652bcd
+index 0000000..2bceb99
 --- /dev/null
 +++ b/editors/patchapply.c
-@@ -0,0 +1,453 @@
+@@ -0,0 +1,515 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * patchapply - apply a unified diff, all or nothing, with preconditions.
@@ -128,8 +128,7 @@ index 0000000..f652bcd
 +	int in_hunk = 0;
 +	char *old_side = NULL;
 +	struct hunk *h = NULL;
-+	size_t buf_cap = 0, buf_len = 0;
-+	char *buf = NULL;
++
 +
 +	while (i < len) {
 +		size_t start = i, l;
@@ -156,9 +155,10 @@ index 0000000..f652bcd
 +			if (old_side && strcmp(old_side, "/dev/null") == 0)
 +				cur->is_new = 1;   /* creation: the old side is /dev/null */
 +			if (strcmp(p, "/dev/null") == 0) {
-+				cur->is_delete = 1; /* deletion: the new side is */
++				/* deletion: the new side is /dev/null, the old side is the path */
++				cur->is_delete = 1;
 +				free(p);
-+				p = NULL;
++				p = old_side ? xstrdup(old_side) : NULL;
 +			}
 +			cur->path = p;
 +			cur->h = xzalloc(sizeof(struct hunk) * MAX_HUNKS);
@@ -192,7 +192,6 @@ index 0000000..f652bcd
 +			h->old_count = b;
 +			h->new_start = c;
 +			h->new_count = d;
-+			buf_len = 0;
 +			in_hunk = 1;
 +			continue;
 +		}
@@ -200,15 +199,10 @@ index 0000000..f652bcd
 +			if (l && (data[start] == ' ' || data[start] == '+' || data[start] == '-'
 +			     || (data[start] == '\\')))
 +			{
-+				if (buf_len + l + 2 > buf_cap) {
-+					buf_cap = (buf_len + l + 2) * 2 + 256;
-+					buf = xrealloc(buf, buf_cap);
-+				}
-+				memcpy(buf + buf_len, data + start, l);
-+				buf_len += l;
-+				buf[buf_len++] = '\n';
-+				h->body = buf;
-+				h->body_len = buf_len;
++				h->body = xrealloc(h->body, h->body_len + l + 2);
++				memcpy(h->body + h->body_len, data + start, l);
++				h->body_len += l;
++				h->body[h->body_len++] = '\n';
 +			} else {
 +				in_hunk = 0;
 +			}
@@ -231,6 +225,8 @@ index 0000000..f652bcd
 +	unsigned opts;
 +	int dry_run, json = 0, i, rc = 0;
 +	struct pfile files[MAX_FILES];
++	char **outs, **oldvers, **newvers;
++	size_t *outlens;
 +	unsigned nfiles = 0;
 +	char *patch;
 +	size_t plen = 0;
@@ -328,6 +324,12 @@ index 0000000..f652bcd
 +	if (json)
 +		fputs("{\"schema\":1,\"status\":\"ok\",\"dry_run\":true,\"files\":[", stdout);
 +
++	/* Two phases: nothing is written until every file has been verified. A
++	 * patch that half-applies is worse than one that refuses. */
++	outs = xzalloc(sizeof(char *) * nfiles);
++	outlens = xzalloc(sizeof(size_t) * nfiles);
++	oldvers = xzalloc(sizeof(char *) * nfiles);
++	newvers = xzalloc(sizeof(char *) * nfiles);
 +	for (i = 0; i < (int)nfiles; i++) {
 +		struct pfile *f = &files[i];
 +		size_t len = 0, out_len = 0, pos = 0;
@@ -335,6 +337,20 @@ index 0000000..f652bcd
 +		unsigned hi, added = 0, removed = 0;
 +		int ok = 1;
 +
++		if (f->is_delete) {
++			/* verified in phase 1, acted on in phase 3 */
++			outs[i] = NULL;
++			if (!f->path || access(f->path, F_OK) != 0) {
++				if (json)
++					printf("%s{\"path\":\"%s\",\"status\":\"error\",\"code\":\"NOT_FOUND\"}",
++							i ? "," : "", f->path ? f->path : "?");
++				else
++					printf("%s: NOT_FOUND\n", f->path ? f->path : "?");
++				rc = 1;
++			}
++			outlens[i] = 0;
++			continue;
++		}
 +		data = f->path ? read_text(f->path, &len) : NULL;
 +		if (!data && f->is_new) {
 +			data = xzalloc(1);   /* creation: nothing on disk yet */
@@ -417,15 +433,12 @@ index 0000000..f652bcd
 +			else
 +				printf("%s: HUNK_MISMATCH\n", f->path);
 +			rc = 1;
-+		} else if (dry_run) {
-+			if (json)
-+				printf("%s{\"path\":\"%s\",\"status\":\"ok\",\"hunks\":%u,"
-+						"\"added\":%u,\"removed\":%u,\"old_version\":\"sha256:%s\","
-+						"\"new_version\":\"sha256:%s\"}",
-+						i ? "," : "", f->path, f->nh, added, removed, hex_old, hex_new);
-+			else
-+				printf("%s: ok hunks=%u +%u -%u\n", f->path, f->nh, added, removed);
 +		} else {
++			outs[i] = out;
++			outlens[i] = out_len;
++			oldvers[i] = xasprintf("sha256:%s", hex_old);
++			newvers[i] = xasprintf("sha256:%s", hex_new);
++			if (0) {
 +			char *tmp = xasprintf("%s.patchapply.%u", f->path, (unsigned)getpid());
 +			int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
 +
@@ -448,10 +461,59 @@ index 0000000..f652bcd
 +				printf("%s: applied hunks=%u +%u -%u\n", f->path, f->nh, added, removed);
 +			}
 +			free(tmp);
++			}
 +		}
-+		free(out);
 +		free(data);
 +	}
++	/* phase 3: act only when every file verified */
++	if (rc == 0) {
++		for (i = 0; i < (int)nfiles; i++) {
++			struct pfile *f = &files[i];
++			int first = 1;
++
++			if (f->is_delete) {
++				if (!dry_run && unlink(f->path) != 0) {
++					bb_perror_msg("%s", f->path);
++					rc = 1;
++					continue;
++				}
++				if (json) {
++					printf("%s{\"path\":\"%s\",\"status\":\"ok\",\"deleted\":true",
++							first ? "" : ",", f->path);
++					printf(",\"dry_run\":%s}", dry_run ? "true" : "false");
++				} else
++					printf("%s: %s\n", f->path, dry_run ? "would delete" : "deleted");
++				continue;
++			}
++			if (!dry_run) {
++				char *tmp = xasprintf("%s.patchapply.%u", f->path, (unsigned)getpid());
++				int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
++
++				if (fd < 0 || full_write(fd, outs[i], outlens[i]) != (ssize_t)outlens[i]
++				 || (fd >= 0 && close(fd) != 0) || rename(tmp, f->path) != 0
++				) {
++					bb_perror_msg("%s", f->path);
++					unlink(tmp);
++					rc = 1;
++					free(tmp);
++					continue;
++				}
++				free(tmp);
++			}
++			free(outs[i]);
++			if (json) {
++				printf("%s{\"path\":\"%s\",\"status\":\"ok\",\"hunks\":%u,"
++						"\"old_version\":%s,\"new_version\":%s,\"dry_run\":%s}",
++						first ? "" : ",", f->path, f->nh, oldvers[i], newvers[i],
++						dry_run ? "true" : "false");
++			} else {
++				printf("%s: %s hunks=%u\n", f->path,
++						dry_run ? "ok" : "applied", f->nh);
++			}
++		}
++	}
++	if (rc != 0 && !json)
++		fputs("patchapply: aborted, nothing written\n", stderr);
 +	if (json)
 +		fputs("]}\n", stdout);
 +	fflush(stdout);
@@ -534,10 +596,10 @@ index 0000000..745847d
 +}
 diff --git a/miscutils/outline.c b/miscutils/outline.c
 new file mode 100644
-index 0000000..ca0d5b7
+index 0000000..eb0728c
 --- /dev/null
 +++ b/miscutils/outline.c
-@@ -0,0 +1,295 @@
+@@ -0,0 +1,350 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * outline - definitions in a file, with line, byte offset and version.
@@ -620,13 +682,47 @@ index 0000000..ca0d5b7
 +	const char *p = line;
 +	const char *end = line + len;
 +
++	static const char *const c_words[] = {
++		"for", "if", "while", "switch", "return", "sizeof", "do", "else",
++		"case", "goto", "typedef", "static", "const", "unsigned", "signed",
++		"void", "int", "char", "long", "short", "float", "double",
++	};
++	int indented = 0;
++
 +	*name = NULL;
 +	*name_len = 0;
 +
-+	while (p < end && (*p == ' ' || *p == '\t'))
++	while (p < end && (*p == ' ' || *p == '\t')) {
 +		p++;
++		indented = 1;
++	}
 +	if (p >= end)
 +		return NULL;
++	/* comments and preprocessor lines are not definitions */
++	if ((p + 1 < end && p[0] == '/' && (p[1] == '/' || p[1] == '*'))
++	 || *p == '*'
++	 || (*p == '#' && (p + 1 >= end || p[1] != ' ')))  /* '#' is a heading, not a directive */
++		return NULL;
++	/* drop declaration qualifiers so 'export class C {' still reads as a class */
++	for (;;) {
++		static const char *const qual[] = {
++			"export ", "declare ", "abstract ", "default ", "static ",
++			"public ", "private ", "protected ", "readonly ", "async ",
++			"extern ", "inline ", "unsafe ", "final ",
++		};
++		unsigned q;
++
++		for (q = 0; q < ARRAY_SIZE(qual); q++) {
++			size_t ql = strlen(qual[q]);
++
++			if ((size_t)(end - p) > ql && strncmp(p, qual[q], ql) == 0) {
++				p += ql;
++				break;
++			}
++		}
++		if (q == ARRAY_SIZE(qual))
++			break;
++	}
 +
 +	/* Markdown headings */
 +	if (*p == '#') {
@@ -665,6 +761,9 @@ index 0000000..ca0d5b7
 +	 || is_prefixed_with(p, "union ")
 +	 || is_prefixed_with(p, "type ")
 +	) {
++		if (indented && (is_prefixed_with(p, "struct ") || is_prefixed_with(p, "union ")))
++			return NULL;
++		{
 +		const char *k = is_prefixed_with(p, "class ") ? "class"
 +			: is_prefixed_with(p, "struct ") ? "struct"
 +			: is_prefixed_with(p, "enum ") ? "enum"
@@ -684,6 +783,7 @@ index 0000000..ca0d5b7
 +			return k;
 +		}
 +		return NULL;
++		}
 +	}
 +
 +	/* A line ending in ')' — with the brace here or on the next line — is a
@@ -731,6 +831,23 @@ index 0000000..ca0d5b7
 +				id--;
 +			if (id == id_end)
 +				return NULL;
++			{
++				unsigned w;
++				size_t nl = (size_t)(id_end - id);
++				int caps = 1, any = 0;
++
++				for (w = 0; w < ARRAY_SIZE(c_words); w++)
++					if (strlen(c_words[w]) == nl && strncmp(id, c_words[w], nl) == 0)
++						return NULL;
++				for (w = 0; w < nl; w++) {
++					if (id[w] >= 'a' && id[w] <= 'z')
++						caps = 0;
++					if (id[w] != '_')
++						any = 1;
++				}
++				if (caps && any)
++					return NULL;   /* APPLET_NOEXEC(...) is a macro call */
++			}
 +			*name = id;
 +			*name_len = (size_t)(id_end - id);
 +			return "function";

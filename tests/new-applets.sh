@@ -64,6 +64,33 @@ printf 'int add(int a)\n{\n}\nint proto(int a);\n' > fn.c
 ck "outline.c_function" "1" "$("$BB" outline fn.c | "$BB" grep -c ':function:.*add')"
 ck "outline.c_prototype_skipped" "0" "$("$BB" outline fn.c | "$BB" grep -c 'proto')"
 
+sec "R. real input: a git diff, and all-or-nothing"
+printf 'one\ntwo\nthree\nfour\n' > r.txt
+printf -- 'diff --git a/r.txt b/r.txt\nindex 111..222 100644\n--- a/r.txt\n+++ b/r.txt\n@@ -1,4 +1,4 @@\n one\n-two\n+TWO\n three\n four\n' > r.diff
+ck "patch.git_diff_rc"   "0" "$("$BB" patchapply r.diff >/dev/null 2>&1; echo $?)"
+ck "patch.git_diff_body" "TWO" "$(sed -n 2p r.txt)"
+printf 'a\n' > x.txt; printf 'b\n' > y.txt
+printf -- '--- a/x.txt\n+++ b/x.txt\n@@ -1 +1 @@\n-a\n+AA\n--- a/y.txt\n+++ b/y.txt\n@@ -1 +1 @@\n-zzz\n+BB\n' > mixed.patch
+ck "patch.mixed_rc"      "1" "$("$BB" patchapply mixed.patch >/dev/null 2>&1; echo $?)"
+ck "patch.mixed_first_untouched" "a" "$(cat x.txt)"
+ck "patch.mixed_second_untouched" "b" "$(cat y.txt)"
+printf -- '--- a/x.txt\n+++ b/x.txt\n@@ -1 +1 @@\n-a\n+AA\n--- a/y.txt\n+++ b/y.txt\n@@ -1 +1 @@\n-b\n+BB\n' > both.patch
+ck "patch.two_files_rc"  "0" "$("$BB" patchapply both.patch >/dev/null 2>&1; echo $?)"
+ck "patch.two_files_a"   "AA" "$(cat x.txt)"
+ck "patch.two_files_b"   "BB" "$(cat y.txt)"
+printf 'keep\n' > k.txt
+printf -- '--- a/k.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-keep\n' > del.patch
+ck "patch.delete_rc"     "0" "$("$BB" patchapply del.patch >/dev/null 2>&1; echo $?)"
+ck "patch.deleted"       "0" "$([ -e k.txt ] && echo 1 || echo 0)"
+
+sec "O3. outline on real shapes"
+printf '//applet:IF_X(APPLET_NOEXEC(x, x_main, D, S, x))\nstatic int f(int a)\n{\n}\nstruct s {\n\tint member;\n};\nexport class C {\n}\n' > real.c
+ck "outline.no_macro_call" "0" "$("$BB" outline real.c | "$BB" grep -c 'APPLET_NOEXEC')"
+ck "outline.no_c_keyword"  "0" "$("$BB" outline real.c | "$BB" grep -c ':function:.*:for')"
+ck "outline.top_struct"    "1" "$("$BB" outline real.c | "$BB" grep -c ':struct:.*:s$')"
+ck "outline.member_skipped" "0" "$("$BB" outline real.c | "$BB" grep -c 'member')"
+ck "outline.export_class"  "1" "$("$BB" outline real.c | "$BB" grep -c ':class:.*:C$')"
+
 sec "H. the binary documents its own flags"
 ck "help.log_since"       "1" "$("$BB" log --help 2>&1 | "$BB" grep -c -- '--since')"
 ck "help.log_summary"     "1" "$("$BB" log --help 2>&1 | "$BB" grep -c -- '--summary')"
