@@ -4,6 +4,29 @@ Project releases of `busybox-static` on top of upstream busybox
 (`1.39.0.git`). The upstream applet set is unchanged except where noted; the
 `patches/` series is the record of every local change.
 
+## 0.5.1 — fixes from the plugin's defect reports
+
+- **`run --prune N` works with `--timestamps`.** It unlinked a fixed list
+  (`stdout`, `stderr`, `meta`) and then `rmdir` failed on the extra `timeline`
+  file, so a wrapped session — which always asks for the timeline — never pruned.
+  The directory is now emptied entry by entry: 8 runs with `-t --prune 3` leave 3.
+- **`unzip a.zip -d DIR` extracts.** BSD getopt stops at the first non-option, so
+  on macOS `-d out` was read as member names: nothing matched and the exit status
+  was 0 while the same command worked on Linux. `-d DIR`, `-dDIR` and `-qd DIR`
+  are peeled out of argv wherever they appear.
+- **The text timeline keeps head *and* tail.** `run -t` printed only the first M
+  lines; a failing suite therefore hid its failure at the end and the plugin had
+  to spend a retrieval on `log RUN --lines N-40:N`. Three quarters of the budget
+  now go to the head, one quarter to the tail, with one marker between.
+- **One id per diagnostic.** `--error-ids` printed both `E FAILED` (from
+  getopt's option message) and `E USAGE` (from `bb_show_usage`) for a single
+  usage error. An unknown option is now marked as a usage error and
+  `bb_show_usage` does not repeat an id that already went to stdout.
+- **brief's budget hint is true again**: it said `-B 0` meant "no limit" while
+  `-B 0` is a zero budget, and `-R` is now documented as literal.
+- New `tests/plugin-reports.sh` — 26 checks named after the report each one
+  guards. `tests/streams.sh` is 37/37 again.
+
 ## 0.5.0 — a real terminal for the guest (`run --pty`)
 
 - `run -Y`/`--pty` launches the guest under a fresh pty: the slave is the child's

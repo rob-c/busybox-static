@@ -496,6 +496,7 @@ Runnable against any built binary:
 ./tests/timeout-resilience-matrix.sh dist/darwin-arm64/bin/busybox # 200 more
 ./tests/wrapper-signals.sh dist/darwin-arm64/bin/busybox # 21 kill-the-wrapper checks
 ./tests/reaper.sh        dist/darwin-arm64/bin/busybox # 50 watchdog checks
+./tests/plugin-reports.sh dist/darwin-arm64/bin/busybox # 26 checks from the plugin's reports
 ./tests/pty.sh           dist/darwin-arm64/bin/busybox # 100 pty/tty checks
 ./tests/streams.sh       dist/darwin-arm64/bin/busybox # 37 stream-discipline checks
 ./tests/brief.sh         dist/darwin-arm64/bin/busybox # 910 brief checks
