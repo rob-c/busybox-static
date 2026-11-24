@@ -1,37 +1,43 @@
 ---
-title: "Releasing 0.6.0: pack-release's printed tag is the upstream one, not the project version"
+title: "Timeline stamps are trimmed, not padded: fix the test pattern, not the applet"
 kind: "gotcha"
-summary: "pack-release.sh prints an upstream tag (v1.39.0-aac079e) that already exists; project releases tag with the project version (v0.6.0) while assets keep the upstream name."
-tags: [release, pack-release, tagging, gh, 0.6.0]
+summary: "`run -t` stamps are trimmed (`[0.019841 out]`), so assert 1-6 fractional digits (1-9 with -n), not a fixed width; 0.6.1 shipped with that fix."
+tags: [run, timestamps, testing, release, 0.6.1]
 created: "2026-11-24T01:03:10.167Z"
-updated: "2026-11-24T01:03:10.167Z"
+updated: "2026-11-24T09:47:32.475Z"
 ---
-`pack-release.sh` prints a `next:` command using the **upstream** tag (`v1.39.0-aac079e`), which already exists as a release — following it would attempt a duplicate. Project releases are tagged with the project version instead (`v0.5.1`, `v0.6.0`), while the asset filenames keep the upstream name.
+`run -t` stamps are trimmed, not zero-padded: `[   0.019841 out]` became `[0.019841 out]`, the seconds field is unpadded and fractional digits are trimmed (`0.019841`, `1.770`, `13.22`). Any check that asserts a fixed width now fails for a reason that has nothing to do with the applet.
 
 ```mermaid
 flowchart LR
-  A["./build-all.sh<br/>6 targets + lipo"] --> B["./pack-release.sh<br/>release/v1.39.0-&lt;sha&gt;/"]
-  B --> C["TAG=v0.6.0<br/>(project version, not the printed one)"]
-  C --> D["gh release create $TAG --draft ... bundle/*"]
-  D --> E["verify 64 assets, then --draft=false --latest"]
+  A["old: [   0.019841 out]"] --> B["new: [0.019841 out]"]
+  B --> C["us: 1-6 fractional digits"]
+  B --> D["ns: 1-9 fractional digits"]
 ```
 
-## What 0.6.0 did
+## What to assert instead
 
 ```sh
-./build-all.sh                                  # wipes build dirs, 6 targets + universal
-./test.sh dist/darwin-arm64/bin/busybox         # 198 passed, 0 failed
-docker run --rm -v "$PWD:/w:ro" almalinux:9 bash -c \
-  'cp /w/test.sh /tmp/; chmod +x /tmp/test.sh; /tmp/test.sh /w/dist/linux-arm64/bin/busybox'   # 197 passed
-./pack-release.sh                               # bundle + SHA256SUMS + NOTES.md
-gh release create v0.6.0 --draft --title "busybox-static 0.6.0 (busybox 1.39.0.git)" \
-	--notes-file /tmp/notes-0.6.0.md --target main release/v1.39.0-aac079e/*
-gh release edit v0.6.0 --draft=false --latest
+# microseconds (default)          # nanoseconds (-n)
+'^\[[0-9]+\.[0-9]{1,6} out\] '    '^\[[0-9]+\.[0-9]{1,9} out\] '
 ```
 
-Verification that actually mattered before publishing: `otool -L` on both `-pure` slices shows exactly **one** dylib, `llvm-readelf -d` on both Linux binaries shows **0** `NEEDED` (static), `shasum -c SHA256SUMS` passes all 31 entries, and the suite numbers are recorded in the commit message.
+A `grep -c` on a fixed-width pattern (`{6}` or `{9}`) returns 0 and the suite reports a dozen failures across sections 24, 24b and 25 — the stamp code is fine, the pattern is stale.
 
-## The two naming traps
+## Shipped in 0.6.1
 
-- **The bundle directory is named after upstream, not the project version.** `release/v1.39.0-aac079e/` fed a `v0.6.0` release, so every asset reads `busybox-static-1.39.0-aac079e-*`. That is the house convention, but it reads as a mistake on the release page.
-- **The release body should start with the project version line** (`busybox-static 0.6.0 (busybox 1.39.0.git)`) followed by the CHANGELOG section, then the licence and asset table from the generated `NOTES.md`. The generated file alone never mentions 0.6.0.
+- `json -f FILE -g .a.b --set --value 42` and `--delete`, with `--json-value` for a typed value and `--dry-run` to print without writing. The document is re-serialised only after the edit applies to a parsed tree, so a parse or path failure leaves the file untouched.
+- Compact timeline stamps as above.
+- `tests/agent-ops-sweep.sh` updated to 1-6 and 1-9 digit patterns.
+
+## Release steps that worked
+
+```sh
+./build-all.sh && ./test.sh dist/darwin-arm64/bin/busybox
+./pack-release.sh
+gh release create v0.6.1 --draft --title "busybox-static 0.6.1 (busybox 1.39.0.git)" \
+	--notes-file /tmp/notes-0.6.1.md --target main release/v1.39.0-aac079e/*
+gh release edit v0.6.1 --draft=false --latest      # after checking 64 assets
+```
+
+Verified before publishing: `test.sh` 198/0 on darwin-arm64 and 197/0 in almalinux:9, `agent-ops` 1299/0 darwin and 1318/0 linux, `agent-ops-sweep` 1311/0 and 1310/0, one dylib in each `-pure` slice, zero `NEEDED` in both Linux binaries, and all 31 `SHA256SUMS` entries OK.
