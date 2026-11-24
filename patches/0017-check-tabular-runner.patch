@@ -1,0 +1,236 @@
+diff --git a/miscutils/check.c b/miscutils/check.c
+new file mode 100644
+index 0000000..d17eb78
+--- /dev/null
++++ b/miscutils/check.c
+@@ -0,0 +1,230 @@
++/* vi: set sw=4 ts=4: */
++/*
++ * check - run a table of shell test cases and report pass/fail.
++ *
++ * Licensed under GPLv2, see file LICENSE in this source tree.
++ */
++//config:config CHECKTBL
++//config:	bool "check (6 kb)"
++//config:	default n
++//config:	help
++//config:	  Run a table of test cases, one per line:
++//config:	      name | command | want_exit | want_substring
++//config:	  Reports pass/fail per case plus a summary, or JSON with
++//config:	  --format json. Comments start with '#'. Named 'check' because
++//config:	  'test' and '[' are already applets.
++
++//applet:IF_CHECKTBL(APPLET_NOEXEC(check, check_main, BB_DIR_USR_BIN, BB_SUID_DROP, check))
++
++//kbuild:lib-$(CONFIG_CHECKTBL) += check.o
++
++//usage:#define check_trivial_usage
++//usage:       "[-f FILE] [-v] [--format json]"
++//usage:#define check_full_usage "\n\n"
++//usage:       "Run test cases from FILE (default: stdin)\n"
++//usage:     "\n	-f FILE	Case table"
++//usage:     "\n	-v	Show output of failing cases"
++//usage:     "\n	--format json	Structured output (schema 1)"
++
++#include "libbb.h"
++
++static void put_json_string(const char *s)
++{
++	putchar('"');
++	for (; s && *s; s++) {
++		if (*s == '"' || *s == '\\')
++			printf("\\%c", *s);
++		else if ((unsigned char)*s < 0x20)
++			printf("\\u%04x", (unsigned char)*s);
++		else
++			putchar(*s);
++	}
++	putchar('"');
++}
++#include <sys/wait.h>
++
++static const char check_longopts[] ALIGN1 =
++	"file\0"   Required_argument "f"
++	"verbose\0" No_argument      "v"
++	"format\0" Required_argument "F"
++	;
++#define check_longopts (check_longopts)
++
++#define MAX_OUT 8192
++
++struct result {
++	char *name;
++	int want_exit, got_exit;
++	int ok;
++	char *why;
++	char out[MAX_OUT];
++};
++
++static int run_case(const char *cmd, char *out, size_t outsz)
++{
++	int fds[2];
++	pid_t pid;
++	int st;
++	ssize_t n;
++	size_t used = 0;
++
++	if (pipe(fds) != 0)
++		return -1;
++	fflush_all();
++	pid = fork();
++	if (pid < 0) {
++		close(fds[0]);
++		close(fds[1]);
++		return -1;
++	}
++	if (pid == 0) {
++		close(fds[0]);
++		dup2(fds[1], 1);
++		close(fds[1]);
++		execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
++		_exit(127);
++	}
++	close(fds[1]);
++	while ((n = safe_read(fds[0], out + used, outsz - 1 - used)) > 0) {
++		used += n;
++		if (used >= outsz - 1)
++			break;
++	}
++	out[used] = '\0';
++	close(fds[0]);
++	if (waitpid(pid, &st, 0) < 0)
++		return -1;
++	if (WIFEXITED(st))
++		return WEXITSTATUS(st);
++	return 128 + WTERMSIG(st);
++}
++
++static char *pc_trim(char *s)
++{
++	char *e;
++
++	while (*s == ' ' || *s == '\t')
++		s++;
++	e = s + strlen(s);
++	while (e > s && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\n' || e[-1] == '\r'))
++		*--e = '\0';
++	return s;
++}
++
++static void json_str(const char *s)
++{
++	putchar('"');
++	for (; *s; s++) {
++		if (*s == '"' || *s == '\\')
++			printf("\\%c", *s);
++		else if ((unsigned char)*s < 0x20)
++			printf("\\u%04x", (unsigned char)*s);
++		else
++			putchar(*s);
++	}
++	putchar('"');
++}
++
++int check_main_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
++int check_main_main(int argc UNUSED_PARAM, char **argv)
++{
++	const char *opt_file = NULL, *opt_fmt = NULL;
++	int opts, json_out, verbose = 0;
++	struct result *res;
++	unsigned n = 0, cap = 64, passed = 0, failed = 0, i;
++	char *buf, *save, *line;
++
++	xfunc_error_retval = 2;
++	opts = getopt32long(argv, "f:v" "F:", check_longopts, &opt_file, &opt_fmt);
++	xfunc_error_retval = 1;   /* past option parsing: failures are operational */
++	verbose = (opts & 2) != 0;   /* v */
++	json_out = opt_fmt && strcmp(opt_fmt, "json") == 0;
++	if (opt_fmt && strcmp(opt_fmt, "json") != 0 && strcmp(opt_fmt, "text") != 0) {
++		bb_error_msg("unknown format %s", opt_fmt);
++		return 2;
++	}
++
++	buf = xmalloc_open_read_close(opt_file ? opt_file : "/dev/stdin", NULL);
++	if (!buf) {
++		int e = errno;
++
++		if (json_out) {
++			printf("{\"schema\":1,\"status\":\"error\",\"code\":\"NOT_FOUND\","
++					"\"message\":");
++			put_json_string(strerror(e));
++			fputs("}\n", stdout);
++		} else {
++			errno = e;
++			bb_perror_msg("%s", opt_file ? opt_file : "stdin");
++		}
++		return 1;
++	}
++
++	res = xzalloc(sizeof(res[0]) * cap);
++	save = buf;
++	while ((line = strsep(&save, "\n")) != NULL) {
++		char *name, *cmd, *want, *sub;
++		struct result *r;
++
++		if (!*pc_trim(line) || *pc_trim(line) == '#')
++			continue;
++		name = strsep(&line, "|");
++		cmd = strsep(&line, "|");
++		want = strsep(&line, "|");
++		sub = line;
++		if (!cmd)
++			continue;
++		if (n == cap) {
++			cap *= 2;
++			res = xrealloc(res, sizeof(res[0]) * cap);
++		}
++		r = &res[n++];
++		r->name = xstrdup(pc_trim(name));
++		r->want_exit = want ? atoi(pc_trim(want)) : 0;
++		r->got_exit = run_case(pc_trim(cmd), r->out, sizeof(r->out));
++		r->ok = (r->got_exit == r->want_exit);
++		if (r->ok && sub && *pc_trim(sub)) {
++			if (!strstr(r->out, pc_trim(sub))) {
++				r->ok = 0;
++				r->why = xasprintf("missing %s", pc_trim(sub));
++			}
++		} else if (!r->ok) {
++			r->why = xasprintf("exit %d, want %d", r->got_exit, r->want_exit);
++		}
++		if (r->ok)
++			passed++;
++		else
++			failed++;
++	}
++
++	if (json_out) {
++		printf("{\"schema\":1,\"status\":\"%s\",\"total\":%u,\"passed\":%u,"
++				"\"failed\":%u,\"cases\":[",
++				failed ? "error" : "ok", n, passed, failed);
++		for (i = 0; i < n; i++) {
++			if (i)
++				putchar(',');
++			fputs("{\"name\":", stdout);
++			json_str(res[i].name);
++			printf(",\"ok\":%s,\"exit\":%d,\"want_exit\":%d",
++					res[i].ok ? "true" : "false", res[i].got_exit, res[i].want_exit);
++			if (!res[i].ok && res[i].why) {
++				fputs(",\"why\":", stdout);
++				json_str(res[i].why);
++			}
++			putchar('}');
++		}
++		fputs("]}\n", stdout);
++	} else {
++		for (i = 0; i < n; i++) {
++			printf("%s %s", res[i].ok ? "ok  " : "FAIL", res[i].name);
++			if (!res[i].ok && res[i].why)
++				printf(": %s", res[i].why);
++			putchar('\n');
++			if (!res[i].ok && verbose)
++				printf("--- output ---\n%s---\n", res[i].out);
++		}
++		printf("total=%u passed=%u failed=%u\n", n, passed, failed);
++	}
++	fflush_stdout_and_exit(failed ? 1 : 0);
++}

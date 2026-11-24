@@ -1,0 +1,141 @@
+diff --git a/include/sysinfo_compat.h b/include/sysinfo_compat.h
+new file mode 100644
+index 0000000..028d094
+--- /dev/null
++++ b/include/sysinfo_compat.h
+@@ -0,0 +1,135 @@
++/* vi: set sw=4 ts=4: */
++/*
++ * shim for the one Linux API that free, uptime, fallocate and ps rely on.
++ * Kept entirely in this new header so the port never has to edit
++ * include/platform.h or libbb/platform.c, which patches 0002 and 0003 own.
++ *
++ * Licensed under GPLv2, see file LICENSE in this source tree.
++ */
++#ifndef BB_SYSINFO_COMPAT_H
++#define BB_SYSINFO_COMPAT_H
++
++#if !defined(__linux__)
++
++/* free/uptime/ps read struct sysinfo.  Off Linux there is none, so provide a
++ * minimal one, filled from sysctls below. */
++struct sysinfo {
++	unsigned long uptime;
++	unsigned long loads[3];
++	unsigned long totalram;
++	unsigned long freeram;
++	unsigned long sharedram;
++	unsigned long bufferram;
++	unsigned long totalswap;
++	unsigned long freeswap;
++	unsigned short procs;
++	unsigned long mem_unit;
++};
++
++#if defined(__APPLE__)
++#include <sys/sysctl.h>
++#include <mach/mach.h>
++#include <mach/vm_statistics.h>
++#include <mach/mach_host.h>
++
++static int bb_sysinfo(struct sysinfo *si)
++{
++	struct timeval boot, now;
++	size_t len;
++	uint64_t memsize = 0;
++	vm_statistics64_data_t vm;
++	mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
++	double loads[3];
++	int mib[2];
++
++	memset(si, 0, sizeof(*si));
++
++	mib[0] = CTL_KERN;
++	mib[1] = KERN_BOOTTIME;
++	len = sizeof(boot);
++	if (sysctl(mib, 2, &boot, &len, NULL, 0) == 0) {
++		gettimeofday(&now, NULL);
++		if (now.tv_sec > boot.tv_sec)
++			si->uptime = (unsigned long)(now.tv_sec - boot.tv_sec);
++	}
++
++	len = sizeof(memsize);
++	if (sysctlbyname("hw.memsize", &memsize, &len, NULL, 0) == 0)
++		si->totalram = (unsigned long)memsize;
++
++	if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
++			(host_info64_t)&vm, &count) == KERN_SUCCESS
++	) {
++		unsigned long page = (unsigned long)vm_page_size;
++
++		si->freeram = (unsigned long)
++			(((uint64_t)vm.free_count + vm.speculative_count) * page);
++		si->bufferram = (unsigned long)
++			(((uint64_t)vm.purgeable_count + vm.wire_count) * page);
++	}
++
++	si->mem_unit = 1;
++	{
++		/* free(1) prints Swap: total/used/free from these.  macOS keeps swap
++		 * accounting in vm.swapusage rather than in the VM stats. */
++		struct xsw_usage xsw;
++		size_t xlen = sizeof(xsw);
++		if (sysctlbyname("vm.swapusage", &xsw, &xlen, NULL, 0) == 0) {
++			si->totalswap = (unsigned long)xsw.xsu_total;
++			si->freeswap = (unsigned long)xsw.xsu_avail;
++		}
++	}
++	if (getloadavg(loads, 3) == 3) {
++		/* uptime prints these via LOAD_INT/LOAD_FRAC, i.e. /2048 */
++		si->loads[0] = (unsigned long)(loads[0] * 2048.0);
++		si->loads[1] = (unsigned long)(loads[1] * 2048.0);
++		si->loads[2] = (unsigned long)(loads[2] * 2048.0);
++	}
++	return 0;
++}
++#define sysinfo(info) bb_sysinfo(info)
++
++/* Reclaimable page cache: inactive + purgeable pages.  One definition for
++ * free, vmstat and top, so the three do not report different "cached" values
++ * for the same machine. */
++static unsigned long long bb_darwin_cached_bytes(void)
++{
++	vm_statistics64_data_t vm;
++	mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
++
++	memset(&vm, 0, sizeof(vm));
++	if (host_statistics64(mach_host_self(), HOST_VM_INFO64,
++			(host_info64_t)&vm, &count) != KERN_SUCCESS)
++		return 0;
++	return ((unsigned long long)vm.inactive_count + vm.purgeable_count)
++		* (unsigned long long)vm_page_size;
++}
++
++
++/* macOS has no posix_fallocate: F_PREALLOCATE does the work, then the file is
++ * grown so the semantics match glibc (size becomes offset+len). */
++#include <sys/fcntl.h>
++static int bb_posix_fallocate(int fd, off_t offset, off_t len)
++{
++	struct fstore fst;
++	struct stat st;
++
++	memset(&fst, 0, sizeof(fst));
++	fst.fst_flags = F_ALLOCATEALL;
++	fst.fst_posmode = F_PEOFPOSMODE;
++	fst.fst_offset = offset;
++	fst.fst_length = len;
++	if (fcntl(fd, F_PREALLOCATE, &fst) == -1)
++		return errno ? errno : EIO;
++	if (fstat(fd, &st) == 0 && st.st_size < offset + len) {
++		if (ftruncate(fd, offset + len) != 0)
++			return errno ? errno : EIO;
++	}
++	return 0;
++}
++#define posix_fallocate(fd, off, len) bb_posix_fallocate(fd, off, len)
++#endif /* __APPLE__ */
++
++#endif /* !__linux__ */
++
++#endif

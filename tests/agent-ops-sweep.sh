@@ -761,8 +761,135 @@ ck "sh -c keeps --timestamps inside the command" "1" \
 ck "run -t --brief rc" "0" "$("$BB" run -t --brief stdout -- "$BB" sh -c 'echo x' >/dev/null 2>&1; echo $?)"
 ck "run -t --quiet still shows the timeline" "1" \
 	"$("$BB" run -t --quiet -- "$BB" sh -c 'echo q' 2>/dev/null | "$BB" grep -c '\[ *[0-9]*\.[0-9]* out\] q')"
+# a private sentinel: `sleep 5` as a pattern also matches an unrelated
+# `sleep 540` from another session and would make a later pgrep lie
+sec "24f. run json: how it ended, what ran, what changed"
+# one field from the single-line JSON: strings, numbers and booleans
+fs() { "$BB" sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p" "$2" | "$BB" head -1; }
+fn() { "$BB" sed -n "s/.*\"$1\":\([0-9][0-9]*\).*/\1/p" "$2" | "$BB" head -1; }
+fb() { "$BB" sed -n "s/.*\"$1\":\([a-z][a-z]*\).*/\1/p" "$2" | "$BB" head -1; }
+"$BB" run -F json -- "$BB" sh -c 'exit 3' > "$T/m" 2>/dev/null
+ck "exit_kind exited" 'exited' "$(fs exit_kind "$T/m")"
+"$BB" run -F json -- "$BB" sh -c 'kill -TERM $$' > "$T/m" 2>/dev/null
+ck "exit_kind signalled" 'signalled' "$(fs exit_kind "$T/m")"
+ck "signal number" "15" "$(fn signal "$T/m")"
+ck "signal name" 'TERM' "$(fs signal_name "$T/m")"
+"$BB" run -F json -T 1 -- "$BB" sleep 9 > "$T/m" 2>/dev/null
+ck "exit_kind timed_out" 'timed_out' "$(fs exit_kind "$T/m")"
+"$BB" run -F json -- "$BB" sh -c 'echo hi' > "$T/m" 2>/dev/null
+ck "argv is an array" "1" "$("$BB" grep -c '"argv":\["' "$T/m")"
+ck "argv0_resolved is absolute" "1" "$(fs argv0_resolved "$T/m" | "$BB" grep -c '^/')"
+ck "cpu and rss present" "1" \
+	"$("$BB" grep -Eq '"cpu_user_ms":[0-9]+,"cpu_sys_ms":[0-9]+,"max_rss_kb":[0-9]+' "$T/m" && echo 1)"
+ck "stdout line count" "1" "$(fn stdout_lines "$T/m")"
+ck "stderr line count" "0" "$(fn stderr_lines "$T/m")"
+ck "binary flag" "false" "$(fb binary "$T/m")"
+ck "final newline flag" "true" "$(fb final_newline "$T/m")"
+ck "dropped_bytes" "0" "$(fn dropped_bytes "$T/m")"
+ck "replay is a shell line" "1" "$(fs replay "$T/m" | "$BB" grep -c '^cd ')"
+ck "inputs_hash is 64 hex" "1" \
+	"$("$BB" sed -n 's/.*"inputs_hash":"\([0-9a-f]*\)".*/\1/p' "$T/m" | "$BB" grep -Ec '^[0-9a-f]{64}$')"
+ck "busybox_version present" "1" "$(fs busybox_version "$T/m" | "$BB" grep -c '^1\.')"
+ck "view_next points at log" "1" \
+	"$("$BB" run -B 5 -F json -- "$BB" sh -c 'seq 1 200' 2>/dev/null | "$BB" grep -c '"view_next":"log -D ')"
+mkdir -p "$T/eff"
+printf 'old\n' > "$T/eff/keep.txt"
+( cd "$T/eff" && "$BB" run -x -F json -- "$BB" sh -c 'printf "hi\n" > new.txt; printf "changed\n" > keep.txt' > "$T/m2" 2>/dev/null )
+ck "effects names the added file" "1" "$("$BB" grep -c '"op":"added","path":"new.txt"' "$T/m2")"
+ck "effects names the changed file" "1" "$("$BB" grep -c '"op":"changed","path":"keep.txt"' "$T/m2")"
+ck "effects reports what it scanned" "1" \
+	"$("$BB" grep -Eq '"effects_scanned":[0-9]+' "$T/m2" && echo 1)"
+ck "effects absent without -x" "0" \
+	"$("$BB" run -F json -- "$BB" true 2>/dev/null | "$BB" grep -c '"effects"')"
+
+sec "24e. run/sh json metadata: where things ran and for how long"
+"$BB" run -F json -s 'cd /tmp && pwd' > "$T/mj" 2>/dev/null
+ck "json reports the final cwd" "1" \
+	"$("$BB" grep -Eq '"cwd":"/[^"]*","cwd_final_known":true' "$T/mj" && echo 1)"
+ck "json reports the start cwd" "1" \
+	"$("$BB" grep -Eq '"cwd_start":"/' "$T/mj" && echo 1)"
+ck "json reports busybox's own absolute path" "1" \
+	"$("$BB" grep -Eq '"busybox":"/[^"]*busybox"' "$T/mj" && echo 1)"
+ck "json reports a wall-clock start" "1" \
+	"$("$BB" grep -Eq '"started_unix_us":[0-9]{16}' "$T/mj" && echo 1)"
+ck "json reports duration in ns and ms" "1" \
+	"$("$BB" grep -Eq '"duration_ns":[0-9]+' "$T/mj" && "$BB" grep -Eq '"duration_ms":[0-9]+' "$T/mj" && echo 1)"
+ck "final cwd is absolute" "1" \
+	"$("$BB" sed -n 's/.*"cwd":"\([^"]*\)".*/\1/p' "$T/mj" | "$BB" grep -c '^/')"
+"$BB" run -F json -s 'cd /tmp && cd /usr && true' > "$T/mj2" 2>/dev/null
+ck "final cwd follows the last cd" "1" \
+	"$("$BB" grep -Eq '"cwd":"/usr"' "$T/mj2" && echo 1)"
+"$BB" sh --format json -c 'cd /tmp' > "$T/mj3" 2>/dev/null
+ck "sh --format json reports the same fields" "1" \
+	"$("$BB" grep -Eq '"cwd":"/[^"]*","cwd_final_known":true' "$T/mj3" && echo 1)"
+"$BB" run -F json -- "$BB" pwd > "$T/mj4" 2>/dev/null
+ck "plain exec still reports a cwd" "1" \
+	"$("$BB" grep -Eq '"cwd":"/' "$T/mj4" && echo 1)"
+
+sec "24d. ip tunnel: same acceptances as the Linux applet"
+ck "ip tunnel rc" "0" "$("$BB" ip tunnel >/dev/null 2>&1; echo $?)"
+ck "ip tunnel show rc" "0" "$("$BB" ip tunnel show >/dev/null 2>&1; echo $?)"
+ck "ip tunnel list rc" "0" "$("$BB" ip tunnel list >/dev/null 2>&1; echo $?)"
+ck "ip tunnel bogus verb errors" "1" "$("$BB" ip tunnel bogus >/dev/null 2>&1; echo $?)"
+ck "ip help documents tunnel" "1" \
+	"$([ "$("$BB" ip --help 2>&1 | "$BB" grep -c 'ip tunnel')" -ge 1 ] && echo 1)"
+if [ "$("$BB" id -u)" != 0 ]; then
+	# unprivileged: creating a tunnel must fail rather than pretend
+	ck "ip tunnel add without privilege fails" "1" \
+		"$("$BB" ip tunnel add bbprobe9 remote 10.0.0.1 local 10.0.0.2 >/dev/null 2>&1; echo $?)"
+else
+	echo "skip ip tunnel add: running as root, creation would succeed"
+fi
+
+sec "24c. ip neigh: same acceptances as the Linux applet"
+ck "ip neigh rc" "0" "$("$BB" ip neigh >/dev/null 2>&1; echo $?)"
+ck "ip neigh show rc" "0" "$("$BB" ip neigh show >/dev/null 2>&1; echo $?)"
+ck "ip neigh list is rejected" "1" "$("$BB" ip neigh list >/dev/null 2>&1; echo $?)"
+ck "ip neigh flush needs a filter" "1" "$("$BB" ip neigh flush >/dev/null 2>&1; echo $?)"
+ck "ip neigh dev without a verb is rejected" "1" "$("$BB" ip neigh dev zzznodev0 >/dev/null 2>&1; echo $?)"
+ifn=$("$BB" ip link 2>/dev/null | "$BB" sed -n 's/^[0-9]*: \([^:]*\):.*/\1/p' | "$BB" head -1)
+ck "ip neigh flush dev IFACE is accepted" "0" \
+	"$("$BB" ip neigh flush dev "${ifn:-zzznodev0}" >/dev/null 2>&1; echo $?)"
+ck "ip neigh bogus verb errors" "1" "$("$BB" ip neigh bogus >/dev/null 2>&1; echo $?)"
+ck "ip help documents neigh" "1" \
+	"$([ "$("$BB" ip --help 2>&1 | "$BB" grep -c 'ip neigh show|flush')" -ge 1 ] && echo 1)"
+if "$BB" ip neigh 2>/dev/null | "$BB" grep -q ' dev '; then
+	ck "ip neigh row has lladdr" "1" "$("$BB" ip neigh | "$BB" grep -c ' lladdr ')"
+else
+	echo "skip ip neigh row shape: no IPv4 neighbours on this host"
+fi
+
 ck "run -t with --timeout still exits 3" "3" \
-	"$("$BB" run -t -T 1 -- "$BB" sleep 5 >/dev/null 2>&1; echo $?)"
+	"$("$BB" run -t -T 1 -- sh -c "sleep 5; : tlsent-$$" >/dev/null 2>&1; echo $?)"
+
+sec "24b. --stamp-ns: the clock's own resolution, declared"
+"$BB" run -t -n -- "$BB" sh -c 'i=0; while [ $i -lt 60 ]; do echo t$i; i=$((i+1)); done' > "$T/ns" 2>/dev/null
+ck "stamp-ns rc" "0" "$?"
+ck "stamp-ns header says stamp=ns" "1" "$("$BB" grep -c 'stamp=ns' "$T/ns")"
+ck "stamp-ns declares its resolution" "1" "$("$BB" grep -Ec 'res_ns=[1-9][0-9]*' "$T/ns")"
+ck "stamp-ns stamps 60 lines with 9 digits" "60" \
+	"$("$BB" grep -Ec '^\[[0-9]+\.[0-9]{9} (out|err)\] ' "$T/ns")"
+ck "stamp-ns resolution is ns-scale (< 1us)" "1" \
+	"$([ "$("$BB" sed -n 's/.*res_ns=\([0-9]*\).*/\1/p' "$T/ns")" -lt 1000 ] && echo 1)"
+ck "stamp-ns timestamps are non-decreasing" "yes" \
+	"$("$BB" sed -n 's/^\[\([0-9]*\)\.\([0-9]*\) .*/\1 \2/p' "$T/ns" |
+	   "$BB" awk '{ns=$1*1000000000+$2; if (NR>1 && ns<prev) bad++; prev=ns}
+		      END { print bad ? "no" : "yes" }')"
+ck "stamp-ns implies a timeline" "1" "$("$BB" grep -c '^--- timeline ---$' "$T/ns")"
+ck "us mode keeps 6 digits" "6" \
+	"$("$BB" run -t -- "$BB" echo x 2>/dev/null | "$BB" sed -n 's/^\[[0-9]*\.\([0-9]*\) out\].*/\1/p' | "$BB" head -1 | "$BB" wc -c | "$BB" tr -d ' ' | "$BB" awk '{print $1-1}')"
+ck "stamp-ns json has stamp_ns and res" "1" \
+	"$("$BB" run -t -n -F json -- "$BB" echo j 2>/dev/null | "$BB" grep -c '"stamp_ns":true,"stamp_res_ns":[0-9]*')"
+ck "stamp-ns json keeps integer ns" "1" \
+	"$("$BB" run -t -n -F json -- "$BB" echo j 2>/dev/null | "$BB" grep -c '"ns":[0-9]\{3,\},"us":[0-9]*')"
+ck "us json still carries us" "1" \
+	"$("$BB" run -t -F json -- "$BB" echo j 2>/dev/null | "$BB" grep -c '"us":[0-9]')"
+ck "sh --stamp-ns forwards" "1" \
+	"$("$BB" sh --stamp-ns -c 'echo f' 2>/dev/null | "$BB" grep -Ec '^\[[0-9]+\.[0-9]{9} out\] f$')"
+ck "sh --stamp-ns keeps the exit code" "9" \
+	"$("$BB" sh --stamp-ns -c 'exit 9' >/dev/null 2>&1; echo $?)"
+ck "sh -c keeps --stamp-ns literal" "1" \
+	"$("$BB" sh -c 'echo --stamp-ns' 2>/dev/null | "$BB" grep -c '^--stamp-ns$')"
 
 sec "25. timestamps survive in JSON and in the evidence on disk"
 rm -rf "$T/tart"
@@ -784,7 +911,7 @@ ck "timeline artifact keeps the streams apart" "1" "$("$BB" grep -c 'err\] b' "$
 # a small view budget shortens the view, never the evidence
 rm -rf "$T/tart2"
 "$BB" run -t -B 8 -D "$T/tart2" -- "$BB" sh -c 'for i in 1 2 3 4 5; do echo l$i; done' > "$T/t5" 2>/dev/null
-ck "small budget shows at least one line" "1" "$("$BB" grep -c '^\[ .* out\] l1$' "$T/t5")"
+ck "small budget shows at least one line" "1" "$("$BB" grep -Ec '^\[[0-9]+\.[0-9]+ out\] l1$' "$T/t5")"
 ck "small budget reports truncated" "1" "$("$BB" grep -c 'truncated=true' "$T/t5")"
 ck "small budget says how many shown" "1" "$("$BB" grep -c 'timeline truncated: 1 of 5' "$T/t5")"
 ck "small budget keeps all five in evidence" "5" \

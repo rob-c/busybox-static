@@ -1,16 +1,19 @@
 diff --git a/archival/rpm.c b/archival/rpm.c
-index de5722b..46d28b0 100644
+index de5722b..a63052a 100644
 --- a/archival/rpm.c
 +++ b/archival/rpm.c
-@@ -412,7 +412,6 @@ int rpm_main(int argc, char **argv)
+@@ -412,8 +412,9 @@ int rpm_main(int argc, char **argv)
  	int opt, func = 0;
  
  	INIT_G();
 -	INIT_PAGESIZE(G.pagesize);
  
++	/* libc words a bad option differently per platform; keep it quiet */
++	opterr = 0;
  	while ((opt = getopt(argc, argv, "iqpldc")) != -1) {
  		switch (opt) {
-@@ -579,7 +578,6 @@ int rpm2cpio_main(int argc UNUSED_PARAM, char **argv)
+ 		case 'i': /* First arg: Install mode, with q: Information */
+@@ -579,7 +580,6 @@ int rpm2cpio_main(int argc UNUSED_PARAM, char **argv)
  	int rpm_fd;
  
  	INIT_G();

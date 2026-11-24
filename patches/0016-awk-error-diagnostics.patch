@@ -1,0 +1,14 @@
+diff --git a/editors/awk.c b/editors/awk.c
+index d7edf05..2a4e251 100644
+--- a/editors/awk.c
++++ b/editors/awk.c
+@@ -4029,6 +4029,9 @@ int awk_main(int argc UNUSED_PARAM, char **argv)
+ 	ahash = hash_init();
+ 
+ 	/* Cannot use getopt32: need to preserve order of -e / -f / -E / -i */
++	/* libc words its own diagnostic differently per platform: keep it quiet
++	 * and let the usage text be the one message. */
++	opterr = 0;
+ 	while ((ch = getopt(argc, argv, OPTSTR_AWK)) >= 0) {
+ 		switch (ch) {
+ 		case 'F':

@@ -4,6 +4,38 @@ Project releases of `busybox-static` on top of upstream busybox
 (`1.39.0.git`). The upstream applet set is unchanged except where noted; the
 `patches/` series is the record of every local change.
 
+## 0.6.0 — darwin/linux parity, ns timeline, richer run metadata
+
+- **`ip neigh` and `ip tunnel` on Darwin.** `ip neigh` reads the ARP cache through
+  `sysctl(NET_RT_FLAGS, RTF_LLINFO)` and `flush` sends `RTM_DELETE` per entry;
+  `ip tunnel` creates and configures `gif` clones with `SIOCIFCREATE` and
+  `SIOCSIFPHYADDR`. `ip` now accepts and rejects exactly what the Linux applet
+  does, case by case, and `ip --help` lists `address|route|link|tunnel|neigh` —
+  only `rule` is absent, because it is netlink-only.
+- **`run` / `sh --format json` say what happened.** `exit_kind` plus
+  `signal`/`signal_name` (a killed child no longer reads as a bare `-1`),
+  `argv[]` with real argument boundaries and `argv0_resolved`,
+  `cpu_user_ms`/`cpu_sys_ms`/`max_rss_kb` from `wait4`,
+  `stdout_lines`/`stderr_lines`/`binary`/`final_newline`/`dropped_bytes`,
+  `replay`, `inputs_hash`, `view_next`, `busybox_version`, and the guest shell's
+  final `cwd` beside `busybox`'s own absolute path. `-x/--effects` reports the
+  files added, changed or removed under the run's cwd.
+- **Nanosecond timeline.** `run -t -n` stamps every line and declares the clock's
+  real granularity (`res_ns`, measured 41 ns here). Darwin uses
+  `CLOCK_MONOTONIC_RAW` because its `CLOCK_MONOTONIC` is 1 µs quantised.
+- **Darwin/Linux parity pass.** Option diagnostics are one message owned by
+  busybox instead of each libc's own (`getopt32` applets plus `head`, `awk`,
+  `hexdump`, `hush`, `rpm`, `unzip`, `dc`, `nmeter`, `ifconfig`); `mount`,
+  `umount` and `mkpasswd` help text are identical; `arch` reports `aarch64`.
+  Audit result: 451/453 option probes and 111/132 behavioural probes identical,
+  with the residue being pruned capabilities and machine data.
+- **Patch series re-cut.** Each file is owned by exactly one patch, and
+  `tests/patch-reconstruct.sh` proves that applying the series to the upstream
+  base reproduces `src/` with 0 differing files.
+- **New tooling.** `tests/platform-probe.sh` + `tests/platform-diff.sh` audit two
+  binaries probe by probe; `tests/patch-reconstruct.sh` validates the series;
+  `tests/agent-ops-sweep.sh` grows to 1300+ checks.
+
 ## 0.5.1 — fixes from the plugin's defect reports
 
 - **`run --prune N` works with `--timestamps`.** It unlinked a fixed list

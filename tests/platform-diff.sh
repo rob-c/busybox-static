@@ -56,6 +56,10 @@ function err(s) { match(s, /err=.*/); return substr(s, RSTART+4) }
 	else if (out(a) != out(b)) { cls="output" }
 	else if (err(a) != err(b)) { cls="stderr" }
 	else { same++; next }
+	# Machine data, not applet behaviour: the same command asked two different
+	# computers a question. Keep them visible but in their own bucket.
+	if (app ~ /^(hostname|id|whoami|pwd|realpath|uname|uptime|free|df|ps|env|printenv|mktemp|ls|du|stat)$/)
+		cls="env"
 	if (pr == "help") cls="usage"
 	total[cls]++
 	app_cls[app]=app_cls[app] " " cls
@@ -67,7 +71,7 @@ END {
 	printf "excluded (timeout on one side): %d\n", skip
 	for (c in total) printf "%-8s %d\n", c, total[c]
 	printf "\n"
-	split("usage exit output stderr", order, " ")
+	split("usage exit env output stderr", order, " ")
 	for (o in order) {
 		c = order[o]
 		if (!total[c]) continue

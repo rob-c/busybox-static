@@ -1,54 +1,3 @@
-diff --git a/Config.in b/Config.in
-index 8955ed3..9189da0 100644
---- a/Config.in
-+++ b/Config.in
-@@ -66,6 +66,23 @@ config LONG_OPTS
- 	Enable this if you want busybox applets to use the gnu --long-option
- 	style, in addition to single character -a -b -c style options.
- 
-+config FEATURE_GNU_LONG_OPTS
-+	bool "Accept GNU long options for applets that only parse short ones"
-+	default n
-+	depends on LONG_OPTS
-+	help
-+	Many applets parse only short options, so "du --max-depth=1" or
-+	"grep --line-number" is rejected even though the same applet has the
-+	matching short option. This adds a table of GNU long names to short
-+	letters (libbb/gnu_longopts.c) and rewrites argv before getopt32()
-+	runs, so no applet source changes are needed.
-+
-+	Costs about 3k of strings and 760 bytes of code, which came to 704
-+	bytes of file size on a Mach-O build. No effect on applets that do
-+	not parse options. "--" always ends option processing, and names an
-+	applet declares itself take priority, so existing behaviour is
-+	unchanged.
-+
- config SHOW_USAGE
- 	bool "Show applet usage messages"
- 	default y
-diff --git a/archival/rpm.c b/archival/rpm.c
-index de5722b..a63052a 100644
---- a/archival/rpm.c
-+++ b/archival/rpm.c
-@@ -412,8 +412,9 @@ int rpm_main(int argc, char **argv)
- 	int opt, func = 0;
- 
- 	INIT_G();
--	INIT_PAGESIZE(G.pagesize);
- 
-+	/* libc words a bad option differently per platform; keep it quiet */
-+	opterr = 0;
- 	while ((opt = getopt(argc, argv, "iqpldc")) != -1) {
- 		switch (opt) {
- 		case 'i': /* First arg: Install mode, with q: Information */
-@@ -579,7 +580,6 @@ int rpm2cpio_main(int argc UNUSED_PARAM, char **argv)
- 	int rpm_fd;
- 
- 	INIT_G();
--	INIT_PAGESIZE(G.pagesize);
- 
- 	rpm_fd = rpm_gettags(argv[1]);
- 
 diff --git a/archival/unzip.c b/archival/unzip.c
 index 8a9a90f..4e32dbe 100644
 --- a/archival/unzip.c
@@ -207,103 +156,6 @@ index 8a9a90f..4e32dbe 100644
  // Seen in some zipfiles: central directory 9 byte extra field contains
  // a subfield with ID 0x5455 and 5 data bytes, which is a Unix-style UTC mtime.
  // Local header version:
-diff --git a/coreutils/df.c b/coreutils/df.c
-index fba2324..9d16fb3 100644
---- a/coreutils/df.c
-+++ b/coreutils/df.c
-@@ -97,7 +97,9 @@
- //usage:       "Filesystem          512-blocks      Used Available Capacity Mounted on\n"
- //usage:       "/dev/sda3             17381728  17107080    274648      98% /\n"
- 
--#include <mntent.h>
-+#ifdef HAVE_MNTENT_H
-+# include <mntent.h>
-+#endif
- #include <sys/statvfs.h>
- #include "libbb.h"
- #include "unicode.h"
-@@ -109,6 +111,34 @@ static unsigned long kscale(unsigned long b, unsigned long bs)
- }
- #endif
- 
-+#if defined(__APPLE__)
-+/*
-+ * APFS volumes in one container share their free space, so statvfs() reports
-+ * container-wide usage: df would claim "/" is 71% full when the sealed system
-+ * volume actually holds ~13 GB.  /bin/df asks the volume itself via
-+ * ATTR_VOL_SPACEUSED, whose reply is a packed { uint32_t length; off_t used; }
-+ * - note the value sits at offset 4, not 8, so it cannot be read through a
-+ * normally-aligned struct.
-+ */
-+#include <sys/attr.h>
-+
-+static unsigned long long darwin_volume_used(const char *path)
-+{
-+	struct attrlist al;
-+	unsigned char buf[32];
-+	uint64_t used;
-+
-+	memset(&al, 0, sizeof(al));
-+	al.bitmapcount = ATTR_BIT_MAP_COUNT;
-+	al.volattr = ATTR_VOL_INFO | ATTR_VOL_SPACEUSED;
-+	memset(buf, 0, sizeof(buf));
-+	if (getattrlist(path, &al, buf, sizeof(buf), 0) != 0)
-+		return 0;
-+	memcpy(&used, buf + sizeof(uint32_t), sizeof(used));
-+	return (unsigned long long)used;
-+}
-+#endif
-+
- int df_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
- int df_main(int argc UNUSED_PARAM, char **argv)
- {
-@@ -260,6 +290,7 @@ int df_main(int argc UNUSED_PARAM, char **argv)
- 
- 		if ((s.f_blocks > 0) || !mount_table || (opt & OPT_ALL)) {
- 			unsigned long long blocks_used;
-+			unsigned long long print_used;
- 			unsigned long long blocks_total;
- 			unsigned blocks_percent_used;
- 
-@@ -271,6 +302,20 @@ int df_main(int argc UNUSED_PARAM, char **argv)
- 					df_disp_hr = 1;
- 			}
- 			blocks_used = s.f_blocks - s.f_bfree;
-+#if defined(__APPLE__)
-+			/* per-volume usage, as /bin/df reports it */
-+			if (!(opt & OPT_INODE)) {
-+				unsigned long long vu = darwin_volume_used(mount_point);
-+				if (vu != 0 && s.f_frsize != 0) {
-+					unsigned long long in_frsize = vu / s.f_frsize;
-+					if (in_frsize <= s.f_blocks)
-+						blocks_used = in_frsize;
-+				}
-+			}
-+#endif
-+			/* the percentage loop below shifts blocks_used, so keep a copy
-+			 * for the "Used" column */
-+			print_used = blocks_used;
- 			blocks_total = blocks_used + s.f_bavail;
- 			blocks_percent_used = blocks_total; /* 0% if blocks_total == 0, else... */
- 			if (blocks_total != 0) {
-@@ -332,7 +377,7 @@ int df_main(int argc UNUSED_PARAM, char **argv)
- 			printf(" %9s " + 1,
- 				/* EXPR x f_frsize / df_disp_hr, show one fractional,
- 				 * use suffixes if df_disp_hr == 0 */
--				make_human_readable_str((s.f_blocks - s.f_bfree),
-+				make_human_readable_str(print_used,
- 						s.f_frsize, df_disp_hr));
- 
- 			printf("%9s %3u%% %s\n",
-@@ -343,7 +388,7 @@ int df_main(int argc UNUSED_PARAM, char **argv)
- #else
- 			printf(" %9lu %9lu %9lu %3u%% %s\n",
- 				kscale(s.f_blocks, s.f_frsize),
--				kscale(s.f_blocks - s.f_bfree, s.f_frsize),
-+				kscale(print_used, s.f_frsize),
- 				kscale(s.f_bavail, s.f_frsize),
- 				blocks_percent_used, mount_point);
- #endif
 diff --git a/coreutils/env.c b/coreutils/env.c
 index e9d3e88..65ff73a 100644
 --- a/coreutils/env.c
@@ -343,34 +195,6 @@ index e9d3e88..65ff73a 100644
  	if (argv[0]) {
  		BB_EXECVP_or_die(argv);
  	}
-diff --git a/coreutils/head.c b/coreutils/head.c
-index ec83a28..89d11a0 100644
---- a/coreutils/head.c
-+++ b/coreutils/head.c
-@@ -183,6 +183,13 @@ int head_main(int argc, char **argv)
- 	int opt;
- 	int retval = EXIT_SUCCESS;
- 
-+#if ENABLE_FEATURE_GNU_LONG_OPTS
-+	/* This applet parses with getopt() rather than getopt32() (it needs the
-+	 * legacy "-N" form and "-n -N"), so the long-option table has to be
-+	 * applied here.  Must run before the legacy check below mangles argv. */
-+	bb_expand_gnu_longopts(argv, head_opts, NULL);
-+#endif
-+
- #if ENABLE_INCLUDE_SUSv2 || ENABLE_FEATURE_FANCY_HEAD
- 	/* Allow legacy syntax of an initial numeric option without -n. */
- 	if (argv[1] && argv[1][0] == '-'
-@@ -196,6 +203,9 @@ int head_main(int argc, char **argv)
- #endif
- 
- 	/* No size benefit in converting this to getopt32 */
-+	/* libc words its own diagnostic differently per platform: keep it quiet
-+	 * and let the usage text be the one message. */
-+	opterr = 0;
- 	while ((opt = getopt(argc, argv, head_opts)) > 0) {
- 		switch (opt) {
- #if ENABLE_FEATURE_FANCY_HEAD
 diff --git a/coreutils/json.c b/coreutils/json.c
 new file mode 100644
 index 0000000..944030b
@@ -650,22 +474,6 @@ index 0000000..944030b
 +	json_free(doc);
 +	fflush_stdout_and_exit(rc);
 +}
-diff --git a/coreutils/ls.c b/coreutils/ls.c
-index 9f52174..dc4825f 100644
---- a/coreutils/ls.c
-+++ b/coreutils/ls.c
-@@ -954,11 +954,9 @@ static int sortcmp(const void *a, const void *b)
- 	if (opt & OPT_t) { /* sort by time */
- 		dif = (d2->dn_time - d1->dn_time);
- 	} else
--#if defined(HAVE_STRVERSCMP) && HAVE_STRVERSCMP == 1
- 	if (opt & OPT_v) { /* sort by version */
- 		dif = strverscmp(d1->name, d2->name);
- 	} else
--#endif
- 	if (opt & OPT_X) { /* sort by extension */
- 		dif = strcmp(strchrnul(d1->name, '.'), strchrnul(d2->name, '.'));
- 	}
 diff --git a/coreutils/mktemp.c b/coreutils/mktemp.c
 index 91b2be6..65b7dd1 100644
 --- a/coreutils/mktemp.c
@@ -2008,10 +1816,10 @@ index 22820a7..958618f 100644
  }
 diff --git a/coreutils/run.c b/coreutils/run.c
 new file mode 100644
-index 0000000..4b4499c
+index 0000000..3eb1758
 --- /dev/null
 +++ b/coreutils/run.c
-@@ -0,0 +1,2267 @@
+@@ -0,0 +1,3369 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * run - captured execution with retrievable evidence.
@@ -2044,6 +1852,8 @@ index 0000000..4b4499c
 +//usage:       "Run PROG, capture stdout/stderr separately, print a bounded view"
 +//usage:     "\n	-T, --timeout SECS	Kill the process group after SECS"
 +//usage:     "\n	-k, --kill-after SECS	Grace period before SIGKILL (default 2)"
++//usage:     "\n	-W, --idle-timeout SECS	Kill after SECS without any output"
++//usage:     "\n	-J, --jsonl		Emit one JSON object per line, as it arrives"
 +//usage:     "\n	-B, --max-bytes N	View budget (default 12000)"
 +//usage:     "\n	-C, --capture-limit N	Captured bytes per stream (default 64 MiB)"
 +//usage:     "\n	-D, --dir PATH		Artifact root (default $TMPDIR/busybox-run)"
@@ -2058,6 +1868,8 @@ index 0000000..4b4499c
 +//usage:     "\n	-q, --quiet		Print the captured streams only, no summary"
 +//usage:     "\n	-j, --brief-json	Emit brief's JSON (schema 1) as the body"
 +//usage:     "\n	-n, --stamp-ns	Stamp with 9 digits instead of 6 (the clock is ns)"
++//usage:     "\n	-x, --effects		Report files created, changed or removed"
++//usage:     "\n			under the run's cwd (bounded)"
 +//usage:     "\n	-t, --timestamps	Prefix every line with its time and stream,"
 +//usage:     "\n			in one interleaved stream (dmesg style)"
 +//usage:     "\n	-Y, --pty		Give the child a new pty as its controlling"
@@ -2084,12 +1896,23 @@ index 0000000..4b4499c
 +//usage:     "\n	-s, --stream WHICH	stdout (default), stderr, timeline or both"
 +//usage:     "\n	-M, --meta		Print the run metadata only"
 +//usage:     "\n	--diff R1:R2	Compare the stdout of two runs"
++//usage:     "\n	--diff-timeline R1:R2	Compare two runs by shape (lines, gaps, duration)"
++//usage:     "\n	-S, --since SECS	Timeline from this offset"
++//usage:     "\n	-U, --until SECS	Timeline up to this offset"
++//usage:     "\n	-G, --around-gap SECS	The widest silences (see --limit)"
++//usage:     "\n	-N, --limit N		How many gaps --around-gap reports (default 3)"
++//usage:     "\n	-P, --sample N		First N and last N lines of a stream"
++//usage:     "\n	-Z, --summary		One-line digest: lines, gaps, stderr, exit"
++//usage:     "\n	-K, --marks		Named events recorded by 'mark' (see mark --help)"
 +//usage:     "\n	-B, --max-bytes N	Output budget (default 12000)"
 +//usage:     "\n	-D, --dir PATH		Artifact root"
 +//usage:     "\n	-F, --format FMT	text (default) or json"
 +
 +#include <termios.h>
 +#include <sys/ioctl.h>
++#if defined(__APPLE__)
++# include <mach-o/dyld.h>
++#endif
 +#include "libbb.h"
 +
 +enum {
@@ -2102,7 +1925,8 @@ index 0000000..4b4499c
 +};
 +
 +static long child_pgid;
-+static pid_t reaper_pid;   /* kills the guest group if we die; we stop it on exit */
++static pid_t reaper_pid;
++static long idle_ms;          /* --idle-timeout, 0 = off */   /* kills the guest group if we die; we stop it on exit */
 +static char **child_env;   /* NAME=VALUE pairs from --env, NULL-terminated */
 +static int n_child_env;
 +static int error_ids;
@@ -2113,12 +1937,14 @@ index 0000000..4b4499c
 +static int pty_req_rows;
 +
 +struct meta {
++	unsigned long long dropped_bytes;
 +	char *cmd;
 +	char *cwd;
 +	long duration_ms;
 +	int exit_code;       /* -1 when killed by a signal */
 +	int term_sig;
 +	int timed_out;
++	int idle_out;        /* the idle deadline fired, not the wall one */
 +	int cancelled;
 +	int capture_complete;
 +	unsigned long long out_bytes;
@@ -2233,6 +2059,294 @@ index 0000000..4b4499c
 +		close(fd);
 +	}
 +	free(path);
++}
++
++/* ---------- metadata helpers ---------- */
++
++/* ---------- effects: what the run changed under its cwd ---------- */
++struct effent {
++	char *path;
++	long long mtime;
++	long long size;
++};
++
++struct efflist {
++	struct effent *v;
++	unsigned n, cap;
++	int truncated;
++	unsigned scanned;
++};
++
++static int eff_cmp(const void *a, const void *b)
++{
++	const struct effent *x = a, *y = b;
++
++	return strcmp(x->path, y->path);
++}
++
++/* tiny growable string, local to this file */
++struct sbuf_ {
++	char *p;
++	size_t len, cap;
++};
++
++static void sb_add_(struct sbuf_ *b, const char *s, size_t n)
++{
++	if (b->len + n + 1 > b->cap) {
++		b->cap = (b->len + n + 1) * 2;
++		b->p = xrealloc(b->p, b->cap);
++	}
++	if (n)
++		memcpy(b->p + b->len, s, n);
++	b->len += n;
++	b->p[b->len] = '\0';
++}
++
++static void sb_addstr_(struct sbuf_ *b, const char *s)
++{
++	sb_add_(b, s, strlen(s));
++}
++
++static void sb_addch_(struct sbuf_ *b, char c)
++{
++	sb_add_(b, &c, 1);
++}
++
++/* POSIX single-quote an argument for the replay line. */
++static void replay_quote(struct sbuf_ *b, const char *s)
++{
++	sb_addch_(b, '\'');
++	for (; *s; s++) {
++		if (*s == '\'')
++			sb_addstr_(b, "'\\''");
++		else
++			sb_addch_(b, *s);
++	}
++	sb_addch_(b, '\'');
++}
++
++static char *run_make_replay(const char *cwd, char **argv)
++{
++	struct sbuf_ b = { 0 };
++	int i;
++
++	sb_addstr_(&b, "cd ");
++	replay_quote(&b, cwd ? cwd : ".");
++	sb_addstr_(&b, " && ");
++	for (i = 0; argv[i]; i++) {
++		if (i)
++			sb_addch_(&b, ' ');
++		replay_quote(&b, argv[i]);
++	}
++	return b.p;
++}
++
++/* sha256 over the argv (NUL-separated) and the start cwd, so two runs that
++ * differ only in arguments or directory hash differently. */
++static void run_inputs_hash(char **argv, const char *cwd, char *out65)
++{
++	sha256_ctx_t ctx;
++	unsigned char dig[32];
++	int i, k;
++
++	sha256_begin(&ctx);
++	for (i = 0; argv[i]; i++) {
++		sha256_hash(&ctx, argv[i], strlen(argv[i]));
++		sha256_hash(&ctx, "", 1);
++	}
++	sha256_hash(&ctx, cwd ? cwd : "", cwd ? strlen(cwd) : 0);
++	sha256_end(&ctx, (char *)dig);
++	for (k = 0; k < 32; k++)
++		sprintf(out65 + k * 2, "%02x", dig[k]);
++	out65[64] = '\0';
++}
++
++static void run_emit_effects_json(struct efflist *before, struct efflist *after)
++{
++	unsigned i = 0, j = 0, emitted = 0;
++	int first = 1;
++
++	printf(",\"effects_scanned\":%u,\"effects_truncated\":%s,\"effects\":[",
++			after->scanned + before->scanned,
++			(before->truncated || after->truncated) ? "true" : "false");
++	while (i < before->n || j < after->n) {
++		int cmp;
++
++		if (i >= before->n)
++			cmp = 1;
++		else if (j >= after->n)
++			cmp = -1;
++		else
++			cmp = strcmp(before->v[i].path, after->v[j].path);
++
++		if (emitted < 200) {
++			if (cmp < 0) {
++				printf("%s{\"op\":\"removed\",\"path\":", first ? "" : ",");
++				json_write_str(before->v[i].path);
++				putchar('}');
++				first = 0;
++				emitted++;
++			} else if (cmp > 0) {
++				printf("%s{\"op\":\"added\",\"path\":", first ? "" : ",");
++				json_write_str(after->v[j].path);
++				printf(",\"size\":%lld}", after->v[j].size);
++				first = 0;
++				emitted++;
++			} else {
++				if (before->v[i].mtime != after->v[j].mtime
++				 || before->v[i].size != after->v[j].size) {
++					printf("%s{\"op\":\"changed\",\"path\":", first ? "" : ",");
++					json_write_str(after->v[j].path);
++					printf(",\"size\":%lld}", after->v[j].size);
++					first = 0;
++					emitted++;
++				}
++			}
++		}
++		if (cmp < 0)
++			i++;
++		else if (cmp > 0)
++			j++;
++		else {
++			i++;
++			j++;
++		}
++	}
++	putchar(']');
++}
++
++/* Count lines, notice NULs and a missing final newline in one pass. */
++static void run_scan_stream(const char *path, unsigned long long *lines,
++		int *is_binary, int *final_nl)
++{
++	int fd = open(path, O_RDONLY);
++	char buf[8192];
++	ssize_t n;
++	unsigned long long count = 0;
++	int last = -1, seen = 0, bin = 0;
++
++	*lines = 0;
++	*is_binary = 0;
++	*final_nl = 0;
++	if (fd < 0)
++		return;
++	while ((n = safe_read(fd, buf, sizeof(buf))) > 0) {
++		ssize_t i;
++
++		if (seen < 8192 && memchr(buf, 0, (size_t)n))
++			bin = 1;
++		for (i = 0; i < n; i++)
++			if (buf[i] == '\n')
++				count++;
++		last = (unsigned char)buf[n - 1];
++		seen += (int)n;
++	}
++	close(fd);
++	*is_binary = bin;
++	if (last >= 0) {
++		*final_nl = (last == '\n');
++		if (!*final_nl)
++			count++;      /* a trailing partial line still counts */
++	}
++	*lines = count;
++}
++
++/* A shell command that reproduces this run exactly. */
++static void run_emit_argv_json(char **argv)
++{
++	int i;
++
++	putchar('[');
++	for (i = 0; argv[i]; i++) {
++		if (i)
++			putchar(',');
++		json_write_str(argv[i]);
++	}
++	putchar(']');
++}
++
++/* Bounded recursive walk: depth 8, 20000 entries. */
++static void eff_walk(struct efflist *l, const char *root, const char *rel, int depth)
++{
++	char *dirpath;
++	DIR *d;
++	struct dirent *de;
++
++	dirpath = rel[0] ? xasprintf("%s/%s", root, rel) : xstrdup(root);
++	d = opendir(dirpath);
++	if (!d) {
++		free(dirpath);
++		return;
++	}
++	while ((de = readdir(d)) != NULL) {
++		char *child, *full;
++		struct stat st;
++
++		if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
++			continue;
++		if (l->scanned >= 20000) {
++			l->truncated = 1;
++			break;
++		}
++		child = rel[0] ? xasprintf("%s/%s", rel, de->d_name) : xstrdup(de->d_name);
++		full = xasprintf("%s/%s", root, child);
++		if (lstat(full, &st) == 0) {
++			l->scanned++;
++			if (S_ISDIR(st.st_mode)) {
++				if (depth < 8)
++					eff_walk(l, root, child, depth + 1);
++			} else {
++				if (l->n == l->cap) {
++					l->cap = l->cap ? l->cap * 2 : 256;
++					l->v = xrealloc(l->v, l->cap * sizeof(l->v[0]));
++				}
++				l->v[l->n].path = xstrdup(child);
++				l->v[l->n].mtime = (long long)st.st_mtime;
++				l->v[l->n].size = (long long)st.st_size;
++				l->n++;
++			}
++		}
++		free(full);
++		free(child);
++	}
++	closedir(d);
++	free(dirpath);
++}
++
++static void run_effects_snapshot(const char *root, struct efflist *l)
++{
++	memset(l, 0, sizeof(*l));
++	if (!root || !root[0])
++		return;
++	eff_walk(l, root, "", 0);
++	if (l->n > 1)
++		qsort(l->v, l->n, sizeof(l->v[0]), eff_cmp);
++}
++
++/* The binary's own absolute path: CONFIG_BUSYBOX_EXEC_PATH is /proc/self/exe
++ * even on Darwin, where dyld has to be asked. */
++static char *run_self_exe(void)
++{
++#if defined(__APPLE__)
++	uint32_t size = 0;
++	char *buf;
++
++	_NSGetExecutablePath(NULL, &size);
++	buf = xmalloc(size + 1);
++	if (_NSGetExecutablePath(buf, &size) == 0 && buf[0]) {
++		char *real = realpath(buf, NULL);
++
++		if (real) {
++			free(buf);
++			return real;
++		}
++		return buf;
++	}
++	free(buf);
++	return NULL;
++#else
++	return realpath("/proc/self/exe", NULL);
++#endif
 +}
 +
 +/* ---------- run: capture ---------- */
@@ -2657,18 +2771,83 @@ index 0000000..4b4499c
 + * The fds array is rewritten as streams reach EOF, so the caller can close
 + * anything the loop left open.
 + */
++
++/* --jsonl: one object per line as it arrives, so a harness can watch a long
++ * command instead of waiting for the document at exit. Lines are reassembled
++ * across read() boundaries; a partial line is held until its newline (or the
++ * stream's end, which flushes it). */
++static int jsonl_on;
++static unsigned long long jsonl_start_us;
++static char *jsonl_part[2];
++static size_t jsonl_plen[2];
++
++static void jsonl_emit(unsigned stream, const char *text, size_t len)
++{
++	struct timespec now;
++	unsigned long long us;
++
++	clock_gettime(CLOCK_MONOTONIC, &now);
++	us = (unsigned long long)now.tv_sec * 1000000ULL
++			+ (unsigned long long)now.tv_nsec / 1000ULL;
++	if (!jsonl_start_us)
++		jsonl_start_us = us;      /* first event defines t=0 */
++	us = (us >= jsonl_start_us) ? us - jsonl_start_us : 0;
++	printf("{\"t\":%llu,\"s\":\"%s\",\"line\":", us, stream ? "err" : "out");
++	json_write_str(xstrndup(text, len));
++	printf("}\n");
++	fflush(stdout);
++}
++
++static void jsonl_feed(unsigned stream, const char *buf, size_t len)
++{
++	size_t i = 0;
++
++	while (i < len) {
++		const char *nl = memchr(buf + i, '\n', len - i);
++		size_t take = nl ? (size_t)(nl - (buf + i)) : len - i;
++
++		if (take) {
++			jsonl_part[stream] = xrealloc(jsonl_part[stream],
++					jsonl_plen[stream] + take + 1);
++			memcpy(jsonl_part[stream] + jsonl_plen[stream], buf + i, take);
++			jsonl_plen[stream] += take;
++		}
++		if (nl) {
++			jsonl_part[stream] = xrealloc(jsonl_part[stream],
++					jsonl_plen[stream] + 1);
++			jsonl_part[stream][jsonl_plen[stream]] = '\0';
++			jsonl_emit(stream, jsonl_part[stream], jsonl_plen[stream]);
++			jsonl_plen[stream] = 0;
++		}
++		i += take + (nl ? 1 : 0);
++	}
++}
++
++static void jsonl_flush_parts(void)
++{
++	unsigned i;
++
++	for (i = 0; i < 2; i++) {
++		if (jsonl_plen[i]) {
++			jsonl_emit(i, jsonl_part[i], jsonl_plen[i]);
++			jsonl_plen[i] = 0;
++		}
++	}
++}
++
 +static void pump(int fds[3], int arts[3], int nr, int feed_to, int feed_from,
 +		int feed_always, long deadline_ms, int kill_after_ms,
 +		long capture_limit, pid_t pid, struct meta *m)
 +{
 +	struct pollfd pfd[4];
-+	unsigned long long captured = 0, term_at = 0;
++	unsigned long long captured = 0, term_at = 0, last_data = 0;
 +	long quota_used[3] = { 0, 0, 0 };
 +	int open_count = 0, phase = 0, i;
 +	char buf[16384];
 +	char feed[4096];
 +	size_t feed_len = 0, feed_off = 0;
 +	int feed_done = (feed_to < 0 || feed_from < 0);
++	(void)0;
 +	int feed_on_line = 1;   /* every byte fed so far ended on a newline */
 +
 +	for (i = 0; i < nr; i++) {
@@ -2682,6 +2861,19 @@ index 0000000..4b4499c
 +
 +		if (phase == 0 && deadline_ms > 0 && (long)now >= deadline_ms) {
 +			m->timed_out = 1;
++			kill(-pid, SIGTERM);
++			kill(pid, SIGTERM);
++			term_at = now;
++			phase = 1;
++		}
++		if (idle_ms > 0 && last_data == 0)
++			last_data = now;   /* silence counts from the start, not from data */
++		if (phase == 0 && idle_ms > 0 && last_data
++		 && (long)now - (long)last_data >= idle_ms
++		) {
++			/* The guest is not producing anything: that is the hang, not the
++			 * total runtime, which may be legitimately long. */
++			m->idle_out = 1;
 +			kill(-pid, SIGTERM);
 +			kill(pid, SIGTERM);
 +			term_at = now;
@@ -2791,6 +2983,7 @@ index 0000000..4b4499c
 +				continue;
 +			}
 +			captured += (unsigned long long)r;
++			last_data = now;      /* the idle deadline measures silence, not runtime */
 +			if (i == 0)
 +				m->out_bytes += (unsigned long long)r;
 +			else
@@ -2804,13 +2997,19 @@ index 0000000..4b4499c
 +					w = 0;
 +				quota_used[i] += w;
 +			}
-+			if (quota_used[i] >= capture_limit && (size_t)r > (size_t)w)
++			if (quota_used[i] >= capture_limit && (size_t)r > (size_t)w) {
 +				m->capture_complete = 0;
++				m->dropped_bytes += (unsigned long long)((size_t)r - (size_t)w);
++			}
 +			tl_feed(i, buf, (size_t)r);
++			if (jsonl_on)
++				jsonl_feed((unsigned)i, buf, (size_t)r);
 +		}
 +	}
 +	(void)captured;
 +	tl_flush_partials();
++	if (jsonl_on)
++		jsonl_flush_parts();
 +}
 +
 +/* Bound head+tail into ONE string, so JSON gets a single scalar. */
@@ -2896,6 +3095,8 @@ index 0000000..4b4499c
 +		return NULL;
 +	}
 +	fflush_all();
++	if (jsonl_on)
++		jsonl_start_us = monotonic_us();
 +	pid = fork();
 +	if (pid == 0) {
 +		dup2(fd, 0);
@@ -3197,11 +3398,23 @@ index 0000000..4b4499c
 +	char *opt_stdin = NULL;
 +	int opt_pgid = 0;
 +	char *opt_prune = NULL;
++	char *opt_idle = NULL;
 +	char *opt_brief = NULL;
 +	int brief_out = 0, brief_err = 0;
 +	int quiet = 0, brief_json = 0;
 +	unsigned opts;
 +	long deadline_ms = 0, budget = DEFAULT_VIEW, capture_limit = DEFAULT_CAPTURE;
++	char *cwd_start = NULL, *cwd_final = NULL, *self_exe = NULL;
++	char *argv0_resolved = NULL;
++	const char *exit_kind = "exited";
++	unsigned long long out_lines = 0, err_lines = 0, dropped_bytes = 0;
++	int out_binary = 0, err_binary = 0, out_final_nl = 0, err_final_nl = 0;
++	struct efflist eff_before, eff_after;
++	int want_effects = 0;
++	unsigned long long started_unix_us = 0;
++	struct rusage ru;
++
++	int cwd_final_known = 0;
 +	int kill_after = 2000, json = 0, use_shell = 0;
 +	const char *root, *dir;
 +	unsigned id;
@@ -3220,6 +3433,8 @@ index 0000000..4b4499c
 +	static const char run_longopts[] ALIGN1 =
 +		"timeout\0"       Required_argument "T"
 +		"kill-after\0"    Required_argument "k"
++		"idle-timeout\0"  Required_argument "W"
++		"jsonl\0"         No_argument       "J"
 +		"max-bytes\0"     Required_argument "B"
 +		"capture-limit\0" Required_argument "C"
 +		"dir\0"           Required_argument "D"
@@ -3233,6 +3448,7 @@ index 0000000..4b4499c
 +		"brief-json\0"    No_argument       "j"
 +	"timestamps\0"    No_argument       "t"
 +	"stamp-ns\0"      No_argument       "n"
++	"effects\0"       No_argument       "x"
 +		"brief\0"         Required_argument "b"
 +		"pty\0"           No_argument       "Y"
 +		;
@@ -3296,12 +3512,14 @@ index 0000000..4b4499c
 +		}
 +		argv[j] = NULL;
 +	}
-+	opts = getopt32long(argv, "T:k:B:C:D:d:sF:i:Pr:b:qjtYn", run_longopts,
++	opts = getopt32long(argv, "T:k:B:C:D:d:sF:i:Pr:b:qjtYnW:Jx", run_longopts,
 +			&opt_timeout, &opt_kill, &opt_bytes, &opt_capture,
-+			&opt_dir, &opt_cwd, &opt_fmt, &opt_stdin, &opt_prune, &opt_brief);
++			&opt_dir, &opt_cwd, &opt_fmt, &opt_stdin, &opt_prune, &opt_brief,
++			&opt_idle);
 +	use_shell = (opts & (1 << 6)) != 0;   /* s */
 +	quiet = (opts & (1 << 12)) != 0;      /* q: 13th letter of the optstring */
 +	brief_json = (opts & (1 << 13)) != 0; /* j: 14th */
++	jsonl_on = (opts & (1 << 18)) != 0;   /* J: 19th letter of the optstring */
 +	if ((opts & (1 << 15)) != 0)          /* Y: 16th letter */
 +		pty_mode = 1;
 +	if (opt_brief) {
@@ -3359,6 +3577,13 @@ index 0000000..4b4499c
 +			bb_error_msg_and_die("bad timeout");
 +		/* absolute: pump() compares against monotonic time */
 +		deadline_ms = (long)now_ms() + (long)(s * 1000.0);
++	}
++	if (opt_idle) {
++		double secs = strtod(opt_idle, NULL);
++
++		if (!(secs > 0))
++			bb_error_msg_and_die("bad idle timeout \"%s\"", opt_idle);
++		idle_ms = (long)(secs * 1000.0);
 +	}
 +	if (opt_kill) {
 +		double s = strtod(opt_kill, NULL);
@@ -3480,11 +3705,33 @@ index 0000000..4b4499c
 +	 * never reached its documented exit 3. */
 +	bb_signals((1 << SIGINT) | (1 << SIGTERM), on_sig);
 +
++	want_effects = (opts & (1 << 19)) != 0;   /* x: 20th letter */
++	{
++		struct timeval tv;
++
++		cwd_start = getcwd(NULL, 0);
++		if (gettimeofday(&tv, NULL) == 0)
++			started_unix_us = (unsigned long long)tv.tv_sec * 1000000
++					+ (unsigned long long)tv.tv_usec;
++		self_exe = run_self_exe();
++	}
++
 +	if (tl.on) {
 +		/* hold everything the capture holds, but never more than 8 MiB */
 +		tl.budget = (size_t)8 * 1024 * 1024;
 +		tl.out_budget = (size_t)budget;
 +	}
++	if (argv[0]) {
++		if (strchr(argv[0], '/'))
++			argv0_resolved = realpath(argv[0], NULL);
++		else {
++			const char *path = getenv("PATH");
++
++			argv0_resolved = find_executable(argv[0], &path);
++		}
++	}
++	if (want_effects)
++		run_effects_snapshot(cwd_start, &eff_before);
 +	started = now_ms();
 +	pid = fork();
 +	if (pid < 0)
@@ -3530,6 +3777,15 @@ index 0000000..4b4499c
 +			bb_perror_msg("cd %s", opt_cwd);
 +			_exit(126);
 +		}
++		{
++			/* A guest may name its own phases: `mark phase:build`. */
++			char *idbuf = xasprintf("BUSYBOX_RUN_ID=R%u", id);
++
++			putenv(idbuf);
++			setenv("BUSYBOX_RUN_DIR", dir, 1);
++			/* the shell writes its final cwd here on exit */
++			putenv(xasprintf("BUSYBOX_RUN_CWD=%s", art_path(dir, "cwd")));
++		}
 +		for (i = 0; i < n_child_env; i++) {
 +			char *eq = strchr(child_env[i], '=');
 +
@@ -3543,9 +3799,17 @@ index 0000000..4b4499c
 +			shv[1] = (char *)"-c";
 +			shv[2] = argv[0];
 +			shv[3] = NULL;
++			/* this binary is the shell of record: bb_busybox_exec_path is
++			 * /proc/self/exe even on Darwin, so resolve the real path first */
++			if (self_exe)
++				execv(self_exe, shv);
 +			execv(bb_busybox_exec_path, shv);
 +			execvp("sh", shv);
 +		} else {
++			/* `sh -c CMD` (how the sh applet forwards) must run this
++			 * binary's shell, not whichever /bin/sh PATH finds */
++			if (self_exe && strcmp(argv[0], "sh") == 0)
++				execv(self_exe, argv);
 +			execvp(argv[0], argv);
 +		}
 +		bb_perror_msg("can't execute '%s'", argv[0]);
@@ -3653,9 +3917,10 @@ index 0000000..4b4499c
 +	{
 +		int killed = 0;
 +		unsigned long long reap_start = now_ms();
++		memset(&ru, 0, sizeof(ru));
 +
 +		for (;;) {
-+			pid_t w = waitpid(pid, &status, WNOHANG);
++			pid_t w = wait4(pid, &status, WNOHANG, &ru);
 +
 +			if (w == pid || w < 0)
 +				break;
@@ -3680,7 +3945,15 @@ index 0000000..4b4499c
 +		m.term_sig = WTERMSIG(status);
 +	} else
 +		m.exit_code = -1;
++	{
++		const char *kind;
 +
++		if (m.timed_out)        kind = "timed_out";
++		else if (m.cancelled)   kind = "cancelled";
++		else if (WIFSIGNALED(status)) kind = "signalled";
++		else                    kind = "exited";
++		exit_kind = kind;
++	}
 +	{
 +		char *p1 = art_path(dir, "stdout");
 +		char *p2 = art_path(dir, "stderr");
@@ -3692,6 +3965,33 @@ index 0000000..4b4499c
 +			m.err_bytes = (unsigned long long)st.st_size;
 +		close(art_out);
 +		close(art_err);
++		{
++			char *p = art_path(dir, "cwd");
++
++			cwd_final = xmalloc_open_read_close(p, NULL);
++			free(p);
++			if (cwd_final) {
++				/* one line, no trailing newline */
++				char *nl = strchr(cwd_final, '\n');
++
++				if (nl)
++					*nl = '\0';
++				if (cwd_final[0])
++					cwd_final_known = 1;
++			}
++		}
++		{
++			char *p = art_path(dir, "stdout");
++
++			run_scan_stream(p, &out_lines, &out_binary, &out_final_nl);
++			free(p);
++			p = art_path(dir, "stderr");
++			run_scan_stream(p, &err_lines, &err_binary, &err_final_nl);
++			free(p);
++		}
++		if (want_effects)
++			run_effects_snapshot(cwd_start, &eff_after);
++		dropped_bytes = m.dropped_bytes;
 +		if (tl.on)
 +			tl_write_file(dir);
 +		write_meta(dir, &m);
@@ -3706,6 +4006,85 @@ index 0000000..4b4499c
 +			}
 +			fputs(",\"dir\":", stdout);
 +			json_write_str(dir);
++			fputs(",\"cwd\":", stdout);
++			json_write_str(cwd_final_known ? cwd_final : (cwd_start ? cwd_start : ""));
++			printf(",\"cwd_final_known\":%s", cwd_final_known ? "true" : "false");
++			fputs(",\"cwd_start\":", stdout);
++			json_write_str(cwd_start ? cwd_start : "");
++			fputs(",\"busybox\":", stdout);
++			json_write_str(self_exe ? self_exe : "");
++			printf(",\"started_unix_us\":%llu", started_unix_us);
++			printf(",\"duration_ns\":%llu", (unsigned long long)m.duration_ms * 1000000ULL);
++			printf(",\"exit_kind\":\"%s\"", exit_kind);
++			if (m.term_sig) {
++				const char *sn = get_signame(m.term_sig);
++
++				printf(",\"signal\":%d,\"signal_name\":\"%s\"",
++						m.term_sig, sn ? sn : "?");
++			}
++			fputs(",\"argv\":", stdout);
++			run_emit_argv_json(argv);
++			fputs(",\"argv0_resolved\":", stdout);
++			json_write_str(argv0_resolved ? argv0_resolved : "");
++			printf(",\"cpu_user_ms\":%lu,\"cpu_sys_ms\":%lu,\"max_rss_kb\":%ld",
++					(unsigned long)(ru.ru_utime.tv_sec * 1000
++						+ ru.ru_utime.tv_usec / 1000),
++					(unsigned long)(ru.ru_stime.tv_sec * 1000
++						+ ru.ru_stime.tv_usec / 1000),
++#if defined(__APPLE__)
++					(long)(ru.ru_maxrss / 1024)   /* Darwin reports bytes */
++#else
++					(long)ru.ru_maxrss            /* Linux reports KiB */
++#endif
++					);
++			printf(",\"stdout_lines\":%llu,\"stderr_lines\":%llu", out_lines, err_lines);
++			printf(",\"binary\":%s,\"final_newline\":%s",
++					out_binary ? "true" : "false",
++					out_final_nl ? "true" : "false");
++			printf(",\"dropped_bytes\":%llu", dropped_bytes);
++			{
++				char *replay = run_make_replay(cwd_start, argv);
++
++				fputs(",\"replay\":", stdout);
++				json_write_str(replay);
++				free(replay);
++			}
++			{
++				char hex[65];
++
++				run_inputs_hash(argv, cwd_start, hex);
++				printf(",\"inputs_hash\":\"%s\"", hex);
++			}
++			{
++				const char *v = bb_banner;
++				const char *sp;
++
++				/* "BusyBox v1.39.0.git (...) multi-call binary" -> the version */
++				if (strncmp(v, "BusyBox v", 9) == 0)
++					v += 9;
++				sp = strchr(v, ' ');
++				fputs(",\"busybox_version\":", stdout);
++				if (sp) {
++					char *ver = xstrndup(v, (size_t)(sp - v));
++
++					json_write_str(ver);
++					free(ver);
++				} else {
++					json_write_str(v);
++				}
++			}
++			if ((m.out_bytes + m.err_bytes) > (unsigned long long)budget) {
++				/* how to read past the view budget */
++				char *nx = xasprintf("log -D %s R%u -B %ld",
++						dir, id, (long)budget * 2);
++
++				fputs(",\"view_next\":", stdout);
++				json_write_str(nx);
++				free(nx);
++			}
++			if (want_effects) {
++				run_emit_effects_json(&eff_before, &eff_after);
++			}
 +			printf(",\"pgid\":%ld", child_pgid);
 +			printf(",\"pty\":%s", pty_mode ? "true" : "false");
 +			if (pty_mode) {
@@ -3766,10 +4145,13 @@ index 0000000..4b4499c
 +			}
 +			putchar('}');
 +			putchar('\n');
++		} else if (jsonl_on) {
++			/* nothing: a NDJSON consumer reads the events and the exit event */
 +		} else if (tl.on) {
-+			printf("run=R%u exit_code=%d timed_out=%s cancelled=%s duration_ms=%ld\n",
++			printf("run=R%u exit_code=%d timed_out=%s cancelled=%s idle=%s duration_ms=%ld\n",
 +					id, m.exit_code, m.timed_out ? "true" : "false",
-+					m.cancelled ? "true" : "false", m.duration_ms);
++					m.cancelled ? "true" : "false",
++					m.idle_out ? "true" : "false", m.duration_ms);
 +			printf("timeline_lines=%u shown=%u truncated=%s stamp=%s res_ns=%u\n",
 +					tl.n, tl_text_shown(),
 +					(tl.truncated || tl.n > tl_shown_count()) ? "true" : "false",
@@ -3798,9 +4180,10 @@ index 0000000..4b4499c
 +			} else
 +				dump_bounded(p2, (size_t)budget / 4, 0, "stderr");
 +		} else {
-+			printf("run=R%u exit_code=%d timed_out=%s cancelled=%s duration_ms=%ld\n",
++			printf("run=R%u exit_code=%d timed_out=%s cancelled=%s idle=%s duration_ms=%ld\n",
 +					id, m.exit_code, m.timed_out ? "true" : "false",
-+					m.cancelled ? "true" : "false", m.duration_ms);
++					m.cancelled ? "true" : "false",
++					m.idle_out ? "true" : "false", m.duration_ms);
 +			printf("captured_bytes=%llu stdout=%llu stderr=%llu capture_complete=%s "
 +					"view_truncated=%s\n",
 +					m.out_bytes + m.err_bytes, m.out_bytes, m.err_bytes,
@@ -3847,6 +4230,13 @@ index 0000000..4b4499c
 +				printf("... view truncated; `log R%u --match ...' has the rest\n", id);
 +		}
 +	}
++	if (jsonl_on) {
++		printf("{\"event\":\"exit\",\"run\":\"R%u\",\"exit_code\":%d,"
++				"\"timed_out\":%s,\"cancelled\":%s,\"idle\":%s,\"duration_ms\":%ld}\n",
++				id, m.exit_code, m.timed_out ? "true" : "false",
++				m.cancelled ? "true" : "false",
++				m.idle_out ? "true" : "false", m.duration_ms);
++	}
 +	if (opt_prune) {
 +		unsigned keep = (unsigned)strtoul(opt_prune, NULL, 10);
 +
@@ -3856,12 +4246,13 @@ index 0000000..4b4499c
 +			printf("pruned=%u keep=%u\n", gone, keep);
 +	}
 +	fflush(stdout);
-+	if (m.timed_out || m.cancelled)
++	if (m.timed_out || m.cancelled || m.idle_out)
 +		return 3;
 +	if (m.exit_code < 0)
 +		return 1;
 +	return m.exit_code;
 +}
++
 +
 +/* ---------- log ---------- */
 +
@@ -4080,6 +4471,437 @@ index 0000000..4b4499c
 +}
 +
 +/* log --diff R1:R2: compare two runs' stdout, line by line. */
++/* ---------- time-addressed timeline retrieval ---------- */
++
++/* "[   0.011354 out] text" -> microseconds, and which stream. */
++static long stamp_us(const char *line, size_t len, int *is_err)
++{
++	long sec = 0, frac = 0;
++	size_t i = 0;
++	int digits = 0;
++
++	*is_err = 0;
++	while (i < len && (line[i] == '[' || line[i] == ' '))
++		i++;
++	while (i < len && line[i] >= '0' && line[i] <= '9')
++		sec = sec * 10 + (line[i++] - '0');
++	if (i < len && line[i] == '.') {
++		i++;
++		while (i < len && line[i] >= '0' && line[i] <= '9' && digits < 9) {
++			frac = frac * 10 + (line[i++] - '0');
++			digits++;
++		}
++	}
++	while (digits++ < 9)
++		frac *= 10;
++	for (; i < len; i++)
++		if (line[i] == 'e' && i + 3 < len && memcmp(line + i, "err", 3) == 0) {
++			*is_err = 1;
++			break;
++		}
++	return sec * 1000000L + frac / 1000;
++}
++
++struct tlstat {
++	unsigned lines, err_lines;
++	long first_out, first_err, last;
++	long gap_from, gap_us;
++};
++
++/* Walk the timeline artifact, filling `st` and printing whatever the caller wants. */
++static int tl_query(const char *dir, long since_us, long until_us,
++		double gap_s, long limit, int json, size_t budget)
++{
++	char *path = art_path(dir, "timeline");
++	char *data = NULL;
++	size_t len = 0, starts_n = 0, *starts;
++	unsigned nlines = 0, i, shown = 0;
++	size_t printed = 0;
++	struct tlstat st;
++
++	memset(&st, 0, sizeof(st));
++	st.first_out = -1;
++	st.first_err = -1;
++
++	if (read_all(path, &data, &len) != 0) {
++		if (json)
++			printf("{\"schema\":1,\"stream\":\"timeline\",\"status\":\"error\","
++					"\"code\":\"NOT_FOUND\",\"message\":\"run not found or stream missing\"}");
++		else
++			fprintf(stderr, "%s: NOT_FOUND\n", path);
++		free(path);
++		return 1;
++	}
++	free(path);
++	starts = line_starts(data, len, &nlines);
++
++	for (i = 0; i < nlines; i++) {
++		size_t l = line_len(data, starts, nlines, len, i);
++		int is_err;
++		long us;
++
++		if (l == 0)
++			continue;
++		us = stamp_us(data + starts[i], l, &is_err);
++		st.lines++;
++		if (is_err) {
++			st.err_lines++;
++			if (st.first_err < 0)
++				st.first_err = us;
++		} else if (st.first_out < 0) {
++			st.first_out = us;
++		}
++		if (us > st.last)
++			st.last = us;
++		if (i && st.last > 0) {
++			long prev = 0;
++			int pe;
++			size_t pl = line_len(data, starts, nlines, len, i - 1);
++
++			prev = pl ? stamp_us(data + starts[i - 1], pl, &pe) : 0;
++			if (us - prev > st.gap_us) {
++				st.gap_us = us - prev;
++				st.gap_from = prev;
++			}
++		}
++	}
++
++	if (gap_s > 0) {
++		/* The N widest silences, with the line on each side. */
++		long want = (long)(gap_s * 1000000.0);
++		long shown_gaps = 0;
++
++		if (json)
++			printf("{\"schema\":1,\"stream\":\"timeline\",\"status\":\"ok\",\"gaps\":[");
++		for (i = 1; i < nlines && shown_gaps < (limit > 0 ? limit : 3); i++) {
++			size_t pl = line_len(data, starts, nlines, len, i - 1);
++			size_t cl = line_len(data, starts, nlines, len, i);
++			int pe, ce;
++			long pu, cu;
++
++			if (!pl || !cl)
++				continue;
++			pu = stamp_us(data + starts[i - 1], pl, &pe);
++			cu = stamp_us(data + starts[i], cl, &ce);
++			if (cu - pu < want)
++				continue;
++			if (json) {
++				printf("%s{\"from_us\":%ld,\"to_us\":%ld,\"gap_us\":%ld,\"before\":",
++						shown_gaps ? "," : "", pu, cu, cu - pu);
++				json_write_str(xstrndup(data + starts[i - 1], pl));
++				printf(",\"after\":");
++				json_write_str(xstrndup(data + starts[i], cl));
++				putchar('}');
++			} else {
++				printf("gap %ldus -> %ldus (%ldus)\n", pu, cu, cu - pu);
++			}
++			shown_gaps++;
++		}
++		if (json)
++			printf("],\"lines\":%u,\"stderr_lines\":%u}", st.lines, st.err_lines);
++		else
++			printf("gaps=%ld lines=%u stderr_lines=%u\n", shown_gaps, st.lines, st.err_lines);
++		free(starts);
++		free(data);
++		fflush(stdout);
++		return 0;
++	}
++
++	if (json)
++		printf("{\"schema\":1,\"stream\":\"timeline\",\"status\":\"ok\",\"events\":[");
++	for (i = 0; i < nlines; i++) {
++		size_t l = line_len(data, starts, nlines, len, i);
++		int is_err;
++		long us;
++
++		if (l == 0)
++			continue;
++		us = stamp_us(data + starts[i], l, &is_err);
++		if (since_us >= 0 && us < since_us)
++			continue;
++		if (until_us >= 0 && us > until_us)
++			continue;
++		if (printed + l + 40 > budget) {
++			shown = i;
++			break;
++		}
++		if (json) {
++			char *text = xstrndup(data + starts[i], l);
++			char *body = strchr(text, ']');
++
++			while (body && *body == ']')
++				body++, body += (*body == ' ');
++			printf("%s{\"n\":%u,\"us\":%ld,\"stream\":\"%s\",\"text\":",
++					printed ? "," : "", i + 1, us, is_err ? "err" : "out");
++			json_write_str(body ? body : "");
++			putchar('}');
++			free(text);
++		} else {
++			fwrite(data + starts[i], 1, l, stdout);
++			putchar('\n');
++		}
++		printed += l;
++	}
++	if (json)
++		printf("],\"shown_bytes\":%u,\"truncated\":%s}", (unsigned)printed,
++				shown ? "true" : "false");
++	free(starts);
++	free(data);
++	fflush(stdout);
++	return 0;
++}
++
++
++static int tl_stats(const char *root, const char *run, struct tlstat *st, long *duration_ms)
++{
++	char *dir = xasprintf("%s/%s", root, run);
++	char *path = art_path(dir, "timeline");
++	char *meta = art_path(dir, "meta");
++	char *data = NULL, *m = NULL;
++	size_t len = 0, mlen = 0, *starts;
++	unsigned nlines = 0, i;
++
++	memset(st, 0, sizeof(*st));
++	st->first_out = st->first_err = -1;
++	*duration_ms = 0;
++	if (read_all(path, &data, &len) != 0) {
++		free(dir); free(path); free(meta);
++		return 1;
++	}
++	starts = line_starts(data, len, &nlines);
++	for (i = 0; i < nlines; i++) {
++		size_t l = line_len(data, starts, nlines, len, i);
++		int is_err;
++		long us, prev = 0;
++
++		if (l == 0)
++			continue;
++		us = stamp_us(data + starts[i], l, &is_err);
++		st->lines++;
++		if (is_err) {
++			st->err_lines++;
++			if (st->first_err < 0)
++				st->first_err = us;
++		} else if (st->first_out < 0) {
++			st->first_out = us;
++		}
++		if (i) {
++			size_t pl = line_len(data, starts, nlines, len, i - 1);
++			int pe;
++
++			prev = pl ? stamp_us(data + starts[i - 1], pl, &pe) : 0;
++			if (us - prev > st->gap_us) {
++				st->gap_us = us - prev;
++				st->gap_from = prev;
++			}
++		}
++	}
++	if (read_all(meta, &m, &mlen) == 0) {
++		char *d = strstr(m, "duration_ms=");
++
++		if (d)
++			*duration_ms = strtol(d + 12, NULL, 10);
++	}
++	free(starts);
++	free(data);
++	free(m);
++	free(dir);
++	free(path);
++	free(meta);
++	return 0;
++}
++
++/* One deterministic digest: what the plugin builds in TypeScript today. */
++static int tl_summary(const char *dir, const char *run, int json)
++{
++	char *path = art_path(dir, "timeline");
++	char *meta = art_path(dir, "meta");
++	char *data = NULL;
++	size_t len = 0, *starts;
++	unsigned nlines = 0, i;
++	struct tlstat st;
++	long exit_code = 0, duration_ms = 0;
++	char *m = NULL;
++	size_t mlen = 0;
++	int timed_out = 0;
++
++	memset(&st, 0, sizeof(st));
++	st.first_out = st.first_err = -1;
++	if (read_all(path, &data, &len) != 0) {
++		if (json)
++			printf("{\"schema\":1,\"status\":\"error\",\"code\":\"NOT_FOUND\"}");
++		else
++			fprintf(stderr, "%s: NOT_FOUND\n", path);
++		return 1;
++	}
++	starts = line_starts(data, len, &nlines);
++	for (i = 0; i < nlines; i++) {
++		size_t l = line_len(data, starts, nlines, len, i);
++		int is_err;
++		long us, prev = 0;
++
++		if (l == 0)
++			continue;
++		us = stamp_us(data + starts[i], l, &is_err);
++		st.lines++;
++		if (is_err) {
++			st.err_lines++;
++			if (st.first_err < 0)
++				st.first_err = us;
++		} else if (st.first_out < 0) {
++			st.first_out = us;
++		}
++		if (i) {
++			size_t pl = line_len(data, starts, nlines, len, i - 1);
++			int pe;
++
++			prev = pl ? stamp_us(data + starts[i - 1], pl, &pe) : 0;
++			if (us - prev > st.gap_us) {
++				st.gap_us = us - prev;
++				st.gap_from = prev;
++			}
++		}
++		if (us > st.last)
++			st.last = us;
++	}
++	if (read_all(meta, &m, &mlen) == 0) {
++		char *p = strstr(m, "exit_code=");
++		char *d = strstr(m, "duration_ms=");
++		char *t = strstr(m, "timed_out=");
++
++		if (p) exit_code = strtol(p + 10, NULL, 10);
++		if (d) duration_ms = strtol(d + 12, NULL, 10);
++		if (t) timed_out = (t[10] == '1');
++	}
++	if (json) {
++		printf("{\"schema\":1,\"run\":");
++		json_write_str(run);
++		printf(",\"status\":\"ok\",\"lines\":%u,\"stderr_lines\":%u,"
++				"\"first_out_us\":%ld,\"first_err_us\":%ld,\"last_us\":%ld,"
++				"\"longest_gap\":{\"from_us\":%ld,\"to_us\":%ld,\"gap_us\":%ld},"
++				"\"exit_code\":%ld,\"duration_ms\":%ld,\"timed_out\":%s}",
++				st.lines, st.err_lines, st.first_out, st.first_err, st.last,
++				st.gap_from, st.gap_from + st.gap_us, st.gap_us,
++				exit_code, duration_ms, timed_out ? "true" : "false");
++	} else {
++		printf("run=%s lines=%u stderr=%u first_out_us=%ld first_err_us=%ld "
++				"last_us=%ld longest_gap_us=%ld exit_code=%ld duration_ms=%ld timed_out=%d\n",
++				run, st.lines, st.err_lines, st.first_out, st.first_err,
++				st.last, st.gap_us, exit_code, duration_ms, timed_out);
++	}
++	free(starts);
++	free(data);
++	free(m);
++	fflush(stdout);
++	return 0;
++}
++
++/* First N and last N lines of a stream: the digest for output brief cannot reduce. */
++static int dump_sample(const char *dir, const char *label, long want,
++		size_t budget, int json)
++{
++	char *path = art_path(dir, label);
++	char *data = NULL;
++	size_t len = 0, *starts, printed = 0;
++	unsigned nlines = 0, i, head, tail;
++
++	if (read_all(path, &data, &len) != 0) {
++		if (json)
++			printf("{\"schema\":1,\"stream\":\"%s\",\"status\":\"error\","
++					"\"code\":\"NOT_FOUND\",\"message\":\"run not found or stream missing\"}", label);
++		else
++			fprintf(stderr, "%s: NOT_FOUND\n", path);
++		return 1;
++	}
++	starts = line_starts(data, len, &nlines);
++	head = ((unsigned)want < nlines) ? (unsigned)want : nlines;
++	tail = (nlines > head && (nlines - head) > (unsigned)want) ? (unsigned)want : (nlines - head);
++
++	if (json)
++		printf("{\"schema\":1,\"stream\":\"%s\",\"status\":\"ok\",\"lines\":[", label);
++	for (i = 0; i < head; i++) {
++		size_t l = line_len(data, starts, nlines, len, i);
++
++		if (json) {
++			fputs(i ? "," : "", stdout);
++			json_write_str(xstrndup(data + starts[i], l));
++		} else {
++			fwrite(data + starts[i], 1, l, stdout);
++			putchar('\n');
++		}
++		printed += l;
++	}
++	if (json)
++		printf("],\"omitted\":%u,\"tail\":[", nlines - head - tail);
++	for (i = nlines - tail; tail && i < nlines; i++) {
++		size_t l = line_len(data, starts, nlines, len, i);
++
++		if (json) {
++			fputs(i == nlines - tail ? "" : ",", stdout);
++			json_write_str(xstrndup(data + starts[i], l));
++		} else {
++			fwrite(data + starts[i], 1, l, stdout);
++			putchar('\n');
++		}
++		printed += l;
++	}
++	if (json)
++		printf("],\"shown_bytes\":%u,\"truncated\":%s}", (unsigned)printed,
++				(nlines > head + tail) ? "true" : "false");
++	free(starts);
++	free(data);
++	fflush(stdout);
++	return 0;
++}
++
++
++
++/* Two runs by shape: lines, stderr lines, first stderr, longest gap, duration. */
++static int log_diff_timeline(const char *root, const char *spec, int json)
++{
++	const char *colon = strchr(spec, ':');
++	char *a, *b;
++	struct tlstat sa, sb;
++	long da = 0, dbb = 0;
++	int changed = 0;
++
++	if (!colon || colon == spec || !colon[1]) {
++		fprintf(stderr, "log: --diff-timeline wants RUN1:RUN2\n");
++		return 2;
++	}
++	a = xstrndup(spec, (size_t)(colon - spec));
++	b = xstrdup(colon + 1);
++	if (tl_stats(root, a, &sa, &da) || tl_stats(root, b, &sb, &dbb)) {
++		if (json)
++			printf("{\"schema\":1,\"status\":\"error\",\"code\":\"NOT_FOUND\"}");
++		else
++			fprintf(stderr, "log: one of %s / %s has no timeline\n", a, b);
++		free(a);
++		free(b);
++		return 1;
++	}
++	if (sa.lines != sb.lines || sa.err_lines != sb.err_lines
++	 || sa.gap_us != sb.gap_us || da != dbb)
++		changed = 1;
++	if (json)
++		printf("{\"schema\":1,\"status\":\"ok\",\"a\":\"%s\",\"b\":\"%s\",\"changed\":%s,"
++				"\"lines\":{\"a\":%u,\"b\":%u},\"stderr_lines\":{\"a\":%u,\"b\":%u},"
++				"\"first_err_us\":{\"a\":%ld,\"b\":%ld},"
++				"\"longest_gap_us\":{\"a\":%ld,\"b\":%ld},"
++				"\"duration_ms\":{\"a\":%ld,\"b\":%ld}}",
++				a, b, changed ? "true" : "false",
++				sa.lines, sb.lines, sa.err_lines, sb.err_lines,
++				sa.first_err, sb.first_err, sa.gap_us, sb.gap_us, da, dbb);
++	else
++		printf("%s -> %s lines %u->%u stderr %u->%u gap_us %ld->%ld duration_ms %ld->%ld changed=%s\n",
++				a, b, sa.lines, sb.lines, sa.err_lines, sb.err_lines,
++				sa.gap_us, sb.gap_us, da, dbb, changed ? "true" : "false");
++	free(a);
++	free(b);
++	fflush(stdout);
++	return 0;
++}
++
 +static int log_diff(const char *root, const char *spec, int json)
 +{
 +	char *colon = strchr(spec, ':');
@@ -4159,6 +4981,9 @@ index 0000000..4b4499c
 +{
 +	char *opt_lines = NULL, *opt_match = NULL, *opt_ctx = NULL;
 +	char *opt_stream = NULL, *opt_bytes = NULL, *opt_dir = NULL, *opt_fmt = NULL;
++	char *opt_since = NULL, *opt_until = NULL, *opt_gap = NULL;
++	char *opt_limit = NULL, *opt_sample = NULL, *opt_difftl = NULL;
++	int summary_only = 0;
 +	char *opt_diff = NULL;
 +	unsigned opts;
 +	const char *root, *run, *dir;
@@ -4175,6 +5000,14 @@ index 0000000..4b4499c
 +		"max-bytes\0" Required_argument "B"
 +		"dir\0"       Required_argument "D"
 +		"format\0"    Required_argument "F"
++		"since\0"     Required_argument "S"
++		"until\0"     Required_argument "U"
++		"around-gap\0" Required_argument "G"
++		"limit\0"     Required_argument "N"
++		"sample\0"    Required_argument "P"
++		"summary\0"   No_argument       "Z"
++		"marks\0"     No_argument       "K"
++		"diff-timeline\0" Required_argument "Q"
 +		;
 +
 +	xfunc_error_retval = 2;
@@ -4183,6 +5016,15 @@ index 0000000..4b4499c
 +		int i;
 +
 +		for (i = 1; argv[i]; i++) {
++			if (strcmp(argv[i], "--diff-timeline") == 0 && argv[i + 1]) {
++				int j;
++
++				opt_difftl = argv[i + 1];
++				for (j = i; argv[j + 2]; j++)
++					argv[j] = argv[j + 2];
++				argv[j] = NULL;
++				break;
++			}
 +			if (strcmp(argv[i], "--diff") == 0 && argv[i + 1]) {
 +				int j;
 +
@@ -4194,10 +5036,13 @@ index 0000000..4b4499c
 +			}
 +		}
 +	}
-+	opts = getopt32long(argv, "l:m:c:s:MB:D:F:", log_longopts,
++	opts = getopt32long(argv, "l:m:c:s:MB:D:F:S:U:G:N:P:ZQ:K", log_longopts,
 +			&opt_lines, &opt_match, &opt_ctx, &opt_stream,
-+			&opt_bytes, &opt_dir, &opt_fmt);
++			&opt_bytes, &opt_dir, &opt_fmt,
++			&opt_since, &opt_until, &opt_gap, &opt_limit, &opt_sample,
++			&opt_difftl);
 +	meta_only = (opts & (1 << 4)) != 0;   /* M */
++	summary_only = (opts & (1 << 13)) != 0;  /* Z: 14th letter of the optstring */
 +	argv += optind;
 +
 +	if (opt_fmt) {
@@ -4218,10 +5063,75 @@ index 0000000..4b4499c
 +	root = artifact_root(opt_dir);
 +	if (opt_diff)
 +		return log_diff(root, opt_diff, json);
++	if (opt_difftl)
++		return log_diff_timeline(root, opt_difftl, json);
 +	if (!argv[0])
 +		bb_show_usage();
 +	run = argv[0];                 /* was lost in the run.c rewrite */
 +	dir = xasprintf("%s/%s", root, run);
++
++	if (opt_since || opt_until || opt_gap)
++		return tl_query(dir,
++				opt_since ? (long)(strtod(opt_since, NULL) * 1000000.0) : -1,
++				opt_until ? (long)(strtod(opt_until, NULL) * 1000000.0) : -1,
++				opt_gap ? strtod(opt_gap, NULL) : 0.0,
++				opt_limit ? strtol(opt_limit, NULL, 10) : 3,
++				json, (size_t)budget);
++	if (summary_only)
++		return tl_summary(dir, run, json);
++	if (opts & (1 << 15)) { /* K: 16th letter */
++		char *mp = art_path(dir, "marks");
++		char *md = NULL;
++		size_t ml = 0;
++		unsigned long long prev = 0;
++		int first_mark = 1;
++
++		if (read_all(mp, &md, &ml) != 0) {
++			if (json)
++				fputs("{\"schema\":1,\"marks\":[]}\n", stdout);
++			else
++				fputs("no marks\n", stdout);
++			return 0;
++		}
++		if (json)
++			fputs("{\"schema\":1,\"marks\":[", stdout);
++		{
++			char *line = md;
++
++			while (line && *line) {
++				char *nl = strchr(line, '\n');
++				unsigned long long us;
++				char *name;
++
++				if (nl)
++					*nl = '\0';
++				us = strtoull(line, &name, 10);
++				while (*name == ' ')
++					name++;
++				if (json) {
++					printf("%s{\"name\":\"%.*s\",\"us\":%llu,\"delta_us\":%llu}",
++							first_mark ? "" : ",", (int)strlen(name), name,
++							us, prev ? us - prev : 0);
++				} else {
++					printf("%-24s at %llu.%06llu  (%+lld.%06lld from previous)\n",
++							name, us / 1000000ULL, us % 1000000ULL,
++							(long long)((us - (prev ? prev : us)) / 1000000ULL),
++							(long long)((us - (prev ? prev : us)) % 1000000ULL));
++				}
++				first_mark = 0;
++				prev = us;
++				line = nl ? nl + 1 : NULL;
++			}
++		}
++		if (json)
++			fputs("]}\n", stdout);
++		free(md);
++		return 0;
++	}
++	if (opt_sample)
++		return dump_sample(dir,
++				opt_stream && strcmp(opt_stream, "stderr") == 0 ? "stderr" : "stdout",
++				strtol(opt_sample, NULL, 10), (size_t)budget, json);
 +
 +	if (meta_only) {
 +		char *path = art_path(dir, "meta");
@@ -4279,22 +5189,6 @@ index 0000000..4b4499c
 +	fflush(stdout);
 +	return rc;
 +}
-diff --git a/coreutils/sort.c b/coreutils/sort.c
-index 1c1b297..e319769 100644
---- a/coreutils/sort.c
-+++ b/coreutils/sort.c
-@@ -307,11 +307,9 @@ static int compare_keys(const void *xarg, const void *yarg)
- 		default:
- 			bb_simple_error_msg_and_die("unknown sort type");
- 			break;
--#if defined(HAVE_STRVERSCMP) && HAVE_STRVERSCMP == 1
- 		case FLAG_V:
- 			retval = strverscmp(x, y);
- 			break;
--#endif
- 		/* Ascii sort */
- 		case 0:
- #if ENABLE_LOCALE_SUPPORT
 diff --git a/coreutils/split.c b/coreutils/split.c
 index b6d1b9a..5a7ba6f 100644
 --- a/coreutils/split.c
@@ -4370,59 +5264,6 @@ index b6d1b9a..5a7ba6f 100644
  		pfx = xasprintf("%s%s", sfx, char_p);
  		if (ENABLE_FEATURE_CLEAN_UP)
  			free(char_p);
-diff --git a/coreutils/stat.c b/coreutils/stat.c
-index 377b425..50e2ee6 100644
---- a/coreutils/stat.c
-+++ b/coreutils/stat.c
-@@ -105,6 +105,19 @@
- //usage:	)
- 
- #include "libbb.h"
-+#if defined(__APPLE__)
-+/* struct statfs and statfs(2) live in <sys/mount.h> on Darwin */
-+# include <sys/mount.h>
-+# include <sys/ucred.h>
-+#endif
-+#if defined(__APPLE__)
-+/* Darwin's statfs.f_type is not a Linux magic number; the filesystem name is
-+ * carried in f_fstypename instead of being looked up in a magic table.
-+ */
-+# define BB_STATFS_FSTYPE(sf) ((const char *)(sf)->f_fstypename)
-+#else
-+# define BB_STATFS_FSTYPE(sf) human_fstype((sf)->f_type)
-+#endif
- #include "common_bufsiz.h"
- 
- enum {
-@@ -306,11 +319,11 @@ static void FAST_FUNC print_statfs(char *pformat, const char m,
- 	} else if (m == 'i') {
- 		printf_llx(pformat, get_f_fsid(statfsbuf));
- 	} else if (m == 'l') {
--		printf_lu(pformat, statfsbuf->f_namelen);
-+		printf_lu(pformat, BB_STATFS_NAMELEN(statfsbuf));
- 	} else if (m == 't') {
- 		printf_lx(pformat, statfsbuf->f_type); /* no equiv */
- 	} else if (m == 'T') {
--		printf_s(pformat, human_fstype(statfsbuf->f_type));
-+		printf_s(pformat, BB_STATFS_FSTYPE(statfsbuf));
- 	} else if (m == 'b') {
- 		printf_llu(pformat, statfsbuf->f_blocks);
- 	} else if (m == 'f') {
-@@ -544,12 +557,12 @@ static bool do_statfs(const char *filename, const char *format)
- 	printf(format,
- 	       filename,
- 	       get_f_fsid(&statfsbuf),
--	       statfsbuf.f_namelen);
-+	       BB_STATFS_NAMELEN(&statfsbuf));
- 
- 	if (option_mask32 & OPT_TERSE)
- 		printf("%lx ", (unsigned long) statfsbuf.f_type);
- 	else
--		printf("Type: %s\n", human_fstype(statfsbuf.f_type));
-+		printf("Type: %s\n", BB_STATFS_FSTYPE(&statfsbuf));
- 
- # if !ENABLE_SELINUX
- 	format = (option_mask32 & OPT_TERSE
 diff --git a/editors/awk.c b/editors/awk.c
 index d7edf05..2a4e251 100644
 --- a/editors/awk.c
@@ -5880,227 +6721,6 @@ index 0000000..15c6aee
 +unsigned json_len(const json_value_t *v) FAST_FUNC;
 +
 +#endif
-diff --git a/include/libbb.h b/include/libbb.h
-index 5348f6c..a57c9ea 100644
---- a/include/libbb.h
-+++ b/include/libbb.h
-@@ -27,6 +27,19 @@
- # define sigemptyset(s)   __sigemptyset(s)
- # define sigisemptyset(s) __sigisemptyset(s)
- #endif
-+#if defined(__APPLE__)
-+/* Darwin lacks glibc's sigisemptyset() */
-+# undef sigisemptyset
-+static ALWAYS_INLINE int bb_sigisemptyset(const sigset_t *set)
-+{
-+	int sig;
-+	for (sig = 1; sig < NSIG; sig++)
-+		if (sigismember(set, sig))
-+			return 0;
-+	return 1;
-+}
-+# define sigisemptyset(s) bb_sigisemptyset(s)
-+#endif
- #include <stdint.h>
- #include <stdio.h>
- #include <stdlib.h>
-@@ -69,10 +82,33 @@
- #endif
- #ifdef HAVE_MNTENT_H
- # include <mntent.h>
-+# define BB_HAVE_MNTENT 1
-+#endif
-+#if defined(__APPLE__)
-+/* Darwin has no <mntent.h>. libbb/mntent.c implements this API on top of
-+ * getmntinfo(3), which is where Darwin keeps its mount table.
-+ */
-+# define BB_HAVE_MNTENT 1
-+struct mntent {
-+	char *mnt_fsname;
-+	char *mnt_dir;
-+	char *mnt_type;
-+	char *mnt_opts;
-+	int mnt_freq;
-+	int mnt_passno;
-+};
-+FILE *setmntent(const char *filename, const char *type);
-+struct mntent *getmntent(FILE *stream);
-+int endmntent(FILE *stream);
-+char *hasmntopt(const struct mntent *m, const char *opt);
- #endif
- #ifdef HAVE_SYS_STATFS_H
- # include <sys/statfs.h>
- #endif
-+/* NB: Darwin's <sys/mount.h> also drags in <bsm/audit.h>, which defines
-+ * token_t and clashes with editors/diff.c. Do not include it globally here;
-+ * the few files that need struct statfs include it themselves.
-+ */
- /* Don't do this here:
-  * #include <sys/sysinfo.h>
-  * Some linux/ includes pull in conflicting definition
-@@ -143,6 +179,9 @@
- # include <arpa/inet.h>
- #elif defined __APPLE__
- # include <netinet/in.h>
-+/* inet_aton()/inet_pton()/inet_ntop() live here on Darwin; without it we
-+ * get "call to undeclared function 'inet_aton'" */
-+# include <arpa/inet.h>
- #else
- # include <arpa/inet.h>
- //This breaks on bionic:
-@@ -1508,6 +1547,9 @@ char **skip_dash_dash(char **argv) FAST_FUNC;
- extern const char *const bb_argv_dash[]; /* { "-", NULL } */
- extern uint32_t option_mask32;
- uint32_t getopt32(char **argv, const char *applet_opts, ...) FAST_FUNC;
-+#if ENABLE_FEATURE_GNU_LONG_OPTS
-+void bb_expand_gnu_longopts(char **argv, const char *optstring, const char *own_longopts) FAST_FUNC;
-+#endif
- # define No_argument "\0"
- # define Required_argument "\001"
- # define Optional_argument "\002"
-@@ -1606,6 +1648,7 @@ void bb_simple_herror_msg_and_die(const char *s) NORETURN FAST_FUNC;
- void bb_perror_nomsg_and_die(void) NORETURN FAST_FUNC;
- void bb_perror_nomsg(void) FAST_FUNC;
- void bb_verror_msg(const char *s, va_list p, const char *strerr) FAST_FUNC;
-+
- void bb_die_memory_exhausted(void) NORETURN FAST_FUNC;
- void bb_logenv_override(void) FAST_FUNC;
- 
-@@ -1763,7 +1806,7 @@ const struct hwtype *get_hwntype(int type) FAST_FUNC;
- 
- 
- extern int fstype_matches(const char *fstype, const char *comma_list) FAST_FUNC;
--#ifdef HAVE_MNTENT_H
-+#ifdef BB_HAVE_MNTENT
- extern struct mntent *find_mount_point(const char *name, int subdir_too) FAST_FUNC;
- #endif
- extern void erase_mtab(const char * name) FAST_FUNC;
-diff --git a/include/platform.h b/include/platform.h
-index 5662a4e..7db1b63 100644
---- a/include/platform.h
-+++ b/include/platform.h
-@@ -172,8 +172,14 @@
- #include <limits.h>
- #if defined(__digital__) && defined(__unix__)
- # include <sex.h>
--#elif defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) \
--   || defined(__APPLE__)
-+#elif defined(__APPLE__)
-+# include <sys/resource.h>  /* rlimit */
-+# include <machine/endian.h>
-+/* Darwin has no glibc's __bswapNN; use compiler builtins */
-+# define bswap_64 __builtin_bswap64
-+# define bswap_32 __builtin_bswap32
-+# define bswap_16 __builtin_bswap16
-+#elif defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
- # include <sys/resource.h>  /* rlimit */
- # include <machine/endian.h>
- # define bswap_64 __bswap64
-@@ -517,6 +523,71 @@ typedef unsigned smalluint;
- 
- #if defined(__APPLE__)
- # undef HAVE_STRCHRNUL
-+/* not in Darwin's libc; fallbacks are in platform.h below / libbb/platform.c */
-+# undef HAVE_MEMPCPY
-+# undef HAVE_MEMRCHR
-+
-+/* Darwin's <sys/stat.h> spells the nanosecond timestamps st_*timespec */
-+# define st_atim st_atimespec
-+# define st_mtim st_mtimespec
-+# define st_ctim st_ctimespec
-+
-+/* Darwin's <netinet/in.h> has no s6_addr32 */
-+# ifndef s6_addr32
-+#  define s6_addr32 __u6_addr.__u6_addr32
-+# endif
-+
-+/* Darwin has ETHERTYPE_* but not the Linux-style ETH_P_* names.
-+ * Values are from the IEEE ethertype registry / Linux if_ether.h.
-+ */
-+# ifndef ETH_P_LOOP
-+#  define ETH_P_LOOP     0x0060
-+# endif
-+# ifndef ETH_P_PUP
-+#  define ETH_P_PUP      0x0200
-+# endif
-+# ifndef ETH_P_PUPAT
-+#  define ETH_P_PUPAT    0x0201
-+# endif
-+# ifndef ETH_P_IP
-+#  define ETH_P_IP       0x0800
-+# endif
-+# ifndef ETH_P_ECONET
-+#  define ETH_P_ECONET   0x0018
-+# endif
-+# ifndef ETH_P_ARP
-+#  define ETH_P_ARP      0x0806
-+# endif
-+# ifndef ETH_P_ATMMPOA
-+#  define ETH_P_ATMMPOA  0x884c
-+# endif
-+# ifndef ETH_P_8021Q
-+#  define ETH_P_8021Q    0x8100
-+# endif
-+# ifndef ETH_P_8021AD
-+#  define ETH_P_8021AD   0x88a8
-+# endif
-+# ifndef ETH_P_IPV6
-+#  define ETH_P_IPV6     0x86DD
-+# endif
-+# ifndef ETH_P_PPP_DISC
-+#  define ETH_P_PPP_DISC 0x8863
-+# endif
-+# ifndef ETH_P_PPP_SES
-+#  define ETH_P_PPP_SES  0x8864
-+# endif
-+# ifndef ETH_P_ATMFATE
-+#  define ETH_P_ATMFATE  0x8884
-+# endif
-+# ifndef ETH_P_IEEEPUP
-+#  define ETH_P_IEEEPUP  0x0a00
-+# endif
-+# ifndef ETH_P_IEEEPUPAT
-+#  define ETH_P_IEEEPUPAT 0x0a01
-+# endif
-+# ifndef ETH_P_ALL
-+#  define ETH_P_ALL      0x0003
-+# endif
- #endif
- 
- #if defined(__FreeBSD__)
-@@ -629,10 +700,32 @@ static ALWAYS_INLINE void *mempcpy(void *dest, const void *src, size_t len)
- extern char *strcasestr(const char *s, const char *pattern) FAST_FUNC;
- #endif
- 
-+#ifndef HAVE_STRVERSCMP
-+extern int strverscmp(const char *s1, const char *s2) FAST_FUNC;
-+#endif
-+
- #ifndef HAVE_STRCHRNUL
- extern char *strchrnul(const char *s, int c) FAST_FUNC;
- #endif
- 
-+#if defined(__APPLE__)
-+/* Darwin's struct statfs has f_iosize/f_type but no f_namelen */
-+# include <sys/param.h>
-+# include <stddef.h>
-+# include <string.h>
-+# define BB_STATFS_NAMELEN(sf) ((unsigned long)NAME_MAX)
-+/* Darwin has neither explicit_bzero() nor memset_s() */
-+# define explicit_bzero(p, n) bb_explicit_bzero((p), (n))
-+static ALWAYS_INLINE void bb_explicit_bzero(void *p, size_t n)
-+{
-+	memset(p, 0, n);
-+	/* keep the compiler from eliding the memset */
-+	__asm__ __volatile__("" : : "r"(p) : "memory");
-+}
-+#else
-+# define BB_STATFS_NAMELEN(sf) ((sf)->f_namelen)
-+#endif
-+
- #ifndef HAVE_STRSEP
- extern char *strsep(char **stringp, const char *delim) FAST_FUNC;
- #endif
 diff --git a/include/sysinfo_compat.h b/include/sysinfo_compat.h
 new file mode 100644
 index 0000000..028d094
@@ -6242,89 +6862,8 @@ index 0000000..028d094
 +#endif /* !__linux__ */
 +
 +#endif
-diff --git a/libbb/Kbuild.src b/libbb/Kbuild.src
-index cb8d2c2..f255cd7 100644
---- a/libbb/Kbuild.src
-+++ b/libbb/Kbuild.src
-@@ -18,6 +18,8 @@ lib-y += bb_bswap_64.o
- lib-y += bb_do_delay.o
- lib-y += bb_pwd.o
- lib-y += bb_qsort.o
-+/* Darwin only: empty translation unit elsewhere (see mntent.c) */
-+lib-y += mntent.o
- #lib-y += bb_strtod.o
- lib-y += bb_strtonum.o
- lib-y += change_identity.o
-@@ -44,6 +46,8 @@ lib-y += get_last_path_component.o
- lib-y += get_line_from_file.o
- lib-y += getpty.o
- lib-y += get_volsize.o
-+# empty translation unit unless CONFIG_FEATURE_GNU_LONG_OPTS (see the file)
-+lib-y += gnu_longopts.o
- lib-y += herror_msg.o
- lib-y += human_readable.o
- lib-y += inet_common.o
-diff --git a/libbb/alloc_affinity.c b/libbb/alloc_affinity.c
-index b6d9f64..7e9984d 100644
---- a/libbb/alloc_affinity.c
-+++ b/libbb/alloc_affinity.c
-@@ -8,7 +8,40 @@
-  */
- #include <sched.h>
- #include "libbb.h"
-+#if defined(__APPLE__)
-+# include <sys/sysctl.h>
-+#endif
- 
-+unsigned long* FAST_FUNC get_malloc_cpu_affinity(int pid, unsigned *sz);
-+
-+#if defined(__APPLE__)
-+/* Darwin has no sched_getaffinity(). Report all online CPUs: that is what
-+ * nproc(1) wants, and "affinity of another pid" does not exist here.
-+ */
-+unsigned long* FAST_FUNC get_malloc_cpu_affinity(int pid, unsigned *sz)
-+{
-+	unsigned long *mask;
-+	unsigned sz_in_bytes, bits;
-+	int ncpu = 1;
-+	size_t len = sizeof(ncpu);
-+
-+	(void)pid;
-+	if (sysctlbyname("hw.logicalcpu", &ncpu, &len, NULL, 0) != 0 || ncpu < 1)
-+		ncpu = 1;
-+	bits = (unsigned)ncpu;
-+	sz_in_bytes = (bits + 8 * sizeof(unsigned long) - 1)
-+			/ (8 * sizeof(unsigned long)) * sizeof(unsigned long);
-+	if (sz_in_bytes < sizeof(unsigned long))
-+		sz_in_bytes = sizeof(unsigned long);
-+	mask = xzalloc(sz_in_bytes);
-+	while (bits--) {
-+		unsigned b = bits;
-+		mask[b / (8 * sizeof(unsigned long))] |= 1UL << (b % (8 * sizeof(unsigned long)));
-+	}
-+	*sz = sz_in_bytes;
-+	return mask;
-+}
-+#else
- unsigned long* FAST_FUNC get_malloc_cpu_affinity(int pid, unsigned *sz)
- {
- 	unsigned long *mask = NULL;
-@@ -19,7 +52,7 @@ unsigned long* FAST_FUNC get_malloc_cpu_affinity(int pid, unsigned *sz)
- 		if (sched_getaffinity(pid, sz_in_bytes, (void*)mask) == 0)
- 			break; /* got it */
- 		sz_in_bytes *= 2;
--		if (errno == EINVAL && (int)sz_in_bytes > 0)
-+		if (errno == EINVAL && (int) sz_in_bytes > 0)
- 			continue;
- 		bb_perror_msg_and_die("can't %cet pid %d's affinity", 'g', pid);
- 	}
-@@ -27,3 +60,4 @@ unsigned long* FAST_FUNC get_malloc_cpu_affinity(int pid, unsigned *sz)
- 	*sz = sz_in_bytes;
- 	return mask;
- }
-+#endif
 diff --git a/libbb/appletlib.c b/libbb/appletlib.c
-index 34b74c3..9fe8674 100644
+index 34b74c3..fa74dc0 100644
 --- a/libbb/appletlib.c
 +++ b/libbb/appletlib.c
 @@ -28,9 +28,12 @@
@@ -6399,7 +6938,7 @@ index 34b74c3..9fe8674 100644
  	if (!argv[1]) {
  		/* Called without arguments */
  		const char *a;
-@@ -850,6 +891,128 @@ int busybox_main(int argc UNUSED_PARAM, char **argv)
+@@ -850,6 +891,139 @@ int busybox_main(int argc UNUSED_PARAM, char **argv)
  	}
  #  endif
  
@@ -6480,6 +7019,17 @@ index 34b74c3..9fe8674 100644
 +			CAP_FEATURE(ENABLE_LOG, "log");
 +			CAP_FEATURE(ENABLE_DOCTOR, "doctor");
 +			CAP_FEATURE(ENABLE_AGENT_JSON, "json");
++			CAP_FEATURE(ENABLE_BRIEF, "brief");
++			CAP_FEATURE(ENABLE_RUN, "timeline");
++			CAP_FEATURE(ENABLE_RUN, "pty");
++			CAP_FEATURE(ENABLE_RUN, "brief-json");
++			CAP_FEATURE(ENABLE_RUN, "error-ids");
++			CAP_FEATURE(ENABLE_RUN, "stamp-ns");
++			CAP_FEATURE(ENABLE_RUN, "idle-timeout");
++			CAP_FEATURE(ENABLE_LOG, "log-query");
++			CAP_FEATURE(ENABLE_MARK, "mark");
++			CAP_FEATURE(ENABLE_OUTLINE, "outline");
++			CAP_FEATURE(ENABLE_PATCHAPPLY, "patchapply");
 +			{
 +				struct stat st;
 +				long sz = 0;
@@ -6528,91 +7078,6 @@ index 34b74c3..9fe8674 100644
  	if (is_prefixed_with(argv[1], "--list")) {
  		unsigned i = 0;
  		const char *a = applet_names;
-diff --git a/libbb/find_mount_point.c b/libbb/find_mount_point.c
-index 0e1be38..9f89e13 100644
---- a/libbb/find_mount_point.c
-+++ b/libbb/find_mount_point.c
-@@ -7,7 +7,13 @@
-  * Licensed under GPLv2 or later, see file LICENSE in this source tree.
-  */
- #include "libbb.h"
--#include <mntent.h>
-+#ifdef HAVE_MNTENT_H
-+# include <mntent.h>
-+#endif
-+#if defined(__APPLE__)
-+# include <sys/param.h>
-+# include <sys/mount.h>
-+#endif
- 
- /*
-  * Given a block device, find the mount table entry if that block device
-@@ -39,6 +45,65 @@ struct mntent* FAST_FUNC find_mount_point(const char *name, int subdir_too)
- 	if (!mtab_fp)
- 		return NULL;
- 
-+#if defined(__APPLE__)
-+	/* APFS firmlinks make "/" and "/System/Volumes/Data" report the same
-+	 * st_dev, so the device matching below cannot tell them apart and the
-+	 * first table entry (always "/") wins.  Match the longest mount-point
-+	 * prefix of the requested path instead, which is what df(1) does.
-+	 *
-+	 * getmntent() hands back one reused static struct, so the winning entry
-+	 * must be COPIED while iterating - keeping a pointer only ever yields the
-+	 * last row of the table. */
-+	if (!block_dev) {
-+		char resolved[PATH_MAX];
-+		const char *want = name;
-+		/* static: the returned struct points into these */
-+		static char best_dir[PATH_MAX];
-+		static char best_name[PATH_MAX];
-+		static char best_type[64];
-+		size_t best_len = 0;
-+		struct mntent *e;
-+
-+		best_dir[0] = best_name[0] = best_type[0] = '\0';
-+		if (realpath(name, resolved))
-+			want = resolved;
-+		while ((e = getmntent(mtab_fp)) != NULL) {
-+			size_t l = strlen(e->mnt_dir);
-+			char last;
-+
-+			if (l == 0)
-+				continue;
-+			if (strncmp(want, e->mnt_dir, l) != 0)
-+				continue;
-+			/* the prefix must end on a path boundary */
-+			last = e->mnt_dir[l - 1];
-+			if (want[l] != '\0' && want[l] != '/' && last != '/')
-+				continue;
-+			if (l > best_len) {
-+				best_len = l;
-+				safe_strncpy(best_dir, e->mnt_dir, sizeof(best_dir));
-+				safe_strncpy(best_name, e->mnt_fsname, sizeof(best_name));
-+				safe_strncpy(best_type, e->mnt_type ? e->mnt_type : "", sizeof(best_type));
-+			}
-+		}
-+		endmntent(mtab_fp);
-+		if (best_len) {
-+			static struct mntent keep;
-+			keep.mnt_fsname = best_name;
-+			keep.mnt_dir = best_dir;
-+			keep.mnt_type = best_type;
-+			keep.mnt_opts = (char *)"";
-+			keep.mnt_freq = 0;
-+			keep.mnt_passno = 0;
-+			return &keep;
-+		}
-+		/* nothing matched by prefix: fall back to device matching */
-+		mtab_fp = setmntent(bb_path_mtab_file, "r");
-+		if (!mtab_fp)
-+			return NULL;
-+	}
-+#endif
-+
- 	while ((mountEntry = getmntent(mtab_fp)) != NULL) {
- 		/* rootfs mount in Linux 2.6 exists always,
- 		 * and it makes sense to always ignore it.
 diff --git a/libbb/find_pid_by_name.c b/libbb/find_pid_by_name.c
 index fe13f72..1731bea 100644
 --- a/libbb/find_pid_by_name.c
@@ -6721,65 +7186,6 @@ index ab468af..7e7321f 100644
  	return proc_nr + 1;
 +#endif
  }
-diff --git a/libbb/getopt32.c b/libbb/getopt32.c
-index 4c05dcb..6f5b6fb 100644
---- a/libbb/getopt32.c
-+++ b/libbb/getopt32.c
-@@ -10,6 +10,7 @@
- # include <getopt.h>
- #endif
- #include "libbb.h"
-+#include "error_ids.h"
- 
- //kbuild:lib-y += getopt32.o
- 
-@@ -531,6 +532,10 @@ vgetopt32(char **argv, const char *applet_opts, const char *applet_long_options,
- 	 * wget $'-\203' "Test: test" http://kernel.org/
- 	 * (supposed to act as --header, but doesn't) */
-  next_opt:
-+	/* Never let libc print the diagnostic: glibc, musl and Apple's libc each
-+	 * word it differently and name a different program, which makes the same
-+	 * binary's stderr unparseable across platforms. We print our own below. */
-+	opterr = 0;
- #if ENABLE_LONG_OPTS
- 	while ((c = getopt_long(argc, argv, applet_opts,
- 			long_options, NULL)) != -1) {
-@@ -546,8 +551,13 @@ vgetopt32(char **argv, const char *applet_opts, const char *applet_long_options,
- 			 * is always NULL (see above) */
- 			if (on_off->opt_char == '\0' /* && c != '\0' */) {
- 				/* We reached the end of complementary[] and did not find -c */
--				if (c == '?') /* getopt says: "bad option, or option has no required argument" */
-+				if (c == '?') { /* getopt says: "bad option, or option has no required argument" */
-+					const char *bad = (optind > 0 && argv[optind - 1])
-+							? argv[optind - 1] : "?";
-+					bb_error_code = "USAGE";  /* the usage text follows: one id */
-+					bb_error_msg("unrecognized option: %s", bad);
- 					goto error;
-+				}
- 				/* if there were options beyond 32 bits (example: ls),
- 				 * they got no complementary[] slot, and no result bit.
- 				 * IOW: they must be "accept but ignore" options.
-@@ -607,6 +617,9 @@ getopt32(char **argv, const char *applet_opts, ...)
- 	uint32_t opt;
- 	va_list p;
- 
-+#if ENABLE_FEATURE_GNU_LONG_OPTS
-+	bb_expand_gnu_longopts(argv, applet_opts, NULL);
-+#endif
- 	va_start(p, applet_opts);
- 	opt = vgetopt32(argv, applet_opts, NULL, p);
- 	va_end(p);
-@@ -621,6 +634,10 @@ getopt32long(char **argv, const char *applet_opts, const char *longopts, ...)
- 	va_list p;
- 
- 	va_start(p, longopts);
-+#if ENABLE_FEATURE_GNU_LONG_OPTS
-+	/* names this applet already declares are left to its own table */
-+	bb_expand_gnu_longopts(argv, applet_opts, longopts);
-+#endif
- 	opt = vgetopt32(argv, applet_opts, longopts, p);
- 	va_end(p);
- 	return opt;
 diff --git a/libbb/in_ether.c b/libbb/in_ether.c
 index c9cf6a9..52ec807 100644
 --- a/libbb/in_ether.c
@@ -7363,122 +7769,6 @@ index fa1f0d3..866adeb 100644
  	va_end(p);
  	xfunc_die();
  }
-diff --git a/libbb/platform.c b/libbb/platform.c
-index 7913353..0e61e86 100644
---- a/libbb/platform.c
-+++ b/libbb/platform.c
-@@ -128,6 +128,54 @@ char* FAST_FUNC strcasestr(const char *s, const char *pattern)
- }
- #endif
- 
-+#ifndef HAVE_STRVERSCMP
-+/*
-+ * Compare as glibc's strverscmp(3) does, so that "sort -V" / "ls -v"
-+ * produce the same order on a platform whose libc lacks it (macOS) as on
-+ * one that has it.  Rule: digit runs compare numerically, and a run that
-+ * starts with '0' sorts as if the decimal point came first, which is what
-+ * gives 000 < 00 < 01 < 010 < 09 < 0 < 1 < 9 < 10.
-+ */
-+int FAST_FUNC strverscmp(const char *s1, const char *s2)
-+{
-+	const unsigned char *l = (const void *)s1;
-+	const unsigned char *r = (const void *)s2;
-+	unsigned i, dp, j;
-+	smallint z = 1;
-+
-+	/* Longest common prefix; dp = start of the current digit run,
-+	 * z = that run is still all zeros. */
-+	for (dp = i = 0; l[i] == r[i]; i++) {
-+		unsigned c = l[i];
-+		if (!c)
-+			return 0;
-+		if (!isdigit(c)) {
-+			dp = i + 1;
-+			z = 1;
-+		} else if (c != '0') {
-+			z = 0;
-+		}
-+	}
-+
-+	if (l[dp] != '0' && r[dp] != '0') {
-+		/* A digit run not starting with '0' is a whole number:
-+		 * the longer run is the larger number. */
-+		for (j = i; isdigit(l[j]); j++) {
-+			if (!isdigit(r[j]))
-+				return 1;
-+		}
-+		if (isdigit(r[j]))
-+			return -1;
-+	} else if (z && dp < i && (isdigit(l[i]) || isdigit(r[i]))) {
-+		/* Common prefix of the run is all zeros: the run compares
-+		 * as a fraction, digit by digit. */
-+		return (int)(l[i] - '0') - (int)(r[i] - '0');
-+	}
-+
-+	return (int)l[i] - (int)r[i];
-+}
-+#endif
-+
- #ifndef HAVE_STRSEP
- /* Copyright (C) 2004 Free Software Foundation, Inc. */
- char* FAST_FUNC strsep(char **stringp, const char *delim)
-diff --git a/libbb/poll_with_signals.c b/libbb/poll_with_signals.c
-index 47419f2..38f4351 100644
---- a/libbb/poll_with_signals.c
-+++ b/libbb/poll_with_signals.c
-@@ -10,6 +10,52 @@
- 
- #include "libbb.h"
- 
-+#if defined(__APPLE__)
-+/* Darwin has no ppoll(). Emulate it.
-+ * The point of ppoll() here is atomicity: unblock the signals *and* start
-+ * waiting in one syscall. Without that we can lose a signal that arrives
-+ * in the unblock->poll() window and then sleep forever.
-+ * Emulation: poll() in short slices and re-check bb_got_signal between them.
-+ */
-+static int darwin_ppoll(struct pollfd *pfd, nfds_t nfds,
-+		const struct timespec *tsp, const sigset_t *sigmask)
-+{
-+	int n;
-+	long left_ms = -1;
-+	sigset_t saved;
-+
-+	if (tsp) {
-+		left_ms = tsp->tv_sec * 1000 + (tsp->tv_nsec + 999999) / 1000000;
-+		if (left_ms < 0)
-+			left_ms = 0;
-+	}
-+	if (sigmask)
-+		sigprocmask(SIG_SETMASK, sigmask, &saved);
-+	for (;;) {
-+		int slice = 100; /* ms */
-+		if (left_ms >= 0 && left_ms < slice)
-+			slice = (int)left_ms;
-+		n = poll(pfd, nfds, slice);
-+		if (n != 0) /* ready, or error (EINTR) */
-+			break;
-+		if (bb_got_signal) {
-+			errno = EINTR;
-+			n = -1;
-+			break;
-+		}
-+		if (left_ms >= 0) {
-+			left_ms -= slice;
-+			if (left_ms <= 0) /* timed out */
-+				break;
-+		}
-+	}
-+	if (sigmask)
-+		sigprocmask(SIG_SETMASK, &saved, NULL);
-+	return n;
-+}
-+# define ppoll darwin_ppoll
-+#endif
-+
- /* Shells, for example, need their line input and "read" builtin
-  * to be interruptible, and the naive handling of it a-la:
-  *	if (bb_got_signal) {
 diff --git a/libbb/procps.c b/libbb/procps.c
 index de640d2..ef23ce4 100644
 --- a/libbb/procps.c
@@ -7767,26 +8057,6 @@ index de640d2..ef23ce4 100644
 +}
 +#endif /* __APPLE__ */
 +
-diff --git a/libbb/time.c b/libbb/time.c
-index f09ef5d..f8943b6 100644
---- a/libbb/time.c
-+++ b/libbb/time.c
-@@ -305,8 +305,15 @@ char* FAST_FUNC strftime_YYYYMMDDHHMMSS(char *buf, unsigned len, time_t *tp)
- 
- static void get_mono(struct timespec *ts)
- {
-+#if defined(__APPLE__) && defined(CLOCK_MONOTONIC_RAW)
-+	/* Apple's CLOCK_MONOTONIC stops while the machine sleeps; the raw timer
-+	 * keeps counting from boot. For a timeline, raw is the honest one. */
-+	if (clock_gettime(CLOCK_MONOTONIC_RAW, ts))
-+		bb_simple_error_msg_and_die("clock_gettime(MONOTONIC_RAW) failed");
-+#else
- 	if (clock_gettime(CLOCK_MONOTONIC, ts))
- 		bb_simple_error_msg_and_die("clock_gettime(MONOTONIC) failed");
-+#endif
- }
- unsigned long long FAST_FUNC monotonic_ns(void)
- {
 diff --git a/libbb/verror_msg.c b/libbb/verror_msg.c
 index 74b608f..986d19f 100644
 --- a/libbb/verror_msg.c
@@ -9462,19 +9732,6 @@ index 0000000..d17eb78
 +	}
 +	fflush_stdout_and_exit(failed ? 1 : 0);
 +}
-diff --git a/miscutils/dc.c b/miscutils/dc.c
-index 42baa67..48b734f 100644
---- a/miscutils/dc.c
-+++ b/miscutils/dc.c
-@@ -275,6 +275,8 @@ int dc_main(int argc UNUSED_PARAM, char **argv)
- 
- 	/* Run -e'SCRIPT' and -fFILE in order of appearance, then handle FILEs */
- 	for (;;) {
-+	/* libc words a bad option differently per platform; keep it quiet */
-+	opterr = 0;
- 		int n = getopt(argc, argv, "e:f:");
- 		if (n <= 0)
- 			break;
 diff --git a/miscutils/doctor.c b/miscutils/doctor.c
 new file mode 100644
 index 0000000..5b607d5
@@ -11392,831 +11649,6 @@ index 32638e2..591298b 100644
  }
 +
 +#endif /* !__APPLE__ */
-diff --git a/networking/interface.c b/networking/interface.c
-index 6b6c094..e7644b1 100644
---- a/networking/interface.c
-+++ b/networking/interface.c
-@@ -34,6 +34,8 @@
- #include "inet_common.h"
- #include <net/if.h>
- #include <net/if_arp.h>
-+
-+#if !defined(__APPLE__)
- #ifdef HAVE_NET_ETHERNET_H
- # include <net/ethernet.h>
- #endif
-@@ -1078,8 +1080,188 @@ static int do_if_print(struct interface *ife, int show_downed_too)
- 	return res;
- }
- 
-+#endif /* !__APPLE__ */
-+
-+#if defined(__APPLE__)
-+/*
-+ * Darwin port: if_readlist() and friends speak rtnetlink, which does not exist
-+ * here.  getifaddrs(3) gives everything the printer needs in one pass: the
-+ * flag word, one sockaddr per address family, and ifa_data pointing at a
-+ * struct if_data with the metrics (mtu, bytes, packets, errors).
-+ *
-+ * Output follows macOS ifconfig closely enough for grep/awk use:
-+ *   en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
-+ *           ether a4:83:e7:xx:xx:xx
-+ *           inet 192.168.1.24 netmask 0xffffff00 broadcast 192.168.1.255
-+ *           inet6 fe80::1c2b:...%en0 prefixlen 64 scopeid 0x4
-+ *           status: active
-+ * Setting anything is not supported (see ifconfig.c's Darwin branch).
-+ */
-+#include <ifaddrs.h>
-+#include <net/if_dl.h>
-+#include <net/if_var.h>
-+
-+static void darwin_print_flags(int flags)
-+{
-+	static const struct {
-+		unsigned bit;
-+		const char *name;
-+	} names[] = {
-+		{ IFF_UP,          "UP"          },
-+		{ IFF_BROADCAST,   "BROADCAST"   },
-+		{ IFF_DEBUG,       "DEBUG"       },
-+		{ IFF_LOOPBACK,    "LOOPBACK"    },
-+		{ IFF_POINTOPOINT, "POINTOPOINT" },
-+		{ IFF_NOTRAILERS,  "NOTRAILERS"  },
-+		{ IFF_RUNNING,     "RUNNING"     },
-+		{ IFF_NOARP,       "NOARP"       },
-+		{ IFF_PROMISC,     "PROMISC"     },
-+		{ IFF_ALLMULTI,    "ALLMULTI"    },
-+		{ IFF_MULTICAST,   "MULTICAST"   },
-+	};
-+	unsigned i;
-+	int first = 1;
-+
-+	for (i = 0; i < ARRAY_SIZE(names); i++) {
-+		if (flags & names[i].bit) {
-+			if (!first)
-+				bb_putchar(',');
-+			fputs(names[i].name, stdout);
-+			first = 0;
-+		}
-+	}
-+}
-+
-+/* 0xffffff00 style netmask, the way BSD ifconfig prints it */
-+static void darwin_print_netmask(const struct sockaddr *sa)
-+{
-+	const struct sockaddr_in *sin = (const struct sockaddr_in *)sa;
-+
-+	if (!sa || sa->sa_family != AF_INET)
-+		return;
-+	printf(" netmask 0x%08x", (unsigned)ntohl(sin->sin_addr.s_addr));
-+}
-+
-+static int darwin_display_interfaces(char *ifname)
-+{
-+	struct ifaddrs *ifap, *ifa;
-+	int shown = 0;
-+
-+	if (getifaddrs(&ifap) != 0) {
-+		bb_perror_msg("getifaddrs");
-+		return 1;
-+	}
-+
-+	for (ifa = ifap; ifa; ifa = ifa->ifa_next) {
-+		/* One pass per interface: only act on the AF_LINK entry, which is
-+		 * the one that carries flags and if_data, then print every
-+		 * address that belongs to that name. */
-+		struct ifaddrs *j;
-+		const struct if_data *ifd;
-+
-+		if (!(ifa->ifa_flags & IFF_UP) && ifa != ifap)
-+			continue;
-+		if (ifa->ifa_addr == NULL)
-+			continue;
-+		if (ifa->ifa_addr->sa_family != AF_LINK)
-+			continue;
-+		if (ifname && ifname != IFNAME_SHOW_DOWNED_TOO && strcmp(ifname, ifa->ifa_name) != 0)
-+			continue;
-+		/* skip the address families already printed for this name */
-+		{
-+			int dup = 0;
-+			for (j = ifap; j != ifa; j = j->ifa_next) {
-+				if (j->ifa_addr
-+				 && j->ifa_addr->sa_family == AF_LINK
-+				 && strcmp(j->ifa_name, ifa->ifa_name) == 0
-+				) {
-+					dup = 1;
-+					break;
-+				}
-+			}
-+			if (dup)
-+				continue;
-+		}
-+
-+		ifd = (const struct if_data *)ifa->ifa_data;
-+		printf("%s: flags=%x<", ifa->ifa_name, (unsigned)ifa->ifa_flags);
-+		darwin_print_flags(ifa->ifa_flags);
-+		bb_putchar('>');
-+		if (ifd)
-+			printf(" mtu %u", (unsigned)ifd->ifi_mtu);
-+		bb_putchar('\n');
-+
-+		for (j = ifap; j; j = j->ifa_next) {
-+			if (!j->ifa_addr || strcmp(j->ifa_name, ifa->ifa_name) != 0)
-+				continue;
-+			switch (j->ifa_addr->sa_family) {
-+			case AF_LINK: {
-+				const struct sockaddr_dl *sdl = (const struct sockaddr_dl *)j->ifa_addr;
-+				const unsigned char *mac;
-+				if (sdl->sdl_alen != 6)
-+					break;
-+				mac = (const unsigned char *)LLADDR(sdl);
-+				printf("\tether %02x:%02x:%02x:%02x:%02x:%02x\n",
-+					mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-+				break;
-+			}
-+			case AF_INET: {
-+				char buf[64];
-+				const struct sockaddr_in *sin = (const struct sockaddr_in *)j->ifa_addr;
-+				inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf));
-+				printf("\tinet %s", buf);
-+				darwin_print_netmask(j->ifa_netmask);
-+				if (j->ifa_broadaddr && (j->ifa_flags & IFF_BROADCAST)) {
-+					const struct sockaddr_in *b = (const struct sockaddr_in *)j->ifa_broadaddr;
-+					inet_ntop(AF_INET, &b->sin_addr, buf, sizeof(buf));
-+					printf(" broadcast %s", buf);
-+				}
-+				bb_putchar('\n');
-+				break;
-+			}
-+			case AF_INET6: {
-+				char buf[64];
-+				const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)j->ifa_addr;
-+				const unsigned char *m = ((const struct sockaddr_in6 *)j->ifa_netmask)->sin6_addr.s6_addr;
-+				int plen = 0;
-+				unsigned k;
-+
-+				for (k = 0; k < 16; k++)
-+					plen += __builtin_popcount(m[k]);
-+				inet_ntop(AF_INET6, &sin6->sin6_addr, buf, sizeof(buf));
-+				printf("\tinet6 %s prefixlen %d\n", buf, plen);
-+				break;
-+			}
-+			default:
-+				break;
-+			}
-+		}
-+
-+		if (ifd) {
-+			printf("\tstatus: %s\n", (ifa->ifa_flags & IFF_RUNNING) ? "active" : "inactive");
-+			if (ifd->ifi_ibytes || ifd->ifi_obytes) {
-+				printf("\t%llu bytes in, %llu bytes out\n",
-+					(unsigned long long)ifd->ifi_ibytes,
-+					(unsigned long long)ifd->ifi_obytes);
-+			}
-+		}
-+		shown++;
-+	}
-+
-+	freeifaddrs(ifap);
-+	if (!shown && ifname && ifname != IFNAME_SHOW_DOWNED_TOO) {
-+		bb_error_msg("no such interface: %s", ifname);
-+		return 1;
-+	}
-+	return 0;
-+}
-+#endif /* __APPLE__ */
-+
- int FAST_FUNC display_interfaces(char *ifname)
- {
-+#if defined(__APPLE__)
-+	return darwin_display_interfaces(ifname);
-+#else
- 	struct interface *ife;
- 	int res;
- 	struct iface_list ilist;
-@@ -1104,9 +1286,10 @@ int FAST_FUNC display_interfaces(char *ifname)
- 	res = do_if_print(ife, /*show_downed_too:*/ 1);
-  ret:
- 	return (res < 0); /* status < 0 == 1 -- error */
-+#endif /* !__APPLE__ */
- }
- 
--#if ENABLE_FEATURE_HWIB
-+#if ENABLE_FEATURE_HWIB && !defined(__APPLE__)
- /* Input an Infiniband address and convert to binary. */
- int FAST_FUNC in_ib(const char *bufp, struct sockaddr *sap)
- {
-diff --git a/networking/ip.c b/networking/ip.c
-index 02f93ad..5ad9e75 100644
---- a/networking/ip.c
-+++ b/networking/ip.c
-@@ -8,8 +8,17 @@
-  * Rani Assaf <rani@magic.metawire.com> 980929: resolve addresses
-  * Bernhard Reutner-Fischer rewrote to use index_in_substr_array
-  */
-+//config:config IP_BUILD_NETLINK
-+//config:	bool "Build the libiproute netlink backends"
-+//config:	default y
-+//config:	depends on IP || IPADDR || IPLINK || IPROUTE || IPRULE || IPTUNNEL || IPNEIGH
-+//config:	help
-+//config:	The rtnetlink code in networking/libiproute is Linux-only.  Turn this
-+//config:	off to keep the ip applet but drop those objects (the Darwin port
-+//config:	provides its own getifaddrs/NET_RT_DUMP implementation).
-+//config:
- //config:config IP
--//config:	bool "ip (35 kb)"
-+//config:	bool "ip (35 kb)
- //config:	default y
- //config:	help
- //config:	The "ip" applet is a TCP/IP interface configuration and routing
-@@ -371,6 +380,582 @@
- 
- #include "libbb.h"
- 
-+#if defined(__APPLE__)
-+/*
-+ * Read-only Darwin port.  busybox's ip delegates to libiproute, which is
-+ * rtnetlink throughout, so the whole thing is compiled out below and replaced
-+ * by three printers built on the same two sources as ifconfig and route:
-+ *
-+ *   ip link   getifaddrs(3)          - flags, mtu, MAC
-+ *   ip addr   getifaddrs(3)          - inet/inet6 addresses with prefixlen
-+ *   ip route  sysctl(NET_RT_DUMP)    - destination/gateway/device
-+ *
-+ * Output follows iproute2's shape closely enough for `ip a | grep inet` and
-+ * `ip route | grep default`, which is what scripts actually use.
-+ */
-+#include <ifaddrs.h>
-+#include <net/if_dl.h>
-+#include <net/if_var.h>
-+#include <net/route.h>
-+#include <sys/sysctl.h>
-+#include <sys/sockio.h>
-+#include <net/if_arp.h>
-+
-+static void darwin_print_flags(int flags)
-+{
-+	static const struct { unsigned bit; const char *name; } t[] = {
-+		{ IFF_UP, "UP" }, { IFF_BROADCAST, "BROADCAST" },
-+		{ IFF_LOOPBACK, "LOOPBACK" }, { IFF_RUNNING, "RUNNING" },
-+		{ IFF_MULTICAST, "MULTICAST" },
-+	};
-+	unsigned i;
-+	int first = 1;
-+	for (i = 0; i < ARRAY_SIZE(t); i++) {
-+		if (flags & t[i].bit) {
-+			if (!first) bb_putchar(',');
-+			fputs(t[i].name, stdout);
-+			first = 0;
-+		}
-+	}
-+}
-+
-+static int darwin_if_index(const char *name)
-+{
-+	struct ifaddrs *ifap, *ifa;
-+	int idx = 0;
-+
-+	if (getifaddrs(&ifap) != 0)
-+		return 0;
-+	for (ifa = ifap; ifa; ifa = ifa->ifa_next) {
-+		if (ifa->ifa_addr && ifa->ifa_addr->sa_family == AF_LINK
-+		 && strcmp(ifa->ifa_name, name) == 0
-+		) {
-+			idx = if_nametoindex(name);
-+			break;
-+		}
-+	}
-+	freeifaddrs(ifap);
-+	return idx;
-+}
-+
-+/* Print "1: en0: <FLAGS> mtu 1500" style lines, one per interface. */
-+static void darwin_ip_link(void)
-+{
-+	struct ifaddrs *ifap, *ifa;
-+
-+	if (getifaddrs(&ifap) != 0) {
-+		bb_perror_msg_and_die("getifaddrs");
-+	}
-+	for (ifa = ifap; ifa; ifa = ifa->ifa_next) {
-+		const struct if_data *ifd;
-+		struct ifaddrs *j;
-+		int dup = 0;
-+
-+		if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_LINK)
-+			continue;
-+		for (j = ifap; j != ifa; j = j->ifa_next) {
-+			if (j->ifa_addr && j->ifa_addr->sa_family == AF_LINK
-+			 && strcmp(j->ifa_name, ifa->ifa_name) == 0
-+			) {
-+				dup = 1;
-+				break;
-+			}
-+		}
-+		if (dup)
-+			continue;
-+
-+		ifd = (const struct if_data *)ifa->ifa_data;
-+		printf("%d: %s: <", darwin_if_index(ifa->ifa_name), ifa->ifa_name);
-+		darwin_print_flags(ifa->ifa_flags);
-+		printf(">");
-+		if (ifd)
-+			printf(" mtu %u", (unsigned)ifd->ifi_mtu);
-+		printf(" qlen 1000\n");
-+		for (j = ifap; j; j = j->ifa_next) {
-+			if (j->ifa_addr && strcmp(j->ifa_name, ifa->ifa_name) == 0
-+			 && j->ifa_addr->sa_family == AF_LINK
-+			) {
-+				const struct sockaddr_dl *sdl = (const struct sockaddr_dl *)j->ifa_addr;
-+				if (sdl->sdl_alen == 6) {
-+					const unsigned char *m = (const unsigned char *)LLADDR(sdl);
-+					printf("    link/ether %02x:%02x:%02x:%02x:%02x:%02x\n",
-+						m[0], m[1], m[2], m[3], m[4], m[5]);
-+				}
-+				break;
-+			}
-+		}
-+	}
-+	freeifaddrs(ifap);
-+}
-+
-+static void darwin_ip_addr(void)
-+{
-+	struct ifaddrs *ifap, *ifa;
-+
-+	if (getifaddrs(&ifap) != 0) {
-+		bb_perror_msg_and_die("getifaddrs");
-+	}
-+	for (ifa = ifap; ifa; ifa = ifa->ifa_next) {
-+		const struct if_data *ifd;
-+		struct ifaddrs *j;
-+		int dup = 0;
-+
-+		if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_LINK)
-+			continue;
-+		for (j = ifap; j != ifa; j = j->ifa_next) {
-+			if (j->ifa_addr && j->ifa_addr->sa_family == AF_LINK
-+			 && strcmp(j->ifa_name, ifa->ifa_name) == 0
-+			) {
-+				dup = 1;
-+				break;
-+			}
-+		}
-+		if (dup)
-+			continue;
-+
-+		ifd = (const struct if_data *)ifa->ifa_data;
-+		printf("%d: %s: <", darwin_if_index(ifa->ifa_name), ifa->ifa_name);
-+		darwin_print_flags(ifa->ifa_flags);
-+		printf(">");
-+		if (ifd)
-+			printf(" mtu %u", (unsigned)ifd->ifi_mtu);
-+		printf("\n");
-+
-+		for (j = ifap; j; j = j->ifa_next) {
-+			char buf[64];
-+			if (!j->ifa_addr || strcmp(j->ifa_name, ifa->ifa_name) != 0)
-+				continue;
-+			if (j->ifa_addr->sa_family == AF_INET) {
-+				const struct sockaddr_in *sin = (const struct sockaddr_in *)j->ifa_addr;
-+				const struct sockaddr_in *nm = (const struct sockaddr_in *)j->ifa_netmask;
-+				unsigned m = nm ? ntohl(nm->sin_addr.s_addr) : 0;
-+				int plen = 0;
-+				while (m & 0x80000000U) { plen++; m <<= 1; }
-+				inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf));
-+				printf("    inet %s/%d", buf, plen);
-+				if (j->ifa_flags & IFF_LOOPBACK)
-+					printf(" scope host");
-+				else
-+					printf(" scope global %s", ifa->ifa_name);
-+				if (j->ifa_broadaddr && (j->ifa_flags & IFF_BROADCAST)) {
-+					const struct sockaddr_in *b = (const struct sockaddr_in *)j->ifa_broadaddr;
-+					inet_ntop(AF_INET, &b->sin_addr, buf, sizeof(buf));
-+					printf(" brd %s", buf);
-+				}
-+				printf("\n");
-+			} else if (j->ifa_addr->sa_family == AF_INET6) {
-+				const struct sockaddr_in6 *s6 = (const struct sockaddr_in6 *)j->ifa_addr;
-+				const unsigned char *m6 = ((const struct sockaddr_in6 *)j->ifa_netmask)->sin6_addr.s6_addr;
-+				int plen = 0;
-+				unsigned k;
-+				for (k = 0; k < 16; k++)
-+					plen += __builtin_popcount(m6[k]);
-+				inet_ntop(AF_INET6, &s6->sin6_addr, buf, sizeof(buf));
-+				printf("    inet6 %s/%d scope global\n", buf, plen);
-+			}
-+		}
-+	}
-+	freeifaddrs(ifap);
-+}
-+
-+static void darwin_ip_route(void)
-+{
-+	int mib[6] = { CTL_NET, PF_ROUTE, 0, AF_INET, NET_RT_DUMP, 0 };
-+	size_t needed = 0;
-+	char *buf, *lim, *next;
-+
-+	if (sysctl(mib, 6, NULL, &needed, NULL, 0) != 0 || needed == 0)
-+		return;
-+	buf = xmalloc(needed);
-+	if (sysctl(mib, 6, buf, &needed, NULL, 0) != 0) {
-+		free(buf);
-+		return;
-+	}
-+	lim = buf + needed;
-+	for (next = buf; next + sizeof(struct rt_msghdr) <= lim; ) {
-+		struct rt_msghdr *rtm = (struct rt_msghdr *)next;
-+		const struct sockaddr *sa, *dst = NULL, *gw = NULL, *mask = NULL;
-+		char d[64], g[64], m[64], ifname[IFNAMSIZ];
-+		int i, is_default;
-+
-+		if (rtm->rtm_msglen == 0)
-+			break;
-+		next += rtm->rtm_msglen;
-+		if (rtm->rtm_version != RTM_VERSION || !(rtm->rtm_flags & RTF_UP))
-+			continue;
-+
-+		sa = (const struct sockaddr *)(rtm + 1);
-+		for (i = 0; i < RTAX_MAX; i++) {
-+			if (!(rtm->rtm_addrs & (1 << i)))
-+				continue;
-+			if ((const char *)sa >= next)
-+				break;
-+			switch (i) {
-+			case RTAX_DST:     dst  = sa; break;
-+			case RTAX_GATEWAY: gw   = sa; break;
-+			case RTAX_NETMASK: mask = sa; break;
-+			default: break;
-+			}
-+			sa = (const struct sockaddr *)((const char *)sa
-+					+ ((sa->sa_len + 3) & ~3));
-+		}
-+
-+		/* destination */
-+		is_default = (!mask || mask->sa_len <= (int)offsetof(struct sockaddr_in, sin_addr))
-+			&& dst && dst->sa_family == AF_INET
-+			&& ((const struct sockaddr_in *)dst)->sin_addr.s_addr == 0;
-+		if (is_default) {
-+			safe_strncpy(d, "default", sizeof(d));
-+		} else if (dst && dst->sa_family == AF_INET) {
-+			unsigned p = 0;
-+			if (mask && mask->sa_len > offsetof(struct sockaddr_in, sin_addr)) {
-+				unsigned mm = ntohl(((const struct sockaddr_in *)mask)->sin_addr.s_addr);
-+				while (mm & 0x80000000U) { p++; mm <<= 1; }
-+			}
-+			inet_ntop(AF_INET, &((const struct sockaddr_in *)dst)->sin_addr, d, sizeof(d));
-+			if (p)
-+				sprintf(d + strlen(d), "/%u", p);
-+		} else {
-+			safe_strncpy(d, "?", sizeof(d));
-+		}
-+
-+		printf("%s", d);
-+		if (gw && gw->sa_family == AF_INET) {
-+			inet_ntop(AF_INET, &((const struct sockaddr_in *)gw)->sin_addr, g, sizeof(g));
-+			printf(" via %s", g);
-+		}
-+		ifname[0] = '\0';
-+		if_indextoname(rtm->rtm_index, ifname);
-+		if (ifname[0])
-+			printf(" dev %s", ifname);
-+		if (rtm->rtm_flags & RTF_GATEWAY)
-+			printf(" proto static");
-+		bb_putchar('\n');
-+	}
-+	free(buf);
-+}
-+
-+/*
-+ * --- setters ---------------------------------------------------------------
-+ * link set  : SIOCSIFFLAGS / SIOCSIFMTU / SIOCSIFLLADDR
-+ * addr add|del : SIOCAIFADDR / SIOCDIFADDR (with the netmask in one message)
-+ * route add|del : PF_ROUTE rt_msghdr, same as the route applet
-+ */
-+static int darwin_ip_sock(void)
-+{
-+	int s = socket(AF_INET, SOCK_DGRAM, 0);
-+	if (s < 0)
-+		bb_simple_perror_msg_and_die("socket");
-+	return s;
-+}
-+
-+static void darwin_ip_sockaddr(struct sockaddr_in *sin, const char *addr)
-+{
-+	char buf[64];
-+	char *slash;
-+
-+	safe_strncpy(buf, addr, sizeof(buf));
-+	slash = strchr(buf, '/');
-+	if (slash)
-+		*slash = '\0';
-+	memset(sin, 0, sizeof(*sin));
-+	sin->sin_len = sizeof(*sin);
-+	sin->sin_family = AF_INET;
-+	if (inet_pton(AF_INET, buf, &sin->sin_addr) != 1)
-+		bb_error_msg_and_die("invalid address: %s", buf);
-+}
-+
-+static int darwin_ip_prefix(const char *addr, int dflt)
-+{
-+	const char *slash = strchr(addr, '/');
-+	return slash ? xatoi_positive(slash + 1) : dflt;
-+}
-+
-+/* ip link set dev IFACE [up|down] [mtu N] [address MAC] */
-+static void darwin_ip_link_set(char **args)
-+{
-+	int s = darwin_ip_sock();
-+	const char *dev = NULL, *mac = NULL;
-+	int up = -1, mtu = -1;
-+
-+	while (*args) {
-+		if (strcmp(*args, "dev") == 0 && args[1]) {
-+			dev = *++args; args++;
-+		} else if (strcmp(*args, "up") == 0) {
-+			up = 1; args++;
-+		} else if (strcmp(*args, "down") == 0) {
-+			up = 0; args++;
-+		} else if (strcmp(*args, "mtu") == 0 && args[1]) {
-+			mtu = xatoi_positive(*++args); args++;
-+		} else if (strcmp(*args, "address") == 0 && args[1]) {
-+			mac = *++args; args++;
-+		} else {
-+			bb_error_msg_and_die("unsupported: ip link set %s", *args);
-+		}
-+	}
-+	if (!dev)
-+		bb_show_usage();
-+
-+	if (mac) {
-+		struct ifreq ifr;
-+		struct sockaddr_dl *sdl;
-+		unsigned b[6];
-+		int i;
-+
-+		memset(&ifr, 0, sizeof(ifr));
-+		strncpy(ifr.ifr_name, dev, IFNAMSIZ - 1);
-+		sdl = (struct sockaddr_dl *)&ifr.ifr_addr;
-+		memset(&ifr.ifr_addr, 0, sizeof(ifr.ifr_addr));
-+		sdl->sdl_len = offsetof(struct sockaddr_dl, sdl_data) + 6;
-+		sdl->sdl_family = AF_LINK;
-+		sdl->sdl_alen = 6;
-+		if (sscanf(mac, "%x:%x:%x:%x:%x:%x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6)
-+			bb_error_msg_and_die("invalid MAC: %s", mac);
-+		for (i = 0; i < 6; i++)
-+			sdl->sdl_data[i] = (unsigned char)b[i];
-+		if (ioctl(s, SIOCSIFLLADDR, &ifr) < 0)
-+			bb_perror_msg_and_die("can't set address on %s", dev);
-+	}
-+	if (mtu > 0) {
-+		struct ifreq ifr;
-+		memset(&ifr, 0, sizeof(ifr));
-+		strncpy(ifr.ifr_name, dev, IFNAMSIZ - 1);
-+		ifr.ifr_mtu = mtu;
-+		if (ioctl(s, SIOCSIFMTU, &ifr) < 0)
-+			bb_perror_msg_and_die("can't set mtu on %s", dev);
-+	}
-+	if (up >= 0) {
-+		struct ifreq ifr;
-+		memset(&ifr, 0, sizeof(ifr));
-+		strncpy(ifr.ifr_name, dev, IFNAMSIZ - 1);
-+		if (ioctl(s, SIOCGIFFLAGS, &ifr) < 0)
-+			bb_perror_msg_and_die("can't read flags of %s", dev);
-+		if (up)
-+			ifr.ifr_flags |= IFF_UP;
-+		else
-+			ifr.ifr_flags &= ~IFF_UP;
-+		if (ioctl(s, SIOCSIFFLAGS, &ifr) < 0)
-+			bb_perror_msg_and_die("can't change flags of %s", dev);
-+	}
-+	close(s);
-+}
-+
-+/* ip addr add|del ADDR[/PFX] dev IFACE */
-+static void darwin_ip_addr_set(char **args, int add)
-+{
-+	int s = darwin_ip_sock();
-+	const char *addr = NULL, *dev = NULL;
-+	struct ifaliasreq ifra;
-+	struct sockaddr_in *sin;
-+	int plen;
-+
-+	if (*args && (*args)[0] != '-') {
-+		addr = *args++;
-+	}
-+	while (*args) {
-+		if (strcmp(*args, "dev") == 0 && args[1]) {
-+			dev = *++args; args++;
-+		} else if (strcmp(*args, "peer") == 0 && args[1]) {
-+			args += 2;                  /* accepted, unused */
-+		} else {
-+			bb_error_msg_and_die("unsupported: ip addr %s", *args);
-+		}
-+	}
-+	if (!addr || !dev)
-+		bb_show_usage();
-+
-+	plen = darwin_ip_prefix(addr, 32);
-+	memset(&ifra, 0, sizeof(ifra));
-+	strncpy(ifra.ifra_name, dev, IFNAMSIZ - 1);
-+
-+	sin = (struct sockaddr_in *)&ifra.ifra_addr;
-+	darwin_ip_sockaddr(sin, addr);
-+
-+	sin = (struct sockaddr_in *)&ifra.ifra_mask;
-+	sin->sin_len = sizeof(*sin);
-+	sin->sin_family = AF_INET;
-+	sin->sin_addr.s_addr = htonl(plen >= 32 ? 0xffffffffU
-+			: (plen <= 0 ? 0 : (0xffffffffU << (32 - plen))));
-+
-+	if (ioctl(s, add ? SIOCAIFADDR : SIOCDIFADDR, &ifra) < 0)
-+		bb_perror_msg_and_die("%s %s on %s", add ? "can't add" : "can't delete", addr, dev);
-+	close(s);
-+}
-+
-+/* ip route add|del DST [via GW] [dev IFACE] */
-+static void darwin_ip_route_set(char **args, int add)
-+{
-+	int s;
-+	struct {
-+		struct rt_msghdr hdr;
-+		struct sockaddr_in dst;
-+		struct sockaddr_in gw;
-+		struct sockaddr_in mask;
-+	} msg;
-+	char dest[64] = "";
-+	const char *gw = NULL, *dev = NULL;
-+	unsigned char addrs = 0;
-+	char *cp;
-+	int i;
-+
-+	while (*args) {
-+		if (strcmp(*args, "via") == 0 && args[1]) {
-+			gw = *++args; args++;
-+		} else if (strcmp(*args, "dev") == 0 && args[1]) {
-+			dev = *++args; args++;
-+		} else if (strcmp(*args, "proto") == 0 && args[1]) {
-+			args += 2;
-+		} else if (!dest[0]) {
-+			safe_strncpy(dest, *args, sizeof(dest));
-+			args++;
-+		} else {
-+			bb_error_msg_and_die("unsupported: ip route %s", *args);
-+		}
-+	}
-+	if (!dest[0])
-+		bb_show_usage();
-+
-+	s = socket(PF_ROUTE, SOCK_RAW, 0);
-+	if (s < 0)
-+		bb_simple_perror_msg_and_die("socket(PF_ROUTE)");
-+
-+	memset(&msg, 0, sizeof(msg));
-+	msg.hdr.rtm_version = RTM_VERSION;
-+	msg.hdr.rtm_type = add ? RTM_ADD : RTM_DELETE;
-+	msg.hdr.rtm_seq = (int)getpid();
-+	msg.hdr.rtm_flags = RTF_UP;
-+
-+	msg.dst.sin_len = sizeof(msg.dst);
-+	msg.dst.sin_family = AF_INET;
-+	if (strcmp(dest, "default") == 0) {
-+		msg.dst.sin_addr.s_addr = 0;
-+	} else {
-+		darwin_ip_sockaddr(&msg.dst, dest);
-+	}
-+	addrs |= RTA_DST;
-+
-+	{
-+		int plen = darwin_ip_prefix(dest, strcmp(dest, "default") == 0 ? 0 : 32);
-+		if (plen <= 0 && strcmp(dest, "default") != 0)
-+			plen = 32;
-+		msg.mask.sin_len = sizeof(msg.mask);
-+		msg.mask.sin_family = AF_INET;
-+		msg.mask.sin_addr.s_addr = htonl(plen >= 32 ? 0xffffffffU
-+				: (plen <= 0 ? 0 : (0xffffffffU << (32 - plen))));
-+		addrs |= RTA_NETMASK;
-+		if (plen == 32)
-+			msg.hdr.rtm_flags |= RTF_HOST;
-+	}
-+
-+	if (gw) {
-+		msg.gw.sin_len = sizeof(msg.gw);
-+		msg.gw.sin_family = AF_INET;
-+		if (inet_pton(AF_INET, gw, &msg.gw.sin_addr) != 1)
-+			bb_error_msg_and_die("invalid gateway: %s", gw);
-+		msg.hdr.rtm_flags |= RTF_GATEWAY;
-+		addrs |= RTA_GATEWAY;
-+	}
-+
-+	msg.hdr.rtm_addrs = addrs;
-+	if (dev)
-+		msg.hdr.rtm_index = if_nametoindex(dev);
-+
-+	cp = (char *)(&msg.hdr + 1);
-+	for (i = 1; i < RTAX_MAX; i++) {
-+		struct sockaddr *sa;
-+		int n;
-+		if (!(addrs & (1 << i)))
-+			continue;
-+		switch (i) {
-+		case RTAX_DST:     sa = (struct sockaddr *)&msg.dst; break;
-+		case RTAX_GATEWAY: sa = (struct sockaddr *)&msg.gw; break;
-+		case RTAX_NETMASK: sa = (struct sockaddr *)&msg.mask; break;
-+		default: continue;
-+		}
-+		n = (sa->sa_len + 3) & ~3;
-+		memcpy(cp, sa, sa->sa_len);
-+		cp += n;
-+	}
-+	msg.hdr.rtm_msglen = (u_short)(cp - (char *)&msg);
-+
-+	if (write(s, &msg, msg.hdr.rtm_msglen) < 0)
-+		bb_perror_msg_and_die("%s %s", add ? "add" : "delete", dest);
-+	close(s);
-+}
-+
-+static int darwin_ip_usage(void)
-+{
-+	bb_show_usage();
-+	return 1;
-+}
-+
-+int ip_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
-+int ip_main(int argc UNUSED_PARAM, char **argv)
-+{
-+	char *cmd;
-+	char *verb;
-+	int want_link = 0, want_addr = 0, want_route = 0;
-+
-+	++argv;
-+	/* skip common option words the way iproute2 accepts them */
-+	while (*argv && (*argv)[0] == '-')
-+		argv++;
-+
-+	if (!*argv)
-+		return darwin_ip_usage();
-+
-+	cmd = *argv;
-+	if (is_prefixed_with(cmd, "link") || strcmp(cmd, "l") == 0) {
-+		want_link = 1;
-+		cmd = "link";
-+	} else if (is_prefixed_with(cmd, "addr") || strcmp(cmd, "a") == 0) {
-+		want_addr = 1;
-+		cmd = "addr";
-+	} else if (is_prefixed_with(cmd, "route") || strcmp(cmd, "r") == 0
-+		|| strcmp(cmd, "ro") == 0
-+	) {
-+		want_route = 1;
-+		cmd = "route";
-+	} else {
-+		bb_error_msg_and_die("only 'link', 'addr' and 'route' are supported on Darwin");
-+	}
-+
-+	/* sub-verb: show/list print, add/del/set mutate */
-+	verb = argv[1];
-+
-+	if (want_link) {
-+		if (!verb || !strcmp(verb, "show") || !strcmp(verb, "list"))
-+			darwin_ip_link();
-+		else if (!strcmp(verb, "set"))
-+			darwin_ip_link_set(argv + 2);
-+		else
-+			bb_error_msg_and_die("unsupported: ip link %s", verb);
-+	} else if (want_addr) {
-+		if (!verb || !strcmp(verb, "show") || !strcmp(verb, "list"))
-+			darwin_ip_addr();
-+		else if (!strcmp(verb, "add"))
-+			darwin_ip_addr_set(argv + 2, 1);
-+		else if (!strcmp(verb, "del") || !strcmp(verb, "delete"))
-+			darwin_ip_addr_set(argv + 2, 0);
-+		else
-+			bb_error_msg_and_die("unsupported: ip addr %s", verb);
-+	} else if (want_route) {
-+		if (!verb || !strcmp(verb, "show") || !strcmp(verb, "list"))
-+			darwin_ip_route();
-+		else if (!strcmp(verb, "add"))
-+			darwin_ip_route_set(argv + 2, 1);
-+		else if (!strcmp(verb, "del") || !strcmp(verb, "delete"))
-+			darwin_ip_route_set(argv + 2, 0);
-+		else
-+			bb_error_msg_and_die("unsupported: ip route %s", verb);
-+	}
-+
-+	(void)cmd;
-+	return EXIT_SUCCESS;
-+}
-+
-+#else /* !__APPLE__ */
-+
- #include "libiproute/utils.h"
- #include "libiproute/ip_common.h"
- 
-@@ -475,3 +1060,4 @@ int ip_main(int argc UNUSED_PARAM, char **argv)
- 	return ip_func(argv);
- }
- #endif
-+#endif /* !__APPLE__ */
 diff --git a/networking/libiproute/Kbuild.src b/networking/libiproute/Kbuild.src
 index d94e4c6..4fa582d 100644
 --- a/networking/libiproute/Kbuild.src
@@ -12230,32 +11662,6 @@ index d94e4c6..4fa582d 100644
  	ip_parse_common_args.o \
  	libnetlink.o \
  	ll_addr.o \
-diff --git a/networking/nslookup.c b/networking/nslookup.c
-index b14762b..e3b63ad 100644
---- a/networking/nslookup.c
-+++ b/networking/nslookup.c
-@@ -37,6 +37,10 @@
- #if !ENABLE_FEATURE_NSLOOKUP_BIG
- 
- #include <resolv.h>
-+#if defined(__APPLE__)
-+/* Darwin ships BIND9 headers: HEADER/MAXDNAME/dname live here */
-+# include <arpa/nameser_compat.h>
-+#endif
- //#include <arpa/inet.h>
- //#include <netdb.h>
- #include "libbb.h"
-@@ -278,6 +282,10 @@ int nslookup_main(int argc, char **argv)
- #if USE_LIBC_RESOLV
- 
- #include <resolv.h>
-+#if defined(__APPLE__)
-+/* Darwin ships BIND9 headers: HEADER/MAXDNAME/dname live here */
-+# include <arpa/nameser_compat.h>
-+#endif
- 
- #else
- 
 diff --git a/networking/ping.c b/networking/ping.c
 index b7e6955..d999120 100644
 --- a/networking/ping.c
@@ -13583,7 +12989,7 @@ index 6cdd641..5c0252f 100644
  {
  #if FIXED_HEADER
 diff --git a/shell/ash.c b/shell/ash.c
-index 9afeaed..7f0e753 100644
+index 9afeaed..dfc68e7 100644
 --- a/shell/ash.c
 +++ b/shell/ash.c
 @@ -906,8 +906,8 @@ out2str(const char *p)
@@ -14038,7 +13444,34 @@ index 9afeaed..7f0e753 100644
  			case '%':
  			case '#':
  				subtype = (c == '#' ? VSTRIMLEFT : VSTRIMRIGHT);
-@@ -15173,6 +15507,351 @@ extern int etext();
+@@ -14989,6 +15323,26 @@ exitshell(void)
+ 		/*free(p); - we'll exit soon */
+ 	}
+  out:
++	/* Report the cwd the shell finished in, when `run` or `sh --format json`
++	 * asked for it: EARLY so a failing trap cannot lose it. */
++	{
++		const char *cwd_file = getenv("BUSYBOX_RUN_CWD");
++
++		if (cwd_file && cwd_file[0]) {
++			char *cwd = getcwd(NULL, 0);
++
++			if (cwd) {
++				int fd = open(cwd_file, O_WRONLY | O_CREAT | O_TRUNC, 0600);
++
++				if (fd >= 0) {
++					full_write(fd, cwd, strlen(cwd));
++					full_write(fd, "\n", 1);
++					close(fd);
++				}
++				free(cwd);
++			}
++		}
++	}
+ 	exitreset();
+ 	/* dash wraps setjobctl(0) in "if (setjmp(loc.loc) == 0) {...}".
+ 	 * our setjobctl(0) does not panic if tcsetpgrp fails inside it.
+@@ -15173,6 +15527,351 @@ extern int etext();
   * exception occurs.  When an exception occurs the variable "state"
   * is used to figure out how far we had gotten.
   */
@@ -14390,7 +13823,7 @@ index 9afeaed..7f0e753 100644
  int ash_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
  #if NUM_SCRIPTS > 0
  int ash_main(int argc, char **argv)
-@@ -15187,6 +15866,13 @@ int ash_main(int argc UNUSED_PARAM, char **argv)
+@@ -15187,6 +15886,13 @@ int ash_main(int argc UNUSED_PARAM, char **argv)
  
  	dbg_show_dirtymem("dirtymem at main start");
  
@@ -14404,7 +13837,7 @@ index 9afeaed..7f0e753 100644
  	/* Initialize global data */
  	INIT_G_misc();
  	INIT_G_memstack();
-@@ -15241,6 +15927,7 @@ int ash_main(int argc UNUSED_PARAM, char **argv)
+@@ -15241,6 +15947,7 @@ int ash_main(int argc UNUSED_PARAM, char **argv)
  		minusc = get_script_content(-argc - 1);
  #endif
  	login_sh = procargs(argv);
@@ -14674,9 +14107,18 @@ index d5c2589..58e1db8 100644
  int fallocate_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
  int fallocate_main(int argc UNUSED_PARAM, char **argv)
 diff --git a/util-linux/fdisk.c b/util-linux/fdisk.c
-index b3ed1b9..98f3193 100644
+index b3ed1b9..31cd784 100644
 --- a/util-linux/fdisk.c
 +++ b/util-linux/fdisk.c
+@@ -79,7 +79,7 @@
+ //usage:       "[-ul" IF_FEATURE_FDISK_BLKSIZE("s") "] "
+ //usage:       "[-C CYLINDERS] [-H HEADS] [-S SECTORS] [-b SSZ] [-t PARTTYPE] DISK"
+ //usage:#define fdisk_full_usage "\n\n"
+-//usage:	IF_FEATURE_FDISK_WRITABLE("Change")IF_NOT_FEATURE_FDISK_WRITABLE("Show")" partition table\n"
++//usage:	"Change partition table\n"
+ //usage:     "\n	-u		Start and End are in cylinders (instead of sectors)"
+ //usage:     "\n			Also enable rounding of sizes to cylinders"
+ //usage:     "\n	-l		Show partition table for each DISK and exit"
 @@ -99,7 +99,12 @@
  # define _LARGEFILE64_SOURCE
  #endif
@@ -15027,10 +14469,27 @@ index 728e728..d40893e 100644
  # include "volume_id.h"
  #else
 diff --git a/util-linux/umount.c b/util-linux/umount.c
-index 337d718..f0af1df 100644
+index 337d718..24c5c68 100644
 --- a/util-linux/umount.c
 +++ b/util-linux/umount.c
-@@ -61,13 +61,43 @@
+@@ -41,7 +41,7 @@
+ //kbuild:lib-$(CONFIG_UMOUNT) += umount.o
+ 
+ //usage:#define umount_trivial_usage
+-//usage:       "[-rlf"IF_FEATURE_MTAB_SUPPORT("m")IF_FEATURE_MOUNT_LOOP("d")IF_FEATURE_UMOUNT_ALL("a")"] [-t FSTYPE] FILESYSTEM|DIRECTORY"
++//usage:       "[-rlf"IF_FEATURE_MTAB_SUPPORT("m")"d"IF_FEATURE_UMOUNT_ALL("a")"] [-t FSTYPE] FILESYSTEM|DIRECTORY"
+ //usage:#define umount_full_usage "\n\n"
+ //usage:       "Unmount filesystems\n"
+ //usage:	IF_FEATURE_UMOUNT_ALL(
+@@ -53,21 +53,49 @@
+ //usage:     "\n	-r	Remount devices read-only if mount is busy"
+ //usage:     "\n	-l	Lazy umount (detach filesystem)"
+ //usage:     "\n	-f	Force umount (i.e., unreachable NFS server)"
+-//usage:	IF_FEATURE_MOUNT_LOOP(
+ //usage:     "\n	-d	Free loop device if it has been used"
+-//usage:	)
+ //usage:     "\n	-t FSTYPE[,...]	Unmount only these filesystem type(s)"
+ //usage:
  //usage:#define umount_example_usage
  //usage:       "$ umount /dev/hdc1\n"
  

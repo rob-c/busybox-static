@@ -223,9 +223,15 @@ ck "run.meta.timedout"  "1" "$("$BB" log -D "$TMPDIR/r" R257 --meta | "$BB" grep
 ck "run.artifact.mode"  "600" "$("$BB" stat -c %a "$TMPDIR/r/R257/stdout")"
 ck "run.dir.mode"       "700" "$("$BB" stat -c %a "$TMPDIR/r")"
 ck "run.missing.log.rc" "1" "$("$BB" log -D "$TMPDIR/r" R999 >/dev/null 2>&1; echo $?)"
-ck "run.timeout.rc"     "3" "$("$BB" run -D "$TMPDIR/r" --timeout 0.3 -- sh -c 'sleep 5' >/dev/null 2>&1; echo $?)"
+# A unique sentinel name: `pgrep -f 'sleep 5'` also matches an unrelated
+# `sleep 540` in another session, which makes this check fail for a reason
+# that has nothing to do with run.
+sent="sentinel-$$"
+ck "run.timeout.rc"     "3" "$("$BB" run -D "$TMPDIR/r" --timeout 0.3 -- sh -c "sleep 5; : $sent" >/dev/null 2>&1; echo $?)"
 ck "run.timeout.meta"   "1" "$("$BB" log -D "$TMPDIR/r" R258 --meta | "$BB" grep -c '^timed_out=1')"
-ck "run.timeout.kills.child" "0" "$("$BB" pgrep -f 'sleep 5' | wc -l | tr -d ' ')"
+# teardown is asynchronous: give the kernel a moment to finish the group kill
+i=0; while [ $i -lt 20 ] && [ "$("$BB" pgrep -f "$sent" | wc -l)" != 0 ]; do sleep 0.1; i=$((i+1)); done
+ck "run.timeout.kills.child" "0" "$("$BB" pgrep -f "$sent" | wc -l | tr -d ' ')"
 ck "run.json.schema"    "1" "$("$BB" run -D "$TMPDIR/r" --format json -- true | "$BB" grep -c '"schema":1')"
 ck "run.json.exit"      "1" "$("$BB" run -D "$TMPDIR/r" --format json -- sh -c 'exit 4' | "$BB" grep -c '"exit_code":4')"
 ck "run.capture.limit"  "1" "$("$BB" run -D "$TMPDIR/r" --capture-limit 16 --format json -- sh -c 'yes x | head -100' | "$BB" grep -c '"capture_complete":false')"

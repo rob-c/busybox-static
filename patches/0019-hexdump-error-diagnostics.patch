@@ -1,0 +1,19 @@
+diff --git a/util-linux/hexdump.c b/util-linux/hexdump.c
+index 5a938e7..13c03c3 100644
+--- a/util-linux/hexdump.c
++++ b/util-linux/hexdump.c
+@@ -99,12 +99,14 @@ int hexdump_main(int argc, char **argv)
+ 	if (ENABLE_HD
+ 	 && (!ENABLE_HEXDUMP || !applet_name[2])
+ 	) { /* we are "hd" */
++		opterr = 0;
+ 		ch = 'C';
+ 		goto hd_applet;
+ 	}
+ 
+ 	/* We cannot use getopt32: in hexdump options are cumulative.
+ 	 * E.g. "hexdump -C -C file" should dump each line twice */
++	opterr = 0;   /* both entry points: hexdump and the hd alias */
+ 	while ((ch = getopt(argc, argv, hexdump_opts)) > 0) {
+ 		p = strchr(hexdump_opts, ch);
+ 		if (!p)

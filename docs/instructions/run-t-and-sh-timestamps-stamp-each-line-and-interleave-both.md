@@ -1,62 +1,51 @@
 ---
-title: "`run -t` and `sh --timestamps` stamp each line and preserve it in JSON and on disk"
+title: "run/sh JSON metadata implemented: exit_kind, argv, cpu/rss, effects, replay"
 kind: "instruction"
-summary: "`run -t` / `sh --timestamps` stamp each line `[ s.uuuuuu out|err]`; the same records are kept in JSON `timeline[]` (with `started_unix_us`), a `timeline` artifact, and `log -s timeline`."
-tags: [run, sh, timestamps, timeline, json, log, ordering]
+summary: "run/sh JSON now carries exit_kind/signal, argv[]+argv0_resolved, cpu/rss from wait4, output shape counts, replay, inputs_hash, view_next and --effects; verified on both platforms."
+tags: [run, json, metadata, effects, signals, rusage]
 created: "2026-11-22T18:35:36.570Z"
-updated: "2026-11-22T18:45:46.890Z"
+updated: "2026-11-24T00:46:45.738Z"
 ---
-`run -t` / `sh --timestamps` print one interleaved stream where every line carries its read time and stream, and the same records are preserved in three places: the JSON `timeline` array, a `timeline` artifact beside `stdout`/`stderr`, and the version `log -s timeline` reads back. Raw artifacts stay byte-exact.
+All nine metadata items are implemented in `run` (and so in `sh --format json`, which forwards). A model can now see how the process ended, what actually executed, what it changed, and how to read past a truncated view.
 
 ```mermaid
 flowchart LR
-  A["child"] -->|stdout| P["poll loop"]
-  A -->|stderr| P
-  P --> B["artifact stdout / stderr<br/>byte-exact"]
-  P --> D["line assembler<br/>stamp on newline"]
-  D --> F["artifact timeline<br/>complete"]
-  D --> E["[  0.015623 out] one"]
-  D --> G["JSON timeline[]"]
-  F --> H["log -s timeline"]
+  A["run -F json"] --> B["how it ended:<br/>exit_kind, signal, signal_name"]
+  A --> C["what ran:<br/>argv[], argv0_resolved"]
+  A --> D["what it cost:<br/>cpu_user_ms, cpu_sys_ms, max_rss_kb"]
+  A --> E["what it changed:<br/>effects[] with -x"]
+  A --> F["how to see more:<br/>view_next"]
 ```
 
-## Text form
+## The fields
+
+| field | note |
+|---|---|
+| `exit_kind` | `exited` / `signalled` / `timed_out` / `cancelled` — `-1` alone no longer needs guessing |
+| `signal`, `signal_name` | only when signalled; `15`, `TERM` |
+| `argv[]`, `argv0_resolved` | real argument boundaries (the `cmd` string is space-joined) and what PATH or realpath resolved argv[0] to |
+| `cpu_user_ms`, `cpu_sys_ms`, `max_rss_kb` | from `wait4`; `ru_maxrss` is bytes on Darwin and KiB on Linux, so it is divided on `__APPLE__` |
+| `stdout_lines`, `stderr_lines`, `binary`, `final_newline`, `dropped_bytes` | output shape, in one pass over each artifact |
+| `replay` | `cd '<cwd>' && '<argv0>' '<arg>' …`, POSIX single-quoted |
+| `inputs_hash` | sha256 over NUL-separated argv plus the start cwd |
+| `busybox_version` | parsed from `bb_banner` |
+| `view_next` | `log -D <dir> R<n> -B <2×budget>`, only when the view was truncated |
+| `effects[]`, `effects_scanned`, `effects_truncated` | with `-x/--effects`: `{op:"added"\|"changed"\|"removed", path, size}` from a bounded walk (depth 8, 20000 entries, 200 reported) of the run's cwd before and after |
+
+## Verified
 
 ```
-$ busybox sh --timestamps -c 'echo one; echo two >&2; sleep 0.05; echo three'
-run=R66 exit_code=0 timed_out=false cancelled=false duration_ms=80
-timeline_lines=3 shown=3 truncated=false
---- timeline ---
-[   0.015623 out] one
-[   0.015686 err] two
-[   0.081766 out] three
+$ busybox run -F json -- busybox sh -c 'kill -TERM $$'
+  → "exit_kind":"signalled","signal":15,"signal_name":"TERM"
+$ cd DIR && busybox run -x -F json -- busybox sh -c 'printf hi > new.txt; printf changed > keep.txt'
+  → "effects":[{"op":"changed","path":"keep.txt","size":8},{"op":"added","path":"new.txt","size":3}]
+$ busybox run -B 5 -F json -- busybox sh -c 'seq 1 200'
+  → "view_next":"log -D <dir> R4059 -B 10"
 ```
 
-Microsecond `CLOCK_MONOTONIC` relative to the fork; `out`/`err` tagged so a merged line is never ambiguous. The two `--- stdout ---` / `--- stderr ---` sections are replaced — keeping them would lose the interleaving again.
+`agent-ops 1299/0`; `agent-ops-sweep 1311/0/8` on darwin, `1310/0/8` in almalinux:9 (one check skips as root); `patchcheck checked=22 bad=0`; `patch-reconstruct` files differing: 0.
 
-## JSON keeps the timestamps
+## Two traps in the harness
 
-```
-$ busybox run -t -F json -- busybox sh -c 'echo a; echo b >&2'
-{…,"started_unix_us":1795372826626033,
- "timeline":[{"us":13134,"stream":"out","text":"a"},{"us":13177,"stream":"err","text":"b"}],
- "timeline_lines":2,"timeline_shown":2,"timeline_truncated":false}
-```
-
-`us` is µs since the fork; `started_unix_us` is the wall-clock origin, so a timeline can be aligned with other logs. `timeline_lines` vs `timeline_shown` says exactly how much of it you are seeing.
-
-## Evidence outlives the response
-
-Even with `-B 8`, where the view shows one line of five, `<dir>/timeline` holds all five. Read it back with `log`:
-
-```
-$ busybox log -D <dir> R7 -s timeline -m 'err]'
-```
-
-`-s` now takes `stdout`, `stderr`, `timeline` or `both`; anything else exits 2.
-
-## The ordering limit, stated once
-
-The two pipes are separate, so byte order *between* them is not recoverable — the known cost of pipes over a pty (§10 Q3). Read order of *complete lines* is what gets stamped: exact within a stream, read order across streams. The `out`/`err` tag is what keeps that honest.
-
-Checks: `tests/agent-ops-sweep.sh` §24-25, 63 of them, green on darwin-arm64 and AlmaLinux 9.
+- busybox `sed` has no `\|` in BRE, so the field extractors are three single-pattern helpers: `fs` (quoted string), `fn` (number), `fb` (boolean word). One alternation pattern returns empty and every check fails for the wrong reason.
+- `ru_maxrss` units differ per platform; without the `__APPLE__` division the field reads 5,816,320 "KB".

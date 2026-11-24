@@ -1,0 +1,1466 @@
+diff --git a/coreutils/df.c b/coreutils/df.c
+index fba2324..9d16fb3 100644
+--- a/coreutils/df.c
++++ b/coreutils/df.c
+@@ -97,7 +97,9 @@
+ //usage:       "Filesystem          512-blocks      Used Available Capacity Mounted on\n"
+ //usage:       "/dev/sda3             17381728  17107080    274648      98% /\n"
+ 
+-#include <mntent.h>
++#ifdef HAVE_MNTENT_H
++# include <mntent.h>
++#endif
+ #include <sys/statvfs.h>
+ #include "libbb.h"
+ #include "unicode.h"
+@@ -109,6 +111,34 @@ static unsigned long kscale(unsigned long b, unsigned long bs)
+ }
+ #endif
+ 
++#if defined(__APPLE__)
++/*
++ * APFS volumes in one container share their free space, so statvfs() reports
++ * container-wide usage: df would claim "/" is 71% full when the sealed system
++ * volume actually holds ~13 GB.  /bin/df asks the volume itself via
++ * ATTR_VOL_SPACEUSED, whose reply is a packed { uint32_t length; off_t used; }
++ * - note the value sits at offset 4, not 8, so it cannot be read through a
++ * normally-aligned struct.
++ */
++#include <sys/attr.h>
++
++static unsigned long long darwin_volume_used(const char *path)
++{
++	struct attrlist al;
++	unsigned char buf[32];
++	uint64_t used;
++
++	memset(&al, 0, sizeof(al));
++	al.bitmapcount = ATTR_BIT_MAP_COUNT;
++	al.volattr = ATTR_VOL_INFO | ATTR_VOL_SPACEUSED;
++	memset(buf, 0, sizeof(buf));
++	if (getattrlist(path, &al, buf, sizeof(buf), 0) != 0)
++		return 0;
++	memcpy(&used, buf + sizeof(uint32_t), sizeof(used));
++	return (unsigned long long)used;
++}
++#endif
++
+ int df_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
+ int df_main(int argc UNUSED_PARAM, char **argv)
+ {
+@@ -260,6 +290,7 @@ int df_main(int argc UNUSED_PARAM, char **argv)
+ 
+ 		if ((s.f_blocks > 0) || !mount_table || (opt & OPT_ALL)) {
+ 			unsigned long long blocks_used;
++			unsigned long long print_used;
+ 			unsigned long long blocks_total;
+ 			unsigned blocks_percent_used;
+ 
+@@ -271,6 +302,20 @@ int df_main(int argc UNUSED_PARAM, char **argv)
+ 					df_disp_hr = 1;
+ 			}
+ 			blocks_used = s.f_blocks - s.f_bfree;
++#if defined(__APPLE__)
++			/* per-volume usage, as /bin/df reports it */
++			if (!(opt & OPT_INODE)) {
++				unsigned long long vu = darwin_volume_used(mount_point);
++				if (vu != 0 && s.f_frsize != 0) {
++					unsigned long long in_frsize = vu / s.f_frsize;
++					if (in_frsize <= s.f_blocks)
++						blocks_used = in_frsize;
++				}
++			}
++#endif
++			/* the percentage loop below shifts blocks_used, so keep a copy
++			 * for the "Used" column */
++			print_used = blocks_used;
+ 			blocks_total = blocks_used + s.f_bavail;
+ 			blocks_percent_used = blocks_total; /* 0% if blocks_total == 0, else... */
+ 			if (blocks_total != 0) {
+@@ -332,7 +377,7 @@ int df_main(int argc UNUSED_PARAM, char **argv)
+ 			printf(" %9s " + 1,
+ 				/* EXPR x f_frsize / df_disp_hr, show one fractional,
+ 				 * use suffixes if df_disp_hr == 0 */
+-				make_human_readable_str((s.f_blocks - s.f_bfree),
++				make_human_readable_str(print_used,
+ 						s.f_frsize, df_disp_hr));
+ 
+ 			printf("%9s %3u%% %s\n",
+@@ -343,7 +388,7 @@ int df_main(int argc UNUSED_PARAM, char **argv)
+ #else
+ 			printf(" %9lu %9lu %9lu %3u%% %s\n",
+ 				kscale(s.f_blocks, s.f_frsize),
+-				kscale(s.f_blocks - s.f_bfree, s.f_frsize),
++				kscale(print_used, s.f_frsize),
+ 				kscale(s.f_bavail, s.f_frsize),
+ 				blocks_percent_used, mount_point);
+ #endif
+diff --git a/coreutils/uname.c b/coreutils/uname.c
+index e1e7a76..3fe8c65 100644
+--- a/coreutils/uname.c
++++ b/coreutils/uname.c
+@@ -171,7 +171,19 @@ int uname_main(int argc UNUSED_PARAM, char **argv UNUSED_PARAM)
+ 	}
+ #endif
+ 	if (ENABLE_BB_ARCH && (!ENABLE_UNAME || applet_name[0] == 'a')) {
++		/* `arch` reports the architecture in Linux terms, so a script that
++		 * branches on `arch` behaves the same on both platforms. `uname -m`
++		 * keeps the kernel's own string. */
++#if defined(__APPLE__) && defined(__aarch64__)
++		if (strcmp(uname_info.name.machine, "arm64") == 0)
++			puts("aarch64");
++		else
++			puts(uname_info.name.machine);
++#elif defined(__APPLE__) && defined(__x86_64__)
++		puts(uname_info.name.machine);   /* x86_64 already matches */
++#else
+ 		puts(uname_info.name.machine);
++#endif
+ 	} else {
+ #if ENABLE_UNAME
+ 		/* "uname" */
+diff --git a/miscutils/bc.c b/miscutils/bc.c
+index 1ef8f41..e1d1323 100644
+--- a/miscutils/bc.c
++++ b/miscutils/bc.c
+@@ -7556,6 +7556,9 @@ int dc_main(int argc UNUSED_PARAM, char **argv)
+ 
+ 	// Run -e'SCRIPT' and -fFILE in order of appearance, then handle FILEs
+ 	noscript = BC_FLAG_I;
++	/* Diagnostic wording must not depend on which libc is linked: glibc,
++	 * musl and Apple's libc each word an unknown option differently. */
++	opterr = 0;
+ 	for (;;) {
+ 		int n = getopt(argc, argv, "e:f:x");
+ 		if (n <= 0)
+@@ -7575,6 +7578,8 @@ int dc_main(int argc UNUSED_PARAM, char **argv)
+ 			option_mask32 |= DC_FLAG_X;
+ 			break;
+ 		default:
++			/* one wording on every platform, matching the Linux build */
++			bb_error_msg("unrecognized option: %c", optopt ? optopt : '?');
+ 			bb_show_usage();
+ 		}
+ 	}
+diff --git a/networking/interface.c b/networking/interface.c
+index 6b6c094..0a773a3 100644
+--- a/networking/interface.c
++++ b/networking/interface.c
+@@ -34,6 +34,8 @@
+ #include "inet_common.h"
+ #include <net/if.h>
+ #include <net/if_arp.h>
++
++#if !defined(__APPLE__)
+ #ifdef HAVE_NET_ETHERNET_H
+ # include <net/ethernet.h>
+ #endif
+@@ -1078,8 +1080,191 @@ static int do_if_print(struct interface *ife, int show_downed_too)
+ 	return res;
+ }
+ 
++#endif /* !__APPLE__ */
++
++#if defined(__APPLE__)
++/*
++ * Darwin port: if_readlist() and friends speak rtnetlink, which does not exist
++ * here.  getifaddrs(3) gives everything the printer needs in one pass: the
++ * flag word, one sockaddr per address family, and ifa_data pointing at a
++ * struct if_data with the metrics (mtu, bytes, packets, errors).
++ *
++ * Output follows macOS ifconfig closely enough for grep/awk use:
++ *   en0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
++ *           ether a4:83:e7:xx:xx:xx
++ *           inet 192.168.1.24 netmask 0xffffff00 broadcast 192.168.1.255
++ *           inet6 fe80::1c2b:...%en0 prefixlen 64 scopeid 0x4
++ *           status: active
++ * Setting anything is not supported (see ifconfig.c's Darwin branch).
++ */
++#include <ifaddrs.h>
++#include <net/if_dl.h>
++#include <net/if_var.h>
++
++static void darwin_print_flags(int flags)
++{
++	static const struct {
++		unsigned bit;
++		const char *name;
++	} names[] = {
++		{ IFF_UP,          "UP"          },
++		{ IFF_BROADCAST,   "BROADCAST"   },
++		{ IFF_DEBUG,       "DEBUG"       },
++		{ IFF_LOOPBACK,    "LOOPBACK"    },
++		{ IFF_POINTOPOINT, "POINTOPOINT" },
++		{ IFF_NOTRAILERS,  "NOTRAILERS"  },
++		{ IFF_RUNNING,     "RUNNING"     },
++		{ IFF_NOARP,       "NOARP"       },
++		{ IFF_PROMISC,     "PROMISC"     },
++		{ IFF_ALLMULTI,    "ALLMULTI"    },
++		{ IFF_MULTICAST,   "MULTICAST"   },
++	};
++	unsigned i;
++	int first = 1;
++
++	for (i = 0; i < ARRAY_SIZE(names); i++) {
++		if (flags & names[i].bit) {
++			if (!first)
++				bb_putchar(',');
++			fputs(names[i].name, stdout);
++			first = 0;
++		}
++	}
++}
++
++/* 0xffffff00 style netmask, the way BSD ifconfig prints it */
++static void darwin_print_netmask(const struct sockaddr *sa)
++{
++	const struct sockaddr_in *sin = (const struct sockaddr_in *)sa;
++
++	if (!sa || sa->sa_family != AF_INET)
++		return;
++	printf(" netmask 0x%08x", (unsigned)ntohl(sin->sin_addr.s_addr));
++}
++
++static int darwin_display_interfaces(char *ifname)
++{
++	struct ifaddrs *ifap, *ifa;
++	int shown = 0;
++
++	if (getifaddrs(&ifap) != 0) {
++		bb_perror_msg("getifaddrs");
++		return 1;
++	}
++
++	for (ifa = ifap; ifa; ifa = ifa->ifa_next) {
++		/* One pass per interface: only act on the AF_LINK entry, which is
++		 * the one that carries flags and if_data, then print every
++		 * address that belongs to that name. */
++		struct ifaddrs *j;
++		const struct if_data *ifd;
++
++		if (!(ifa->ifa_flags & IFF_UP) && ifa != ifap)
++			continue;
++		if (ifa->ifa_addr == NULL)
++			continue;
++		if (ifa->ifa_addr->sa_family != AF_LINK)
++			continue;
++		if (ifname && ifname != IFNAME_SHOW_DOWNED_TOO && strcmp(ifname, ifa->ifa_name) != 0)
++			continue;
++		/* skip the address families already printed for this name */
++		{
++			int dup = 0;
++			for (j = ifap; j != ifa; j = j->ifa_next) {
++				if (j->ifa_addr
++				 && j->ifa_addr->sa_family == AF_LINK
++				 && strcmp(j->ifa_name, ifa->ifa_name) == 0
++				) {
++					dup = 1;
++					break;
++				}
++			}
++			if (dup)
++				continue;
++		}
++
++		ifd = (const struct if_data *)ifa->ifa_data;
++		printf("%s: flags=%x<", ifa->ifa_name, (unsigned)ifa->ifa_flags);
++		darwin_print_flags(ifa->ifa_flags);
++		bb_putchar('>');
++		if (ifd)
++			printf(" mtu %u", (unsigned)ifd->ifi_mtu);
++		bb_putchar('\n');
++
++		for (j = ifap; j; j = j->ifa_next) {
++			if (!j->ifa_addr || strcmp(j->ifa_name, ifa->ifa_name) != 0)
++				continue;
++			switch (j->ifa_addr->sa_family) {
++			case AF_LINK: {
++				const struct sockaddr_dl *sdl = (const struct sockaddr_dl *)j->ifa_addr;
++				const unsigned char *mac;
++				if (sdl->sdl_alen != 6)
++					break;
++				mac = (const unsigned char *)LLADDR(sdl);
++				printf("\tether %02x:%02x:%02x:%02x:%02x:%02x\n",
++					mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
++				break;
++			}
++			case AF_INET: {
++				char buf[64];
++				const struct sockaddr_in *sin = (const struct sockaddr_in *)j->ifa_addr;
++				inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf));
++				printf("\tinet %s", buf);
++				darwin_print_netmask(j->ifa_netmask);
++				if (j->ifa_broadaddr && (j->ifa_flags & IFF_BROADCAST)) {
++					const struct sockaddr_in *b = (const struct sockaddr_in *)j->ifa_broadaddr;
++					inet_ntop(AF_INET, &b->sin_addr, buf, sizeof(buf));
++					printf(" broadcast %s", buf);
++				}
++				bb_putchar('\n');
++				break;
++			}
++			case AF_INET6: {
++				char buf[64];
++				const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)j->ifa_addr;
++				const unsigned char *m = ((const struct sockaddr_in6 *)j->ifa_netmask)->sin6_addr.s6_addr;
++				int plen = 0;
++				unsigned k;
++
++				for (k = 0; k < 16; k++)
++					plen += __builtin_popcount(m[k]);
++				inet_ntop(AF_INET6, &sin6->sin6_addr, buf, sizeof(buf));
++				printf("\tinet6 %s prefixlen %d\n", buf, plen);
++				break;
++			}
++			default:
++				break;
++			}
++		}
++
++		if (ifd) {
++			printf("\tstatus: %s\n", (ifa->ifa_flags & IFF_RUNNING) ? "active" : "inactive");
++			if (ifd->ifi_ibytes || ifd->ifi_obytes) {
++				printf("\t%llu bytes in, %llu bytes out\n",
++					(unsigned long long)ifd->ifi_ibytes,
++					(unsigned long long)ifd->ifi_obytes);
++			}
++		}
++		shown++;
++	}
++
++	freeifaddrs(ifap);
++	if (!shown && ifname && ifname != IFNAME_SHOW_DOWNED_TOO) {
++		/* Match the Linux wording (and its shape) so stderr parses the
++		 * same way on both platforms. */
++		bb_error_msg("%s: error fetching interface information: Device not found",
++				ifname);
++		return 1;
++	}
++	return 0;
++}
++#endif /* __APPLE__ */
++
+ int FAST_FUNC display_interfaces(char *ifname)
+ {
++#if defined(__APPLE__)
++	return darwin_display_interfaces(ifname);
++#else
+ 	struct interface *ife;
+ 	int res;
+ 	struct iface_list ilist;
+@@ -1104,9 +1289,10 @@ int FAST_FUNC display_interfaces(char *ifname)
+ 	res = do_if_print(ife, /*show_downed_too:*/ 1);
+  ret:
+ 	return (res < 0); /* status < 0 == 1 -- error */
++#endif /* !__APPLE__ */
+ }
+ 
+-#if ENABLE_FEATURE_HWIB
++#if ENABLE_FEATURE_HWIB && !defined(__APPLE__)
+ /* Input an Infiniband address and convert to binary. */
+ int FAST_FUNC in_ib(const char *bufp, struct sockaddr *sap)
+ {
+diff --git a/networking/ip.c b/networking/ip.c
+index 02f93ad..91a5d35 100644
+--- a/networking/ip.c
++++ b/networking/ip.c
+@@ -8,8 +8,17 @@
+  * Rani Assaf <rani@magic.metawire.com> 980929: resolve addresses
+  * Bernhard Reutner-Fischer rewrote to use index_in_substr_array
+  */
++//config:config IP_BUILD_NETLINK
++//config:	bool "Build the libiproute netlink backends"
++//config:	default y
++//config:	depends on IP || IPADDR || IPLINK || IPROUTE || IPRULE || IPTUNNEL || IPNEIGH
++//config:	help
++//config:	The rtnetlink code in networking/libiproute is Linux-only.  Turn this
++//config:	off to keep the ip applet but drop those objects (the Darwin port
++//config:	provides its own getifaddrs/NET_RT_DUMP implementation).
++//config:
+ //config:config IP
+-//config:	bool "ip (35 kb)"
++//config:	bool "ip (35 kb)
+ //config:	default y
+ //config:	help
+ //config:	The "ip" applet is a TCP/IP interface configuration and routing
+@@ -346,7 +355,7 @@
+ //usage:#endif
+ //usage:
+ //usage:#define ip_trivial_usage
+-//usage:       "[OPTIONS] "
++//usage:       "[OPTIONS] address|route|link|tunnel|neigh|rule [ARGS]"
+ //usage:	IF_FEATURE_IP_ADDRESS("address")
+ //usage:	IF_FEATURE_IP_ROUTE(  IF_FEATURE_IP_ADDRESS("|")"route")
+ //usage:	IF_FEATURE_IP_LINK(   IP_BAR_LINK  "link")
+@@ -356,6 +365,15 @@
+ //usage:       " [ARGS]"
+ //usage:#define ip_full_usage "\n\n"
+ //usage:       "OPTIONS := -f[amily] inet|inet6|link | -o[neline]\n"
++//usage:	"\n"
++//usage:	"ip addr add|del IFADDR dev IFACE | show|flush [dev IFACE] [to PREFIX]\n"
++//usage:	"ip route list|flush|add|del|change|append|replace|test ROUTE\n"
++//usage:	"ip link set IFACE [up|down] [arp on|off] [multicast on|off]\n"
++//usage:	"	[promisc on|off] [mtu NUM] [name NAME] [qlen NUM] [address MAC]\n"
++//usage:	"	[master IFACE | nomaster] [netns PID] [type TYPE ARGS]\n"
++//usage:	"ip tunnel add|change|del|show [NAME]\n"
++//usage:	"	[mode ipip|gre|sit] [remote ADDR] [local ADDR] [ttl TTL]\n"
++//usage:	"ip neigh show|flush [to PREFIX] [dev DEV] [nud STATE]"
+ //usage:	IF_FEATURE_IP_ADDRESS("\n"
+ //usage:	"ip addr "ipaddr_trivial_usage)
+ //usage:	IF_FEATURE_IP_ROUTE("\n"
+@@ -371,6 +389,912 @@
+ 
+ #include "libbb.h"
+ 
++#if defined(__APPLE__)
++/*
++ * Read-only Darwin port.  busybox's ip delegates to libiproute, which is
++ * rtnetlink throughout, so the whole thing is compiled out below and replaced
++ * by three printers built on the same two sources as ifconfig and route:
++ *
++ *   ip link   getifaddrs(3)          - flags, mtu, MAC
++ *   ip addr   getifaddrs(3)          - inet/inet6 addresses with prefixlen
++ *   ip route  sysctl(NET_RT_DUMP)    - destination/gateway/device
++ *
++ * Output follows iproute2's shape closely enough for `ip a | grep inet` and
++ * `ip route | grep default`, which is what scripts actually use.
++ */
++#include <ifaddrs.h>
++#include <net/if_dl.h>
++#include <net/if_var.h>
++#include <net/route.h>
++#include <sys/sysctl.h>
++#include <sys/sockio.h>
++#include <net/if_arp.h>
++
++static void darwin_print_flags(int flags)
++{
++	static const struct { unsigned bit; const char *name; } t[] = {
++		{ IFF_UP, "UP" }, { IFF_BROADCAST, "BROADCAST" },
++		{ IFF_LOOPBACK, "LOOPBACK" }, { IFF_RUNNING, "RUNNING" },
++		{ IFF_MULTICAST, "MULTICAST" },
++	};
++	unsigned i;
++	int first = 1;
++	for (i = 0; i < ARRAY_SIZE(t); i++) {
++		if (flags & t[i].bit) {
++			if (!first) bb_putchar(',');
++			fputs(t[i].name, stdout);
++			first = 0;
++		}
++	}
++}
++
++static int darwin_if_index(const char *name)
++{
++	struct ifaddrs *ifap, *ifa;
++	int idx = 0;
++
++	if (getifaddrs(&ifap) != 0)
++		return 0;
++	for (ifa = ifap; ifa; ifa = ifa->ifa_next) {
++		if (ifa->ifa_addr && ifa->ifa_addr->sa_family == AF_LINK
++		 && strcmp(ifa->ifa_name, name) == 0
++		) {
++			idx = if_nametoindex(name);
++			break;
++		}
++	}
++	freeifaddrs(ifap);
++	return idx;
++}
++
++/* Print "1: en0: <FLAGS> mtu 1500" style lines, one per interface. */
++static void darwin_ip_link(void)
++{
++	struct ifaddrs *ifap, *ifa;
++
++	if (getifaddrs(&ifap) != 0) {
++		bb_perror_msg_and_die("getifaddrs");
++	}
++	for (ifa = ifap; ifa; ifa = ifa->ifa_next) {
++		const struct if_data *ifd;
++		struct ifaddrs *j;
++		int dup = 0;
++
++		if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_LINK)
++			continue;
++		for (j = ifap; j != ifa; j = j->ifa_next) {
++			if (j->ifa_addr && j->ifa_addr->sa_family == AF_LINK
++			 && strcmp(j->ifa_name, ifa->ifa_name) == 0
++			) {
++				dup = 1;
++				break;
++			}
++		}
++		if (dup)
++			continue;
++
++		ifd = (const struct if_data *)ifa->ifa_data;
++		printf("%d: %s: <", darwin_if_index(ifa->ifa_name), ifa->ifa_name);
++		darwin_print_flags(ifa->ifa_flags);
++		printf(">");
++		if (ifd)
++			printf(" mtu %u", (unsigned)ifd->ifi_mtu);
++		printf(" qlen 1000\n");
++		for (j = ifap; j; j = j->ifa_next) {
++			if (j->ifa_addr && strcmp(j->ifa_name, ifa->ifa_name) == 0
++			 && j->ifa_addr->sa_family == AF_LINK
++			) {
++				const struct sockaddr_dl *sdl = (const struct sockaddr_dl *)j->ifa_addr;
++				if (sdl->sdl_alen == 6) {
++					const unsigned char *m = (const unsigned char *)LLADDR(sdl);
++					printf("    link/ether %02x:%02x:%02x:%02x:%02x:%02x\n",
++						m[0], m[1], m[2], m[3], m[4], m[5]);
++				}
++				break;
++			}
++		}
++	}
++	freeifaddrs(ifap);
++}
++
++static void darwin_ip_addr(void)
++{
++	struct ifaddrs *ifap, *ifa;
++
++	if (getifaddrs(&ifap) != 0) {
++		bb_perror_msg_and_die("getifaddrs");
++	}
++	for (ifa = ifap; ifa; ifa = ifa->ifa_next) {
++		const struct if_data *ifd;
++		struct ifaddrs *j;
++		int dup = 0;
++
++		if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_LINK)
++			continue;
++		for (j = ifap; j != ifa; j = j->ifa_next) {
++			if (j->ifa_addr && j->ifa_addr->sa_family == AF_LINK
++			 && strcmp(j->ifa_name, ifa->ifa_name) == 0
++			) {
++				dup = 1;
++				break;
++			}
++		}
++		if (dup)
++			continue;
++
++		ifd = (const struct if_data *)ifa->ifa_data;
++		printf("%d: %s: <", darwin_if_index(ifa->ifa_name), ifa->ifa_name);
++		darwin_print_flags(ifa->ifa_flags);
++		printf(">");
++		if (ifd)
++			printf(" mtu %u", (unsigned)ifd->ifi_mtu);
++		printf("\n");
++
++		for (j = ifap; j; j = j->ifa_next) {
++			char buf[64];
++			if (!j->ifa_addr || strcmp(j->ifa_name, ifa->ifa_name) != 0)
++				continue;
++			if (j->ifa_addr->sa_family == AF_INET) {
++				const struct sockaddr_in *sin = (const struct sockaddr_in *)j->ifa_addr;
++				const struct sockaddr_in *nm = (const struct sockaddr_in *)j->ifa_netmask;
++				unsigned m = nm ? ntohl(nm->sin_addr.s_addr) : 0;
++				int plen = 0;
++				while (m & 0x80000000U) { plen++; m <<= 1; }
++				inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf));
++				printf("    inet %s/%d", buf, plen);
++				if (j->ifa_flags & IFF_LOOPBACK)
++					printf(" scope host");
++				else
++					printf(" scope global %s", ifa->ifa_name);
++				if (j->ifa_broadaddr && (j->ifa_flags & IFF_BROADCAST)) {
++					const struct sockaddr_in *b = (const struct sockaddr_in *)j->ifa_broadaddr;
++					inet_ntop(AF_INET, &b->sin_addr, buf, sizeof(buf));
++					printf(" brd %s", buf);
++				}
++				printf("\n");
++			} else if (j->ifa_addr->sa_family == AF_INET6) {
++				const struct sockaddr_in6 *s6 = (const struct sockaddr_in6 *)j->ifa_addr;
++				const unsigned char *m6 = ((const struct sockaddr_in6 *)j->ifa_netmask)->sin6_addr.s6_addr;
++				int plen = 0;
++				unsigned k;
++				for (k = 0; k < 16; k++)
++					plen += __builtin_popcount(m6[k]);
++				inet_ntop(AF_INET6, &s6->sin6_addr, buf, sizeof(buf));
++				printf("    inet6 %s/%d scope global\n", buf, plen);
++			}
++		}
++	}
++	freeifaddrs(ifap);
++}
++
++static void darwin_ip_route(void)
++{
++	int mib[6] = { CTL_NET, PF_ROUTE, 0, AF_INET, NET_RT_DUMP, 0 };
++	size_t needed = 0;
++	char *buf, *lim, *next;
++
++	if (sysctl(mib, 6, NULL, &needed, NULL, 0) != 0 || needed == 0)
++		return;
++	buf = xmalloc(needed);
++	if (sysctl(mib, 6, buf, &needed, NULL, 0) != 0) {
++		free(buf);
++		return;
++	}
++	lim = buf + needed;
++	for (next = buf; next + sizeof(struct rt_msghdr) <= lim; ) {
++		struct rt_msghdr *rtm = (struct rt_msghdr *)next;
++		const struct sockaddr *sa, *dst = NULL, *gw = NULL, *mask = NULL;
++		char d[64], g[64], m[64], ifname[IFNAMSIZ];
++		int i, is_default;
++
++		if (rtm->rtm_msglen == 0)
++			break;
++		next += rtm->rtm_msglen;
++		if (rtm->rtm_version != RTM_VERSION || !(rtm->rtm_flags & RTF_UP))
++			continue;
++
++		sa = (const struct sockaddr *)(rtm + 1);
++		for (i = 0; i < RTAX_MAX; i++) {
++			if (!(rtm->rtm_addrs & (1 << i)))
++				continue;
++			if ((const char *)sa >= next)
++				break;
++			switch (i) {
++			case RTAX_DST:     dst  = sa; break;
++			case RTAX_GATEWAY: gw   = sa; break;
++			case RTAX_NETMASK: mask = sa; break;
++			default: break;
++			}
++			sa = (const struct sockaddr *)((const char *)sa
++					+ ((sa->sa_len + 3) & ~3));
++		}
++
++		/* destination */
++		is_default = (!mask || mask->sa_len <= (int)offsetof(struct sockaddr_in, sin_addr))
++			&& dst && dst->sa_family == AF_INET
++			&& ((const struct sockaddr_in *)dst)->sin_addr.s_addr == 0;
++		if (is_default) {
++			safe_strncpy(d, "default", sizeof(d));
++		} else if (dst && dst->sa_family == AF_INET) {
++			unsigned p = 0;
++			if (mask && mask->sa_len > offsetof(struct sockaddr_in, sin_addr)) {
++				unsigned mm = ntohl(((const struct sockaddr_in *)mask)->sin_addr.s_addr);
++				while (mm & 0x80000000U) { p++; mm <<= 1; }
++			}
++			inet_ntop(AF_INET, &((const struct sockaddr_in *)dst)->sin_addr, d, sizeof(d));
++			if (p)
++				sprintf(d + strlen(d), "/%u", p);
++		} else {
++			safe_strncpy(d, "?", sizeof(d));
++		}
++
++		printf("%s", d);
++		if (gw && gw->sa_family == AF_INET) {
++			inet_ntop(AF_INET, &((const struct sockaddr_in *)gw)->sin_addr, g, sizeof(g));
++			printf(" via %s", g);
++		}
++		ifname[0] = '\0';
++		if_indextoname(rtm->rtm_index, ifname);
++		if (ifname[0])
++			printf(" dev %s", ifname);
++		if (rtm->rtm_flags & RTF_GATEWAY)
++			printf(" proto static");
++		bb_putchar('\n');
++	}
++	free(buf);
++}
++
++/*
++ * --- setters ---------------------------------------------------------------
++ * link set  : SIOCSIFFLAGS / SIOCSIFMTU / SIOCSIFLLADDR
++ * addr add|del : SIOCAIFADDR / SIOCDIFADDR (with the netmask in one message)
++ * route add|del : PF_ROUTE rt_msghdr, same as the route applet
++ */
++static int darwin_ip_sock(void)
++{
++	int s = socket(AF_INET, SOCK_DGRAM, 0);
++	if (s < 0)
++		bb_simple_perror_msg_and_die("socket");
++	return s;
++}
++
++static void darwin_ip_sockaddr(struct sockaddr_in *sin, const char *addr)
++{
++	char buf[64];
++	char *slash;
++
++	safe_strncpy(buf, addr, sizeof(buf));
++	slash = strchr(buf, '/');
++	if (slash)
++		*slash = '\0';
++	memset(sin, 0, sizeof(*sin));
++	sin->sin_len = sizeof(*sin);
++	sin->sin_family = AF_INET;
++	if (inet_pton(AF_INET, buf, &sin->sin_addr) != 1)
++		bb_error_msg_and_die("invalid address: %s", buf);
++}
++
++static int darwin_ip_prefix(const char *addr, int dflt)
++{
++	const char *slash = strchr(addr, '/');
++	return slash ? xatoi_positive(slash + 1) : dflt;
++}
++
++/* ip link set dev IFACE [up|down] [mtu N] [address MAC] */
++static void darwin_ip_link_set(char **args)
++{
++	int s = darwin_ip_sock();
++	const char *dev = NULL, *mac = NULL;
++	int up = -1, mtu = -1;
++
++	while (*args) {
++		if (strcmp(*args, "dev") == 0 && args[1]) {
++			dev = *++args; args++;
++		} else if (strcmp(*args, "up") == 0) {
++			up = 1; args++;
++		} else if (strcmp(*args, "down") == 0) {
++			up = 0; args++;
++		} else if (strcmp(*args, "mtu") == 0 && args[1]) {
++			mtu = xatoi_positive(*++args); args++;
++		} else if (strcmp(*args, "address") == 0 && args[1]) {
++			mac = *++args; args++;
++		} else {
++			bb_error_msg_and_die("unsupported: ip link set %s", *args);
++		}
++	}
++	if (!dev)
++		bb_show_usage();
++
++	if (mac) {
++		struct ifreq ifr;
++		struct sockaddr_dl *sdl;
++		unsigned b[6];
++		int i;
++
++		memset(&ifr, 0, sizeof(ifr));
++		strncpy(ifr.ifr_name, dev, IFNAMSIZ - 1);
++		sdl = (struct sockaddr_dl *)&ifr.ifr_addr;
++		memset(&ifr.ifr_addr, 0, sizeof(ifr.ifr_addr));
++		sdl->sdl_len = offsetof(struct sockaddr_dl, sdl_data) + 6;
++		sdl->sdl_family = AF_LINK;
++		sdl->sdl_alen = 6;
++		if (sscanf(mac, "%x:%x:%x:%x:%x:%x", &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]) != 6)
++			bb_error_msg_and_die("invalid MAC: %s", mac);
++		for (i = 0; i < 6; i++)
++			sdl->sdl_data[i] = (unsigned char)b[i];
++		if (ioctl(s, SIOCSIFLLADDR, &ifr) < 0)
++			bb_perror_msg_and_die("can't set address on %s", dev);
++	}
++	if (mtu > 0) {
++		struct ifreq ifr;
++		memset(&ifr, 0, sizeof(ifr));
++		strncpy(ifr.ifr_name, dev, IFNAMSIZ - 1);
++		ifr.ifr_mtu = mtu;
++		if (ioctl(s, SIOCSIFMTU, &ifr) < 0)
++			bb_perror_msg_and_die("can't set mtu on %s", dev);
++	}
++	if (up >= 0) {
++		struct ifreq ifr;
++		memset(&ifr, 0, sizeof(ifr));
++		strncpy(ifr.ifr_name, dev, IFNAMSIZ - 1);
++		if (ioctl(s, SIOCGIFFLAGS, &ifr) < 0)
++			bb_perror_msg_and_die("can't read flags of %s", dev);
++		if (up)
++			ifr.ifr_flags |= IFF_UP;
++		else
++			ifr.ifr_flags &= ~IFF_UP;
++		if (ioctl(s, SIOCSIFFLAGS, &ifr) < 0)
++			bb_perror_msg_and_die("can't change flags of %s", dev);
++	}
++	close(s);
++}
++
++/* ip addr add|del ADDR[/PFX] dev IFACE */
++static void darwin_ip_addr_set(char **args, int add)
++{
++	int s = darwin_ip_sock();
++	const char *addr = NULL, *dev = NULL;
++	struct ifaliasreq ifra;
++	struct sockaddr_in *sin;
++	int plen;
++
++	if (*args && (*args)[0] != '-') {
++		addr = *args++;
++	}
++	while (*args) {
++		if (strcmp(*args, "dev") == 0 && args[1]) {
++			dev = *++args; args++;
++		} else if (strcmp(*args, "peer") == 0 && args[1]) {
++			args += 2;                  /* accepted, unused */
++		} else {
++			bb_error_msg_and_die("unsupported: ip addr %s", *args);
++		}
++	}
++	if (!addr || !dev)
++		bb_show_usage();
++
++	plen = darwin_ip_prefix(addr, 32);
++	memset(&ifra, 0, sizeof(ifra));
++	strncpy(ifra.ifra_name, dev, IFNAMSIZ - 1);
++
++	sin = (struct sockaddr_in *)&ifra.ifra_addr;
++	darwin_ip_sockaddr(sin, addr);
++
++	sin = (struct sockaddr_in *)&ifra.ifra_mask;
++	sin->sin_len = sizeof(*sin);
++	sin->sin_family = AF_INET;
++	sin->sin_addr.s_addr = htonl(plen >= 32 ? 0xffffffffU
++			: (plen <= 0 ? 0 : (0xffffffffU << (32 - plen))));
++
++	if (ioctl(s, add ? SIOCAIFADDR : SIOCDIFADDR, &ifra) < 0)
++		bb_perror_msg_and_die("%s %s on %s", add ? "can't add" : "can't delete", addr, dev);
++	close(s);
++}
++
++/* ip route add|del DST [via GW] [dev IFACE] */
++/* ---- tunnels: Darwin clones gif/stf interfaces instead of Linux's tunl0 ---- */
++static int darwin_if_ioctl(int cmd, struct ifreq *ifr)
++{
++	int fd = socket(AF_INET, SOCK_DGRAM, 0);
++	int rc;
++
++	if (fd < 0)
++		return -1;
++	rc = ioctl(fd, cmd, ifr);
++	close(fd);
++	return rc;
++}
++
++/* Linux shape: "gif0: ip/ip  remote A  local B" */
++static void darwin_ip_tunnel_show(void)
++{
++	struct ifaddrs *ifap, *ifa;
++	char last[IFNAMSIZ] = "";
++
++	if (getifaddrs(&ifap) != 0)
++		return;
++	for (ifa = ifap; ifa; ifa = ifa->ifa_next) {
++		struct ifreq ifr;
++		char src[64] = "any", dst[64] = "any";
++
++		if (!ifa->ifa_name || strncmp(ifa->ifa_name, "gif", 3) != 0)
++			continue;
++		if (strcmp(last, ifa->ifa_name) == 0)
++			continue;               /* one line per interface */
++		safe_strncpy(last, ifa->ifa_name, sizeof(last));
++
++		memset(&ifr, 0, sizeof(ifr));
++		safe_strncpy(ifr.ifr_name, ifa->ifa_name, IFNAMSIZ);
++		if (darwin_if_ioctl(SIOCGIFPSRCADDR, &ifr) == 0) {
++			struct sockaddr_in *sin = (struct sockaddr_in *)&ifr.ifr_addr;
++			if (sin->sin_family == AF_INET && sin->sin_addr.s_addr)
++				inet_ntop(AF_INET, &sin->sin_addr, src, sizeof(src));
++		}
++		memset(&ifr, 0, sizeof(ifr));
++		safe_strncpy(ifr.ifr_name, ifa->ifa_name, IFNAMSIZ);
++		if (darwin_if_ioctl(SIOCGIFPDSTADDR, &ifr) == 0) {
++			struct sockaddr_in *sin = (struct sockaddr_in *)&ifr.ifr_addr;
++			if (sin->sin_family == AF_INET && sin->sin_addr.s_addr)
++				inet_ntop(AF_INET, &sin->sin_addr, dst, sizeof(dst));
++		}
++		/* Linux prints "… remote A  local B  ttl inherit  nopmtudisc"; gif
++		 * inherits the TTL from the route, and PMTU-disc is not a knob here,
++		 * so only the field that is true on both is printed. */
++		printf("%s: ip/ip  remote %s  local %s  ttl inherit\n",
++				ifa->ifa_name, dst, src);
++	}
++	freeifaddrs(ifap);
++}
++
++/* add|change|del: SIOCIFCREATE + SIOCSIFPHYADDR / SIOCDIFPHYADDR / SIOCIFDESTROY.
++ * All of it needs root, which is why none of it is exercised by the test suite. */
++static void darwin_ip_tunnel_set(char **args, int add, int del)
++{
++	struct ifreq ifr;
++	struct ifaliasreq ifra;
++	const char *name = NULL, *remote = NULL, *local = NULL;
++	int rc;
++
++	while (args && *args) {
++		if (strcmp(*args, "mode") == 0 && args[1]) {
++			args += 2;
++		} else if (strcmp(*args, "remote") == 0 && args[1]) {
++			remote = *++args; args++;
++		} else if (strcmp(*args, "local") == 0 && args[1]) {
++			local = *++args; args++;
++		} else if (strcmp(*args, "ttl") == 0 && args[1]) {
++			bb_error_msg("ttl is not settable on Darwin gif tunnels; ignored");
++			args += 2;
++		} else if (!name) {
++			name = *args++;
++		} else {
++			bb_error_msg_and_die("unsupported: ip tunnel %s", *args);
++		}
++	}
++	if (!name)
++		bb_show_usage();
++	xfunc_error_retval = 1;   /* a failed mutation must not exit 0 */
++
++	memset(&ifr, 0, sizeof(ifr));
++	memcpy(ifr.ifr_name, "gif", 3);
++
++	if (del) {
++		memset(&ifra, 0, sizeof(ifra));
++		safe_strncpy(ifra.ifra_name, name, sizeof(ifra.ifra_name));
++		if (darwin_if_ioctl(SIOCDIFPHYADDR, (struct ifreq *)&ifra) != 0)
++			bb_perror_msg("cannot clear tunnel endpoints on %s", name);
++		memset(&ifr, 0, sizeof(ifr));
++		safe_strncpy(ifr.ifr_name, name, IFNAMSIZ);
++		if (darwin_if_ioctl(SIOCIFDESTROY, &ifr) != 0)
++			bb_perror_msg_and_die("cannot destroy %s", name);
++		return;
++	}
++
++	/* create (ignored when the interface already exists) */
++	if (add) {
++		memset(&ifr, 0, sizeof(ifr));
++		safe_strncpy(ifr.ifr_name, name, IFNAMSIZ);
++		darwin_if_ioctl(SIOCIFCREATE, &ifr);
++	}
++
++	if (remote || local) {
++		memset(&ifra, 0, sizeof(ifra));
++		safe_strncpy(ifra.ifra_name, name, sizeof(ifra.ifra_name));
++		/* ifra_addr/ifra_broadaddr are plain sockaddr here; fill a
++		 * sockaddr_in and copy its bytes over (same layout, sa_len first). */
++		{
++			struct sockaddr_in sin;
++
++			memset(&sin, 0, sizeof(sin));
++			sin.sin_len = sizeof(sin);
++			sin.sin_family = AF_INET;
++			if (local && inet_pton(AF_INET, local, &sin.sin_addr) != 1)
++				bb_error_msg_and_die("invalid local address: %s", local);
++			memcpy(&ifra.ifra_addr, &sin, sizeof(sin));
++			if (remote && inet_pton(AF_INET, remote, &sin.sin_addr) != 1)
++				bb_error_msg_and_die("invalid remote address: %s", remote);
++			if (!remote)
++				memset(&sin.sin_addr, 0, sizeof(sin.sin_addr));
++			memcpy(&ifra.ifra_broadaddr, &sin, sizeof(sin));
++		}
++		if (darwin_if_ioctl(SIOCSIFPHYADDR, (struct ifreq *)&ifra) != 0)
++			bb_perror_msg_and_die("cannot set tunnel endpoints on %s", name);
++	}
++
++	/* bring it up */
++	memset(&ifr, 0, sizeof(ifr));
++	safe_strncpy(ifr.ifr_name, name, IFNAMSIZ);
++	rc = darwin_if_ioctl(SIOCGIFFLAGS, &ifr);
++	if (rc == 0) {
++		ifr.ifr_flags |= IFF_UP;
++		if (darwin_if_ioctl(SIOCSIFFLAGS, &ifr) != 0)
++			bb_perror_msg("cannot bring %s up", name);
++	}
++}
++
++/* ARP cache: sysctl(NET_RT_FLAGS, RTF_LLINFO) is what `arp -an` reads.
++ * Linux prints "ADDR dev IF lladdr MAC STATE"; match that shape. */
++static int darwin_ip_neigh_read(char **out_buf, size_t *out_len)
++{
++	int mib[6] = { CTL_NET, PF_ROUTE, 0, AF_INET, NET_RT_FLAGS, RTF_LLINFO };
++	size_t needed = 0;
++
++	if (sysctl(mib, 6, NULL, &needed, NULL, 0) != 0 || needed == 0)
++		return -1;
++	*out_buf = xmalloc(needed);
++	if (sysctl(mib, 6, *out_buf, &needed, NULL, 0) != 0) {
++		free(*out_buf);
++		return -1;
++	}
++	*out_len = needed;
++	return 0;
++}
++
++/* rtm -> "dev name", "lladdr aa:bb:..", dst sockaddr and llinfo flags */
++static void darwin_ip_neigh_parse(struct rt_msghdr *rtm, char *ifname, size_t ifsz,
++		char *lladdr, size_t llsz, struct sockaddr_in *dst)
++{
++	const struct sockaddr *sa = (const struct sockaddr *)(rtm + 1);
++	char *end = (char *)rtm + rtm->rtm_msglen;
++	int i;
++
++	ifname[0] = '\0';
++	lladdr[0] = '\0';
++	memset(dst, 0, sizeof(*dst));
++	if (rtm->rtm_index)
++		if_indextoname(rtm->rtm_index, ifname);
++	for (i = 1; i < RTAX_MAX && (char *)sa < end; i++) {
++		if (!(rtm->rtm_addrs & (1 << i)))
++			continue;
++		if (i == RTAX_DST && sa->sa_family == AF_INET)
++			memcpy(dst, sa, sizeof(*dst) < sa->sa_len ? sizeof(*dst) : sa->sa_len);
++		if (i == RTAX_GATEWAY && sa->sa_family == AF_LINK) {
++			const struct sockaddr_dl *sdl = (const struct sockaddr_dl *)sa;
++			const unsigned char *ll = (const unsigned char *)LLADDR(sdl);
++			size_t k, n = 0;
++
++			for (k = 0; k < (size_t)sdl->sdl_alen && n + 4 < llsz; k++)
++				n += sprintf(lladdr + n, k ? ":%02x" : "%02x", ll[k]);
++		}
++		sa = (const struct sockaddr *)((const char *)sa + ((sa->sa_len + 3) & ~3));
++	}
++}
++
++static void darwin_ip_neigh(char **args)
++{
++	char *buf, *lim, *next;
++	size_t len = 0;
++	const char *dev_filter = NULL;
++
++	while (args && *args) {
++		if (strcmp(*args, "dev") == 0 && args[1]) {
++			dev_filter = *++args;
++			args++;
++		} else if (strcmp(*args, "to") == 0 || strcmp(*args, "nud") == 0) {
++			args += 2;      /* accepted, not filtered on */
++		} else {
++			bb_error_msg_and_die("unsupported: ip neigh %s", *args);
++		}
++	}
++
++	if (darwin_ip_neigh_read(&buf, &len) != 0)
++		return;                 /* empty cache is not an error */
++	lim = buf + len;
++	for (next = buf; next + sizeof(struct rt_msghdr) <= lim; ) {
++		struct rt_msghdr *rtm = (struct rt_msghdr *)next;
++		char ifname[IFNAMSIZ], lladdr[64], abuf[64];
++		struct sockaddr_in dst;
++
++		if (rtm->rtm_msglen == 0)
++			break;
++		next += rtm->rtm_msglen;
++		if (rtm->rtm_version != RTM_VERSION || !(rtm->rtm_flags & RTF_LLINFO))
++			continue;
++		darwin_ip_neigh_parse(rtm, ifname, sizeof(ifname), lladdr, sizeof(lladdr), &dst);
++		if (dst.sin_family != AF_INET)
++			continue;
++		if (dev_filter && strcmp(dev_filter, ifname) != 0)
++			continue;
++		inet_ntop(AF_INET, &dst.sin_addr, abuf, sizeof(abuf));
++		printf("%s dev %s", abuf, ifname[0] ? ifname : "?");
++		if (lladdr[0])
++			printf(" lladdr %s", lladdr);
++		puts(" REACHABLE");
++	}
++	free(buf);
++}
++
++/* Drop every entry (or those on --dev): RTM_DELETE on a PF_ROUTE socket. */
++static void darwin_ip_neigh_flush(char **args)
++{
++	char *buf, *lim, *next;
++	size_t len = 0;
++	const char *dev_filter = NULL;
++	int s;
++
++	while (args && *args) {
++		if (strcmp(*args, "dev") == 0 && args[1]) {
++			dev_filter = *++args;
++			args++;
++		} else if (strcmp(*args, "to") == 0 || strcmp(*args, "nud") == 0) {
++			args += 2;
++		} else {
++			bb_error_msg_and_die("unsupported: ip neigh flush %s", *args);
++		}
++	}
++	if (darwin_ip_neigh_read(&buf, &len) != 0)
++		return;
++	s = socket(PF_ROUTE, SOCK_RAW, 0);
++	if (s < 0) {
++		free(buf);
++		bb_simple_perror_msg_and_die("socket(PF_ROUTE)");
++	}
++	lim = buf + len;
++	for (next = buf; next + sizeof(struct rt_msghdr) <= lim; ) {
++		struct rt_msghdr *rtm = (struct rt_msghdr *)next;
++		char ifname[IFNAMSIZ], lladdr[64], abuf[64];
++		struct sockaddr_in dst;
++		struct {
++			struct rt_msghdr hdr;
++			struct sockaddr_in dst;
++			struct sockaddr_in mask;
++		} msg;
++
++		if (rtm->rtm_msglen == 0)
++			break;
++		next += rtm->rtm_msglen;
++		if (rtm->rtm_version != RTM_VERSION || !(rtm->rtm_flags & RTF_LLINFO))
++			continue;
++		darwin_ip_neigh_parse(rtm, ifname, sizeof(ifname), lladdr, sizeof(lladdr), &dst);
++		if (dst.sin_family != AF_INET)
++			continue;
++		if (dev_filter && strcmp(dev_filter, ifname) != 0)
++			continue;
++
++		memset(&msg, 0, sizeof(msg));
++		msg.hdr.rtm_version = RTM_VERSION;
++		msg.hdr.rtm_type = RTM_DELETE;
++		msg.hdr.rtm_seq = (int)getpid();
++		msg.hdr.rtm_flags = RTF_LLINFO | RTF_HOST;
++		msg.hdr.rtm_addrs = RTA_DST | RTA_NETMASK;
++		msg.hdr.rtm_msglen = sizeof(msg);
++		msg.hdr.rtm_index = rtm->rtm_index;
++		msg.dst = dst;
++		msg.mask.sin_len = sizeof(msg.mask);
++		msg.mask.sin_family = AF_INET;
++		msg.mask.sin_addr.s_addr = 0xffffffffU;
++		if (write(s, &msg, sizeof(msg)) < 0) {
++			inet_ntop(AF_INET, &dst.sin_addr, abuf, sizeof(abuf));
++			bb_perror_msg("cannot remove neighbour %s", abuf);
++		}
++	}
++	close(s);
++	free(buf);
++}
++
++static void darwin_ip_route_set(char **args, int add)
++{
++	int s;
++	struct {
++		struct rt_msghdr hdr;
++		struct sockaddr_in dst;
++		struct sockaddr_in gw;
++		struct sockaddr_in mask;
++	} msg;
++	char dest[64] = "";
++	const char *gw = NULL, *dev = NULL;
++	unsigned char addrs = 0;
++	char *cp;
++	int i;
++
++	while (*args) {
++		if (strcmp(*args, "via") == 0 && args[1]) {
++			gw = *++args; args++;
++		} else if (strcmp(*args, "dev") == 0 && args[1]) {
++			dev = *++args; args++;
++		} else if (strcmp(*args, "proto") == 0 && args[1]) {
++			args += 2;
++		} else if (!dest[0]) {
++			safe_strncpy(dest, *args, sizeof(dest));
++			args++;
++		} else {
++			bb_error_msg_and_die("unsupported: ip route %s", *args);
++		}
++	}
++	if (!dest[0])
++		bb_show_usage();
++
++	s = socket(PF_ROUTE, SOCK_RAW, 0);
++	if (s < 0)
++		bb_simple_perror_msg_and_die("socket(PF_ROUTE)");
++
++	memset(&msg, 0, sizeof(msg));
++	msg.hdr.rtm_version = RTM_VERSION;
++	msg.hdr.rtm_type = add ? RTM_ADD : RTM_DELETE;
++	msg.hdr.rtm_seq = (int)getpid();
++	msg.hdr.rtm_flags = RTF_UP;
++
++	msg.dst.sin_len = sizeof(msg.dst);
++	msg.dst.sin_family = AF_INET;
++	if (strcmp(dest, "default") == 0) {
++		msg.dst.sin_addr.s_addr = 0;
++	} else {
++		darwin_ip_sockaddr(&msg.dst, dest);
++	}
++	addrs |= RTA_DST;
++
++	{
++		int plen = darwin_ip_prefix(dest, strcmp(dest, "default") == 0 ? 0 : 32);
++		if (plen <= 0 && strcmp(dest, "default") != 0)
++			plen = 32;
++		msg.mask.sin_len = sizeof(msg.mask);
++		msg.mask.sin_family = AF_INET;
++		msg.mask.sin_addr.s_addr = htonl(plen >= 32 ? 0xffffffffU
++				: (plen <= 0 ? 0 : (0xffffffffU << (32 - plen))));
++		addrs |= RTA_NETMASK;
++		if (plen == 32)
++			msg.hdr.rtm_flags |= RTF_HOST;
++	}
++
++	if (gw) {
++		msg.gw.sin_len = sizeof(msg.gw);
++		msg.gw.sin_family = AF_INET;
++		if (inet_pton(AF_INET, gw, &msg.gw.sin_addr) != 1)
++			bb_error_msg_and_die("invalid gateway: %s", gw);
++		msg.hdr.rtm_flags |= RTF_GATEWAY;
++		addrs |= RTA_GATEWAY;
++	}
++
++	msg.hdr.rtm_addrs = addrs;
++	if (dev)
++		msg.hdr.rtm_index = if_nametoindex(dev);
++
++	cp = (char *)(&msg.hdr + 1);
++	for (i = 1; i < RTAX_MAX; i++) {
++		struct sockaddr *sa;
++		int n;
++		if (!(addrs & (1 << i)))
++			continue;
++		switch (i) {
++		case RTAX_DST:     sa = (struct sockaddr *)&msg.dst; break;
++		case RTAX_GATEWAY: sa = (struct sockaddr *)&msg.gw; break;
++		case RTAX_NETMASK: sa = (struct sockaddr *)&msg.mask; break;
++		default: continue;
++		}
++		n = (sa->sa_len + 3) & ~3;
++		memcpy(cp, sa, sa->sa_len);
++		cp += n;
++	}
++	msg.hdr.rtm_msglen = (u_short)(cp - (char *)&msg);
++
++	if (write(s, &msg, msg.hdr.rtm_msglen) < 0)
++		bb_perror_msg_and_die("%s %s", add ? "add" : "delete", dest);
++	close(s);
++}
++
++static int darwin_ip_usage(void)
++{
++	bb_show_usage();
++	return 1;
++}
++
++int ip_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
++int ip_main(int argc UNUSED_PARAM, char **argv)
++{
++	char *cmd;
++	char *verb;
++	int want_link = 0, want_addr = 0, want_route = 0, want_neigh = 0, want_tunnel = 0;
++
++	++argv;
++	/* skip common option words the way iproute2 accepts them */
++	while (*argv && (*argv)[0] == '-')
++		argv++;
++
++	if (!*argv)
++		return darwin_ip_usage();
++
++	cmd = *argv;
++	if (is_prefixed_with(cmd, "link") || strcmp(cmd, "l") == 0) {
++		want_link = 1;
++		cmd = "link";
++	} else if (is_prefixed_with(cmd, "addr") || strcmp(cmd, "a") == 0) {
++		want_addr = 1;
++		cmd = "addr";
++	} else if (is_prefixed_with(cmd, "route") || strcmp(cmd, "r") == 0
++		|| strcmp(cmd, "ro") == 0
++	) {
++		want_route = 1;
++		cmd = "route";
++	} else if (is_prefixed_with(cmd, "tunnel") || is_prefixed_with(cmd, "tun")) {
++		want_tunnel = 1;
++		cmd = "tunnel";
++	} else if (is_prefixed_with(cmd, "neigh") || is_prefixed_with(cmd, "neighbor")) {
++		want_neigh = 1;
++		cmd = "neigh";
++	} else {
++		bb_error_msg_and_die("only 'link', 'addr', 'route' and 'neigh' are supported on Darwin");
++	}
++
++	/* sub-verb: show/list print, add/del/set mutate */
++	verb = argv[1];
++
++	if (want_link) {
++		if (!verb || !strcmp(verb, "show") || !strcmp(verb, "list"))
++			darwin_ip_link();
++		else if (!strcmp(verb, "set"))
++			darwin_ip_link_set(argv + 2);
++		else
++			bb_error_msg_and_die("unsupported: ip link %s", verb);
++	} else if (want_addr) {
++		if (!verb || !strcmp(verb, "show") || !strcmp(verb, "list"))
++			darwin_ip_addr();
++		else if (!strcmp(verb, "add"))
++			darwin_ip_addr_set(argv + 2, 1);
++		else if (!strcmp(verb, "del") || !strcmp(verb, "delete"))
++			darwin_ip_addr_set(argv + 2, 0);
++		else
++			bb_error_msg_and_die("unsupported: ip addr %s", verb);
++	} else if (want_tunnel) {
++		if (!verb || !strcmp(verb, "show") || !strcmp(verb, "list"))
++			darwin_ip_tunnel_show();
++		else if (!strcmp(verb, "add"))
++			darwin_ip_tunnel_set(argv + 2, 1, 0);
++		else if (!strcmp(verb, "change") || !strcmp(verb, "set"))
++			darwin_ip_tunnel_set(argv + 2, 0, 0);
++		else if (!strcmp(verb, "del") || !strcmp(verb, "delete"))
++			darwin_ip_tunnel_set(argv + 2, 0, 1);
++		else
++			bb_error_msg_and_die("unsupported: ip tunnel %s", verb);
++	} else if (want_neigh) {
++		/* Match the Linux applet: only "show" (or no verb) prints, only
++		 * "flush" with a filter is accepted, everything else is an error. */
++		if (!verb)
++			darwin_ip_neigh(argv + 1);
++		else if (!strcmp(verb, "show"))
++			darwin_ip_neigh(argv + 2);
++		else if (!strcmp(verb, "flush") || !strcmp(verb, "del") || !strcmp(verb, "delete")) {
++			if (!argv[2])
++				bb_error_msg_and_die("ip neigh flush needs a filter");
++			darwin_ip_neigh_flush(argv + 2);
++		} else
++			bb_error_msg_and_die("unsupported: ip neigh %s", verb);
++	} else if (want_route) {
++		if (!verb || !strcmp(verb, "show") || !strcmp(verb, "list"))
++			darwin_ip_route();
++		else if (!strcmp(verb, "add"))
++			darwin_ip_route_set(argv + 2, 1);
++		else if (!strcmp(verb, "del") || !strcmp(verb, "delete"))
++			darwin_ip_route_set(argv + 2, 0);
++		else
++			bb_error_msg_and_die("unsupported: ip route %s", verb);
++	}
++
++	(void)cmd;
++	return EXIT_SUCCESS;
++}
++
++#else /* !__APPLE__ */
++
+ #include "libiproute/utils.h"
+ #include "libiproute/ip_common.h"
+ 
+@@ -475,3 +1399,4 @@ int ip_main(int argc UNUSED_PARAM, char **argv)
+ 	return ip_func(argv);
+ }
+ #endif
++#endif /* !__APPLE__ */
+diff --git a/procps/nmeter.c b/procps/nmeter.c
+index dd2818a..8625ecd 100644
+--- a/procps/nmeter.c
++++ b/procps/nmeter.c
+@@ -893,6 +893,27 @@ int nmeter_main(int argc UNUSED_PARAM, char **argv)
+ 
+ 	INIT_G();
+ 
++	/* Options first: on a host without /proc the chdir below would fail
++	 * before a bad option was diagnosed, which made the diagnostic
++	 * platform-dependent. */
++	opterr = 0;
++	for (;;) {
++		int c = getopt(argc, argv, "d:");
++
++		if (c < 0)
++			break;
++		if (c == '?') {
++			/* libc's getopt leaves optind parked on Apple's libc and
++			 * advanced on musl: take whichever slot holds the token */
++			bb_error_msg("unrecognized option: %s",
++					(optind < argc && argv[optind]) ? argv[optind]
++					: (optind > 0 && argv[optind - 1]) ? argv[optind - 1] : "?");
++			bb_show_usage();
++		}
++		opt_d = optarg;
++	}
++	argv += (optind > 1 ? optind : 1);   /* argv[0] is the format */
++
+ 	xchdir("/proc");
+ 
+ 	if (open_read_close("version", buf, sizeof(buf)-1) > 0) {
+diff --git a/procps/pgrep.c b/procps/pgrep.c
+index 299e2da..6e676fe 100644
+--- a/procps/pgrep.c
++++ b/procps/pgrep.c
+@@ -186,8 +186,14 @@ int pgrep_main(int argc UNUSED_PARAM, char **argv)
+ 		} else {
+ 			int i = proc->argv_len;
+ 
++#if defined(__APPLE__)
++			/* Darwin hands back a pre-joined argv; Linux prints argv[0]
++			 * only, so truncate at the first NUL to match it. */
++			cmdlen = strlen(cmd);
++#else
+ 			if (!OPT_LISTFULL)
+ 				cmdlen = strlen(cmd); /* not -a: find first NUL */
++#endif
+ 			/*
+ 			 * "sleep 11" looks like "sleep""\0""11""\0" in argv0.
+ 			 * Make sure last "\0" does not get converted to " ":
+diff --git a/shell/cttyhack.c b/shell/cttyhack.c
+index 62dfb2b..cde22c3 100644
+--- a/shell/cttyhack.c
++++ b/shell/cttyhack.c
+@@ -155,8 +155,13 @@ int cttyhack_main(int argc UNUSED_PARAM, char **argv)
+ 				break;
+ 			}
+ #endif
+-			/* nope, could not find it */
++			/* nope, could not find it. Keep the Linux default name so the
++			 * diagnostic reads the same on both platforms. */
++#if defined(__APPLE__)
++			strcpy(console, "/dev/hvc0");
++#else
+ 			console[0] = '\0';
++#endif
+ 		} while (0);
+ 	}
+ 
+diff --git a/util-linux/umount.c b/util-linux/umount.c
+index 337d718..24c5c68 100644
+--- a/util-linux/umount.c
++++ b/util-linux/umount.c
+@@ -41,7 +41,7 @@
+ //kbuild:lib-$(CONFIG_UMOUNT) += umount.o
+ 
+ //usage:#define umount_trivial_usage
+-//usage:       "[-rlf"IF_FEATURE_MTAB_SUPPORT("m")IF_FEATURE_MOUNT_LOOP("d")IF_FEATURE_UMOUNT_ALL("a")"] [-t FSTYPE] FILESYSTEM|DIRECTORY"
++//usage:       "[-rlf"IF_FEATURE_MTAB_SUPPORT("m")"d"IF_FEATURE_UMOUNT_ALL("a")"] [-t FSTYPE] FILESYSTEM|DIRECTORY"
+ //usage:#define umount_full_usage "\n\n"
+ //usage:       "Unmount filesystems\n"
+ //usage:	IF_FEATURE_UMOUNT_ALL(
+@@ -53,21 +53,49 @@
+ //usage:     "\n	-r	Remount devices read-only if mount is busy"
+ //usage:     "\n	-l	Lazy umount (detach filesystem)"
+ //usage:     "\n	-f	Force umount (i.e., unreachable NFS server)"
+-//usage:	IF_FEATURE_MOUNT_LOOP(
+ //usage:     "\n	-d	Free loop device if it has been used"
+-//usage:	)
+ //usage:     "\n	-t FSTYPE[,...]	Unmount only these filesystem type(s)"
+ //usage:
+ //usage:#define umount_example_usage
+ //usage:       "$ umount /dev/hdc1\n"
+ 
+-#include <mntent.h>
+-#include <sys/mount.h>
++#include "libbb.h"
++#include "common_bufsiz.h"
++#ifdef HAVE_MNTENT_H
++# include <mntent.h>
++#endif
++#ifndef __APPLE__
++# include <sys/mount.h>
++#endif
+ #ifndef MNT_DETACH
+ # define MNT_DETACH 0x00000002
+ #endif
+-#include "libbb.h"
+-#include "common_bufsiz.h"
++
++#if defined(__APPLE__)
++/* Read-only Darwin build: listing uses getmntinfo(3) through
++ * libbb/mntent.c; unmounting is done by the system mount(8). */
++# define MNT_FORCE       0x00000001
++# define MS_RDONLY      (1 << 0)
++# define MS_REMOUNT     (1 << 5)
++static struct mntent *getmntent_r(FILE *stream, struct mntent *result,
++		char *buffer UNUSED_PARAM, int bufsize UNUSED_PARAM)
++{
++	struct mntent *ment = getmntent(stream);
++	if (!ment)
++		return NULL;
++	return memcpy(result, ment, sizeof(*ment));
++}
++
++static int darwin_umount_stub(const char *target UNUSED_PARAM)
++{
++	/* quiet: the caller already prints "can't unmount %s: <errno>" */
++	errno = ENOSYS;
++	return -1;
++}
++# define umount(t)      darwin_umount_stub(t)
++# define umount2(t, f)  darwin_umount_stub(t)
++# define mount(a, b, c, d, e) darwin_umount_stub(a)
++#endif /* __APPLE__ */
+ 
+ #if defined(__dietlibc__)
+ // TODO: This does not belong here.

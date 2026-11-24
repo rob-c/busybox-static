@@ -68,6 +68,7 @@ probe() {
 }
 
 # ---- phase A: every applet, option surface only ---------------------------
+if [ "${PROBE_PHASE:-all}" != "B" ]; then
 say "# phase A: option surface"
 "$BB" --list | "$BB" sort | while read -r app; do
 	printf 'A %s\n' "$app" >&2
@@ -76,15 +77,21 @@ say "# phase A: option surface"
 	rm|rmdir|mv|cp|ln|chmod|chown|chgrp|dd|mknod|mkfifo|kill|killall5|\
 	pkill|reboot|poweroff|halt|init|swapoff|swapon|sync|mount|umount|\
 	passwd|su|login|setpriv|envuidgid|setuidgid|chroot|watchdog|crond|\
-	crontab|syslogd|klogd|telnetd|ftpd|httpd|inetd|udhcpd|dnsd|runsv|runsvdir|	less|more|vi|ed|telnet|watch|top|script|scriptreplay|chat|microcom|	getty|login|consoles|pscan|rx|ttysize|beep) : ;;
+	crontab|syslogd|klogd|telnetd|ftpd|httpd|inetd|udhcpd|dnsd|runsv|runsvdir|	less|more|vi|ed|telnet|watch|top|script|scriptreplay|chat|microcom|	getty|login|consoles|pscan|rx|ttysize|beep|	add-shell|remove-shell|lsscsi|lsusb|lspci|lsof|fuser|cttyhack|ifconfig) : ;;
+	# ^ the last group has no option parser: they act on argv, so a junk
+	# option can write (/etc/shells), report hardware only one machine has, or
+	# (cttyhack) try to execute the junk as a command. They get positive
+	# probes in phase B instead.
 	*)
 		probe "$app" help --help
 		probe "$app" badlong --nosuch-option-xyz
 		;;
 	esac
 done
+fi
 
 # ---- phase B: curated read-only behaviour --------------------------------
+if [ "${PROBE_PHASE:-all}" != "A" ]; then
 say "# phase B: behaviour over fixed fixtures"
 # applet|label|args
 while IFS=';' read -r app label args; do
@@ -93,6 +100,8 @@ while IFS=';' read -r app label args; do
 	# shellcheck disable=SC2086
 	probe "$app" "$label" $args
 done <<'EOF'
+cttyhack;runs;true
+ifconfig;nosuchiface;nosuchiface
 cat;file;three
 cat;nofile;nosuchfile
 head;n2;-n 2 -q
@@ -225,6 +234,9 @@ tr;help;--help
 wc;help;--help
 EOF
 
+fi   # end of phase B
+
+if [ "${PROBE_PHASE:-all}" = "C" ] || [ "${PROBE_PHASE:-all}" = "all" ]; then
 # ---- phase C: live process probes ----------------------------------------
 # A process only shows the procps differences, so spawn one from this binary
 # under a name that is the same on both platforms.
@@ -250,3 +262,4 @@ probe pkill x -x nosuch-proc-zzz
 probe killall l -l
 "$BB" kill "$SPID" 2>/dev/null
 "$BB" pkill -f bbprobe 2>/dev/null; true
+fi
