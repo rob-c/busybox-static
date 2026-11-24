@@ -13,7 +13,7 @@ sec() { printf '== %s ==\n' "$1"; }
 SRC="${0%/tests/*}/src"
 
 sec "M. mark and log --marks"
-ck "mark.outside_run_prints" "1" "$("$BB" mark phase:x | "$BB" grep -cE '^[0-9]+ phase:x$')"
+ck "mark.outside_run_prints" "1" "$(unset BUSYBOX_RUN_DIR; "$BB" mark phase:x | "$BB" grep -cE '^[0-9]+ phase:x$')"
 J=$("$BB" run --format json -- "$BB" sh -c "$BB mark phase:build; sleep 0.1; $BB mark phase:test" 2>/dev/null)
 R=$(printf '%s' "$J" | sed -n 's/.*"run":"\(R[0-9]*\)".*/\1/p')
 ck "marks.two_recorded" "2" "$("$BB" log "$R" --marks --format json | "$BB" grep -o '"name":' | "$BB" wc -l | tr -d ' ')"
@@ -119,6 +119,21 @@ ck "outline.java_class"   "1" "$("$BB" outline X.java | "$BB" grep -c ':class:.*
 ck "outline.java_method"  "1" "$("$BB" outline X.java | "$BB" grep -c ':function:.*:m$')"
 ck "outline.comment_not_fn" "0" "$("$BB" outline y.sh | "$BB" grep -c ':function:')"
 ck "outline.shell_fn"     "1" "$(printf 'go() {\n  :\n}\n' > z.sh; "$BB" outline z.sh | "$BB" grep -c ':function:.*go')"
+
+sec "J2. json --set: guarded writing"
+printf '{"a":{"b":1,"keep":true},"c":[10,20,30]}\n' > w.json
+ck "jset.dry_rc"      "0" "$("$BB" json --set -f w.json -g .a.b --value x --dry-run >/dev/null 2>&1; echo $?)"
+ck "jset.dry_no_write" "1" "$("$BB" json -f w.json -g .a.b)"
+ck "jset.set_rc"      "0" "$("$BB" json --set -f w.json -g .a.b --value hello >/dev/null 2>&1; echo $?)"
+ck "jset.set_value"   "hello" "$("$BB" json -f w.json -g .a.b)"
+ck "jset.sibling_kept" "true" "$("$BB" json -f w.json -g .a.keep)"
+ck "jset.json_value"  "42" "$("$BB" json --set -f w.json -g .a.b --json-value 42 >/dev/null 2>&1; "$BB" json -f w.json -g .a.b)"
+ck "jset.array_index" "99" "$("$BB" json --set -f w.json -g '.c[1]' --json-value 99 >/dev/null 2>&1; "$BB" json -f w.json -g '.c[1]')"
+ck "jset.add_member"  "1" "$("$BB" json --set -f w.json -g .a.added --json-value '[1,2]' >/dev/null 2>&1; "$BB" json -f w.json -g .a.added -t | "$BB" grep -c array)"
+ck "jset.delete"      "1" "$("$BB" json --delete -f w.json -g .a.keep >/dev/null 2>&1; "$BB" json -f w.json -g .a.keep >/dev/null 2>&1; echo $?)"
+ck "jset.missing_rc"  "1" "$("$BB" json --set -f w.json -g .nope.x --value 1 >/dev/null 2>&1; echo $?)"
+ck "jset.missing_untouched" "$("$BB" json -f w.json -g .a.b)" "$("$BB" json -f w.json -g .a.b)"
+ck "jset.result_json" "1" "$("$BB" json --set -f w.json -g .a.b --json-value 5 --format json | "$BB" grep -c '"status":"ok"')"
 
 sec "H. the binary documents its own flags"
 ck "help.log_since"       "1" "$("$BB" log --help 2>&1 | "$BB" grep -c -- '--since')"

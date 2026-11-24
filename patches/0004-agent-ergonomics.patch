@@ -197,10 +197,10 @@ index e9d3e88..65ff73a 100644
  	}
 diff --git a/coreutils/json.c b/coreutils/json.c
 new file mode 100644
-index 0000000..944030b
+index 0000000..22ce133
 --- /dev/null
 +++ b/coreutils/json.c
-@@ -0,0 +1,273 @@
+@@ -0,0 +1,603 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * json - query or validate a JSON document from the shell.
@@ -221,7 +221,7 @@ index 0000000..944030b
 +//kbuild:lib-$(CONFIG_JSON) += json.o
 +
 +//usage:#define json_trivial_usage
-+//usage:       "[-f FILE] [-g PATH] [-k] [-t] [-n] [-c] [--format json]"
++//usage:       "[-f FILE] [-g PATH] [-k] [-t] [-n] [-c] [--set|--delete --value V] [--format json]"
 +//usage:#define json_full_usage "\n\n"
 +//usage:       "Query a JSON document\n"
 +//usage:     "\n	-f FILE	Read FILE (default: stdin)"
@@ -230,7 +230,13 @@ index 0000000..944030b
 +//usage:     "\n	-t	With -g, print the type"
 +//usage:     "\n	-n	With -g, print the length or element count"
 +//usage:     "\n	-c	Validate only; print nothing on success"
++//usage:     "\n	--set		Write: set .path to --value STR or --json-value JSON"
++//usage:     "\n	--delete	Write: remove the member at .path"
++//usage:     "\n	--dry-run	With --set/--delete, print the document, write nothing"
 +//usage:     "\n	--format json	Structured output (schema 1)"
++//usage:     "\n"
++//usage:     "\nWriting is guarded: the document is parsed first, a missing parent"
++//usage:     "\naborts with NOT_FOUND, and the file is replaced by temp+rename."
 +
 +#include "libbb.h"
 +#include "json_read.h"
@@ -252,6 +258,11 @@ index 0000000..944030b
 +	"length\0" No_argument       "n"
 +	"check\0"  No_argument       "c"
 +	"format\0" Required_argument "F"
++	"set\0"    No_argument       "S"
++	"value\0"  Required_argument "V"
++	"json-value\0" Required_argument "J"
++	"delete\0" No_argument       "D"
++	"dry-run\0" No_argument      "N"
 +	;
 +#define json_longopts (json_longopts)
 +
@@ -338,6 +349,236 @@ index 0000000..944030b
 +	return v;
 +}
 +
++
++/* ---------- guarded writing: --set / --delete ---------- */
++
++static void jw_value(const json_value_t *v)
++{
++	if (!v) {
++		fputs("null", stdout);
++		return;
++	}
++	switch (v->type) {
++	case JSON_OBJECT: {
++		const json_value_t *c;
++		int first = 1;
++
++		putchar('{');
++		for (c = v->child; c; c = c->next) {
++			if (!first)
++				putchar(',');
++			first = 0;
++			put_json_string(c->key ? c->key : "");
++			putchar(':');
++			jw_value(c);
++		}
++		putchar('}');
++		break;
++	}
++	case JSON_ARRAY: {
++		const json_value_t *c;
++		int first = 1;
++
++		putchar('[');
++		for (c = v->child; c; c = c->next) {
++			if (!first)
++				putchar(',');
++			first = 0;
++			jw_value(c);
++		}
++		putchar(']');
++		break;
++	}
++	case JSON_STRING:
++		put_json_string(v->str ? v->str : "");
++		break;
++	case JSON_NUMBER:
++		fputs(v->str ? v->str : "0", stdout);
++		break;
++	case JSON_TRUE:
++		fputs("true", stdout);
++		break;
++	case JSON_FALSE:
++		fputs("false", stdout);
++		break;
++	default:
++		fputs("null", stdout);
++		break;
++	}
++}
++
++/* ".a.b[2]" -> the container holding the last segment, plus that segment. */
++static const json_value_t *walk_parent(const json_value_t *root, const char *path,
++		char *key, size_t key_sz, long *idx)
++{
++	const char *p = path;
++
++	key[0] = '\0';
++	*idx = -1;
++	if (*p == '.')
++		p++;
++	while (*p) {
++		const char *seg = p;
++		size_t n;
++
++		while (*p && *p != '.' && *p != '[')
++			p++;
++		n = (size_t)(p - seg);
++		if (n == 0 || n >= key_sz)
++			return NULL;
++		memcpy(key, seg, n);
++		key[n] = '\0';
++		if (*p == '[') {
++			long i = strtol(p + 1, (char **)&p, 10);
++
++			if (*p != ']')
++				return NULL;
++			p++;
++			/* the name before '[' still has to resolve */
++			root = json_get(root, key);
++			if (!root)
++				return NULL;
++			if (p[0] == '\0') {         /* the segment is the final index */
++				*idx = i;
++				key[0] = '\0';
++				return root;
++			}
++			root = json_at(root, (unsigned)i);
++			if (!root)
++				return NULL;
++			if (*p == '.')
++				p++;
++			continue;
++		}
++		if (p[0] == '\0')               /* final key */
++			return root;
++		root = json_get(root, key);
++		if (!root)
++			return NULL;
++		if (*p == '.')
++			p++;
++	}
++	return NULL;
++}
++
++/* Replace a member's *payload*, keeping the node and its siblings intact. */
++static int set_member(json_value_t *obj, const char *key, json_value_t *nv)
++{
++	json_value_t *c, *last = NULL;
++
++	for (c = obj->child; c; c = c->next) {
++		if (c->key && strcmp(c->key, key) == 0) {
++			free(c->str);
++			c->str = nv->str;
++			c->child = nv->child;
++			c->type = nv->type;
++			nv->str = NULL;
++			nv->child = NULL;
++			json_free(nv);
++			return 0;
++		}
++		last = c;
++	}
++	nv->key = xstrdup(key);
++	nv->next = NULL;
++	if (last)
++		last->next = nv;
++	else
++		obj->child = nv;
++	return 1;
++}
++
++static int set_index(json_value_t *arr, long idx, json_value_t *nv)
++{
++	json_value_t *c = arr->child;
++	long k = 0;
++
++	for (; c && k < idx; c = c->next)
++		k++;
++	if (!c)
++		return -1;
++	free(c->str);
++	c->str = nv->str;
++	c->child = nv->child;
++	c->type = nv->type;
++	nv->str = NULL;
++	nv->child = NULL;
++	json_free(nv);
++	return 0;
++}
++
++static int delete_member(json_value_t *obj, const char *key)
++{
++	json_value_t *c, *prev = NULL;
++
++	for (c = obj->child; c; c = c->next) {
++		if (c->key && strcmp(c->key, key) == 0) {
++			if (prev)
++				prev->next = c->next;
++			else
++				obj->child = c->next;
++			c->next = NULL;
++			json_free(c);
++			return 1;
++		}
++		prev = c;
++	}
++	return 0;
++}
++
++static json_value_t *mk_value(const char *text, int raw)
++{
++	json_value_t *v = xzalloc(sizeof(*v));
++
++	if (raw) {
++		char *err = NULL;
++		json_value_t *p = json_parse(text, strlen(text), &err);
++
++		if (!p) {
++			free(err);
++			free(v);
++			return NULL;
++		}
++		return p;
++	}
++	v->type = JSON_STRING;
++	v->str = xstrdup(text);
++	return v;
++}
++
++static int write_document(const char *path, const json_value_t *doc)
++{
++	char *tmp = xasprintf("%s.json.%u", path, (unsigned)getpid());
++	struct stat st;
++	mode_t mode = 0600;
++	int fd, saved, rc = 0;
++
++	if (stat(path, &st) == 0)
++		mode = st.st_mode & 07777;
++	fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, mode);
++	if (fd < 0) {
++		bb_perror_msg("%s", tmp);
++		free(tmp);
++		return 1;
++	}
++	fflush_all();
++	saved = dup(STDOUT_FILENO);
++	dup2(fd, STDOUT_FILENO);
++	jw_value(doc);
++	putchar('\n');
++	fflush_all();
++	dup2(saved, STDOUT_FILENO);
++	close(saved);
++	close(fd);
++	if (rename(tmp, path) != 0) {
++		bb_perror_msg("%s", path);
++		unlink(tmp);
++		rc = 1;
++	}
++	free(tmp);
++	return rc;
++}
++
 +int json_main_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
 +int json_main_main(int argc UNUSED_PARAM, char **argv)
 +{
@@ -347,12 +588,17 @@ index 0000000..944030b
 +	const json_value_t *child;
 +	const char *why = NULL;
 +	char *err = NULL, *buf = NULL;
++	char *opt_value = NULL, *opt_jvalue = NULL;
 +	size_t len = 0;
 +	int opts, json_out, rc;
++	int do_set, do_delete, dry_run;
 +
 +	xfunc_error_retval = 2;
-+	opts = getopt32long(argv, "f:g:ktnc" "F:", json_longopts,
-+			&opt_file, &opt_path, &opt_fmt);
++	opts = getopt32long(argv, "f:g:ktncF:SV:J:DN", json_longopts,
++			&opt_file, &opt_path, &opt_fmt, &opt_value, &opt_jvalue);
++	do_set = (opts & (1 << 7)) != 0;      /* S: 8th letter */
++	do_delete = (opts & (1 << 10)) != 0;  /* D: 11th */
++	dry_run = (opts & (1 << 11)) != 0;    /* N: 12th */
 +	xfunc_error_retval = 1;   /* past option parsing: failures are operational */
 +	json_out = opt_fmt && strcmp(opt_fmt, "json") == 0;
 +	if (opt_fmt && strcmp(opt_fmt, "json") != 0 && strcmp(opt_fmt, "text") != 0) {
@@ -391,6 +637,90 @@ index 0000000..944030b
 +		}
 +		free(err);
 +		return 1;
++	}
++
++	if (do_set || do_delete) {
++		char key[128];
++		long idx;
++		const json_value_t *parent;
++		int changed = 0;
++
++		if (!opt_file || !opt_path || opt_path[0] != '.') {
++			bb_error_msg("--set/--delete want -f FILE and -g .path");
++			return 2;
++		}
++		if (do_set && !opt_value && !opt_jvalue) {
++			bb_error_msg("--set wants --value STR or --json-value JSON");
++			return 2;
++		}
++		parent = walk_parent(doc, opt_path, key, sizeof(key), &idx);
++		if (!parent) {
++			if (json_out)
++				printf("{\"schema\":1,\"path\":\"%s\",\"status\":\"error\","
++						"\"code\":\"NOT_FOUND\"}\n", opt_path);
++			else
++				bb_error_msg("%s: no such path", opt_path);
++			return 1;
++		}
++		if (do_delete) {
++			if (parent->type != JSON_OBJECT || idx >= 0 || !delete_member(parent, key)) {
++				if (json_out)
++					printf("{\"schema\":1,\"path\":\"%s\",\"status\":\"error\","
++							"\"code\":\"NOT_FOUND\"}\n", opt_path);
++				else
++					bb_error_msg("%s: nothing to delete", opt_path);
++				return 1;
++			}
++			changed = 1;
++		} else {
++			json_value_t *nv = mk_value(opt_jvalue ? opt_jvalue : opt_value,
++					opt_jvalue != NULL);
++
++			if (!nv) {
++				if (json_out)
++					printf("{\"schema\":1,\"path\":\"%s\",\"status\":\"error\","
++							"\"code\":\"INVALID_JSON\"}\n", opt_path);
++				else
++					bb_error_msg("--json-value is not valid JSON");
++				return 1;
++			}
++			if (idx >= 0) {
++				if (parent->type != JSON_ARRAY || set_index((json_value_t *)parent, idx, nv) != 0) {
++					json_free(nv);
++					bb_error_msg("%s: no such index", opt_path);
++					return 1;
++				}
++				changed = 1;
++			} else {
++				if (parent->type != JSON_OBJECT) {
++					json_free(nv);
++					bb_error_msg("%s: parent is not an object", opt_path);
++					return 1;
++				}
++				changed = set_member((json_value_t *)parent, key, nv);
++			}
++		}
++		if (dry_run) {
++			if (json_out) {
++				printf("{\"schema\":1,\"path\":\"%s\",\"status\":\"ok\","
++						"\"dry_run\":true,\"document\":", opt_path);
++				jw_value(doc);
++				fputs("}\n", stdout);
++			} else {
++				jw_value(doc);
++				putchar('\n');
++			}
++			return 0;
++		}
++		if (write_document(opt_file, doc) != 0)
++			return 1;
++		if (json_out)
++			printf("{\"schema\":1,\"path\":\"%s\",\"status\":\"ok\","
++					"\"dry_run\":false,\"set\":%s}\n", opt_path,
++					do_delete ? "false" : "true");
++		else
++			printf("%s %s\n", opt_path, do_delete ? "deleted" : "set");
++		return 0;
 +	}
 +
 +	if (opts & OPT_c) {
@@ -1816,10 +2146,10 @@ index 22820a7..958618f 100644
  }
 diff --git a/coreutils/run.c b/coreutils/run.c
 new file mode 100644
-index 0000000..3eb1758
+index 0000000..195a16c
 --- /dev/null
 +++ b/coreutils/run.c
-@@ -0,0 +1,3369 @@
+@@ -0,0 +1,3387 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * run - captured execution with retrievable evidence.
@@ -2450,6 +2780,12 @@ index 0000000..3eb1758
 +}
 +
 +/* ns mode: [   0.015623417 out]   us mode: [   0.015623 out] */
++/*
++ * Compact stamps: no leading zeros, and fraction digits that shrink as the
++ * seconds grow — 0.019841, 1.234, 13.67. Ordering survives within a run because
++ * consecutive records at the same magnitude keep the same width; the JSON
++ * timeline carries full microseconds when exact values matter.
++ */
 +static void tl_stamp(char *out, unsigned long long ns)
 +{
 +	unsigned long long s = ns / 1000000000ULL;
@@ -2459,11 +2795,23 @@ index 0000000..3eb1758
 +
 +	if (!tl.nanosec)
 +		frac /= 1000ULL;             /* microseconds */
++	if (s >= 10 && !tl.nanosec)
++		digits = 2;                  /* 13.67 rather than 13.675780 */
++	else if (s >= 1 && !tl.nanosec)
++		digits = 3;                  /* 1.234 */
++	if (digits == 2)
++		frac /= 10000ULL;
++	else if (digits == 3)
++		frac /= 1000ULL;
++	else if (digits == 6)
++		frac /= 1ULL;
++	else if (digits == 9)
++		frac /= 1ULL;
++
 +	out[n++] = '[';
 +	k = 0;
 +	do { t[k++] = (char)('0' + (int)(s % 10)); s /= 10; } while (s);
-+	while (k < 5) t[k++] = '0';          /* five columns, dmesg-ish */
-+	while (k) out[n++] = t[--k];
++	while (k) out[n++] = t[--k];         /* no padding: 0, 1, 13 */
 +	out[n++] = '.';
 +	k = digits;
 +	while (k) { t[k - 1] = (char)('0' + (int)(frac % 10)); frac /= 10; k--; }
