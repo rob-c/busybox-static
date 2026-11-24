@@ -4,6 +4,21 @@ Project releases of `busybox-static` on top of upstream busybox
 (`1.39.0.git`). The upstream applet set is unchanged except where noted; the
 `patches/` series is the record of every local change.
 
+## 0.6.1 — `json --set`/`--delete`, and compact timeline stamps
+
+- **`json` can write.** `json -f FILE -g .a.b --set --value 42` sets a member
+  (`--json-value` for a typed value instead of a string) and `--delete` removes
+  one, with `--dry-run` printing the result and writing nothing. The document is
+  re-serialised only after the edit applies to a parsed tree, so a parse or path
+  failure leaves the file untouched.
+- **`run -t` stamps are compact.** `[   0.019841 out]` became `[0.019841 out]`:
+  the seconds field is unpadded and fractional digits are trimmed, so the same
+  information costs fewer bytes per line. `run -t -n` keeps nanosecond
+  resolution and still reports `res_ns`.
+- **Suite updates** for the trimmed stamp shape (`tests/agent-ops-sweep.sh`
+  asserts 1-6 and 1-9 fractional digits rather than a fixed width), and
+  `tests/new-applets.sh` covers the JSON writer.
+
 ## 0.6.0 — darwin/linux parity, ns timeline, richer run metadata
 
 - **`ip neigh` and `ip tunnel` on Darwin.** `ip neigh` reads the ARP cache through

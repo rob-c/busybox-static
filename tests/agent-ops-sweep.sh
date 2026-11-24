@@ -692,19 +692,19 @@ ck "waitfor ready has a status" "1" "$("$BB" waitfor -f "$T/cf.ready" -T 1 -F js
 
 sec "24. run/sh --timestamps: one interleaved, stamped stream"
 # every stamped line: [  sec.usec out|err] text
-STAMP='^\[ *[0-9]+\.[0-9][0-9][0-9][0-9][0-9][0-9] (out|err)\] '
+STAMP='^\[[0-9]+\.[0-9]{1,6} (out|err)\] '
 "$BB" run -t -- "$BB" sh -c 'echo one; echo two >&2; echo three' > "$T/tl" 2>/dev/null
 ck "run -t rc" "0" "$?"
 ck "run -t prints a timeline header" "1" "$("$BB" grep -c '^--- timeline ---$' "$T/tl")"
 ck "run -t stamps every body line" "3" \
-	"$("$BB" grep -Ec '^\[ *[0-9]+\.([0-9]{6}) (out|err)\] ' "$T/tl")"
+	"$("$BB" grep -Ec '^\[[0-9]+\.[0-9]{1,6} (out|err)\] ' "$T/tl")"
 ck "run -t keeps the stdout lines" "1" "$("$BB" grep -c 'out\] one$' "$T/tl")"
 ck "run -t keeps the stderr lines" "1" "$("$BB" grep -c 'err\] two$' "$T/tl")"
 ck "run -t counts the lines" "1" "$("$BB" grep -c '^timeline_lines=3' "$T/tl")"
 ck "run -t has no separate stream sections" "0" "$("$BB" grep -c '^--- stdout ---' "$T/tl")"
 ck "run -t keeps the run header" "1" "$("$BB" grep -c '^run=R[0-9]* exit_code=0' "$T/tl")"
 # timestamps must be non-decreasing, in read order
-"$BB" sed -n 's/^\[ *\([0-9]*\.[0-9]*\) .*/\1/p' "$T/tl" > "$T/st"
+"$BB" sed -n 's/^\[\([0-9]*\.[0-9]*\) .*/\1/p' "$T/tl" > "$T/st"
 ck "run -t timestamps are non-decreasing" "1" \
 	"$("$BB" sort -n -c "$T/st" 2>/dev/null && echo 1)"
 ck "run -t prints three stamps" "3" "$("$BB" wc -l < "$T/st" | "$BB" tr -d ' ')"
@@ -745,12 +745,12 @@ ck "run -t keeps a long line whole" "1" \
 	"$("$BB" awk '/\] x/ {print (length($0) >= 5000) ? 1 : 0; exit}' "$T/tl5")"
 ck "run -t does not split a long line" "1" "$("$BB" grep -c '^timeline_lines=1' "$T/tl5")"
 ck "run -t long line keeps its bytes" "5000" \
-	"$("$BB" sed -n 's/^\[ *[0-9]*\.[0-9]* out\] //p' "$T/tl5" | "$BB" wc -c | "$BB" tr -d ' ' | "$BB" awk '{print $1-1}')"
+	"$("$BB" sed -n 's/^\[[0-9]*\.[0-9]* out\] //p' "$T/tl5" | "$BB" wc -c | "$BB" tr -d ' ' | "$BB" awk '{print $1-1}')"
 # sh forwarding
 "$BB" sh --timestamps -c 'echo via-sh' > "$T/ts" 2>/dev/null
 ck "sh --timestamps rc" "0" "$?"
 ck "sh --timestamps prints a timeline" "1" "$("$BB" grep -c '^--- timeline ---$' "$T/ts")"
-ck "sh --timestamps stamps the line" "1" "$("$BB" grep -Ec '^\[ *[0-9]+\.[0-9]{6} out\] via-sh$' "$T/ts")"
+ck "sh --timestamps stamps the line" "1" "$("$BB" grep -Ec '^\[[0-9]+\.[0-9]{1,6} out\] via-sh$' "$T/ts")"
 ck "sh --timestamps keeps the exit code" "7" \
 	"$("$BB" sh --timestamps -c 'exit 7' >/dev/null 2>&1; echo $?)"
 "$BB" sh --timestamps --format json -c 'echo j' > "$T/tsj" 2>/dev/null
@@ -760,7 +760,7 @@ ck "sh -c keeps --timestamps inside the command" "1" \
 # composition with the other capture options
 ck "run -t --brief rc" "0" "$("$BB" run -t --brief stdout -- "$BB" sh -c 'echo x' >/dev/null 2>&1; echo $?)"
 ck "run -t --quiet still shows the timeline" "1" \
-	"$("$BB" run -t --quiet -- "$BB" sh -c 'echo q' 2>/dev/null | "$BB" grep -c '\[ *[0-9]*\.[0-9]* out\] q')"
+	"$("$BB" run -t --quiet -- "$BB" sh -c 'echo q' 2>/dev/null | "$BB" grep -c '\[[0-9]*\.[0-9]* out\] q')"
 # a private sentinel: `sleep 5` as a pattern also matches an unrelated
 # `sleep 540` from another session and would make a later pgrep lie
 sec "24f. run json: how it ended, what ran, what changed"
@@ -868,7 +868,7 @@ ck "stamp-ns rc" "0" "$?"
 ck "stamp-ns header says stamp=ns" "1" "$("$BB" grep -c 'stamp=ns' "$T/ns")"
 ck "stamp-ns declares its resolution" "1" "$("$BB" grep -Ec 'res_ns=[1-9][0-9]*' "$T/ns")"
 ck "stamp-ns stamps 60 lines with 9 digits" "60" \
-	"$("$BB" grep -Ec '^\[[0-9]+\.[0-9]{9} (out|err)\] ' "$T/ns")"
+	"$("$BB" grep -Ec '^\[[0-9]+\.[0-9]{1,9} (out|err)\] ' "$T/ns")"
 ck "stamp-ns resolution is ns-scale (< 1us)" "1" \
 	"$([ "$("$BB" sed -n 's/.*res_ns=\([0-9]*\).*/\1/p' "$T/ns")" -lt 1000 ] && echo 1)"
 ck "stamp-ns timestamps are non-decreasing" "yes" \
@@ -876,8 +876,9 @@ ck "stamp-ns timestamps are non-decreasing" "yes" \
 	   "$BB" awk '{ns=$1*1000000000+$2; if (NR>1 && ns<prev) bad++; prev=ns}
 		      END { print bad ? "no" : "yes" }')"
 ck "stamp-ns implies a timeline" "1" "$("$BB" grep -c '^--- timeline ---$' "$T/ns")"
-ck "us mode keeps 6 digits" "6" \
-	"$("$BB" run -t -- "$BB" echo x 2>/dev/null | "$BB" sed -n 's/^\[[0-9]*\.\([0-9]*\) out\].*/\1/p' | "$BB" head -1 | "$BB" wc -c | "$BB" tr -d ' ' | "$BB" awk '{print $1-1}')"
+# stamps are trimmed, not padded: at most 6 fractional digits in us mode
+ck "us mode keeps at most 6 digits" "1" \
+	"$("$BB" run -t -- "$BB" echo x 2>/dev/null | "$BB" sed -n 's/^\[\([0-9]*\.[0-9]*\) out\].*/\1/p' | "$BB" head -1 | "$BB" grep -Ec '^[0-9]+\.[0-9]{1,6}$')"
 ck "stamp-ns json has stamp_ns and res" "1" \
 	"$("$BB" run -t -n -F json -- "$BB" echo j 2>/dev/null | "$BB" grep -c '"stamp_ns":true,"stamp_res_ns":[0-9]*')"
 ck "stamp-ns json keeps integer ns" "1" \
@@ -885,7 +886,7 @@ ck "stamp-ns json keeps integer ns" "1" \
 ck "us json still carries us" "1" \
 	"$("$BB" run -t -F json -- "$BB" echo j 2>/dev/null | "$BB" grep -c '"us":[0-9]')"
 ck "sh --stamp-ns forwards" "1" \
-	"$("$BB" sh --stamp-ns -c 'echo f' 2>/dev/null | "$BB" grep -Ec '^\[[0-9]+\.[0-9]{9} out\] f$')"
+	"$("$BB" sh --stamp-ns -c 'echo f' 2>/dev/null | "$BB" grep -Ec '^\[[0-9]+\.[0-9]{1,9} out\] f$')"
 ck "sh --stamp-ns keeps the exit code" "9" \
 	"$("$BB" sh --stamp-ns -c 'exit 9' >/dev/null 2>&1; echo $?)"
 ck "sh -c keeps --stamp-ns literal" "1" \
@@ -906,7 +907,7 @@ ck "json timeline order is out then err" "1" \
 # the timeline is evidence: it stays on disk, complete, next to stdout/stderr
 tlart=$("$BB" ls "$T"/tart/R*/timeline 2>/dev/null | "$BB" head -1)
 ck "timeline artifact exists" "1" "$([ -n "$tlart" ] && echo 1)"
-ck "timeline artifact stamps every line" "2" "$("$BB" grep -Ec '^\[ *[0-9]+\.[0-9]{6} (out|err)\] ' "$tlart")"
+ck "timeline artifact stamps every line" "2" "$("$BB" grep -Ec '^\[[0-9]+\.[0-9]{1,6} (out|err)\] ' "$tlart")"
 ck "timeline artifact keeps the streams apart" "1" "$("$BB" grep -c 'err\] b' "$tlart")"
 # a small view budget shortens the view, never the evidence
 rm -rf "$T/tart2"
@@ -915,7 +916,7 @@ ck "small budget shows at least one line" "1" "$("$BB" grep -Ec '^\[[0-9]+\.[0-9
 ck "small budget reports truncated" "1" "$("$BB" grep -c 'truncated=true' "$T/t5")"
 ck "small budget says how many shown" "1" "$("$BB" grep -c 'timeline truncated: 1 of 5' "$T/t5")"
 ck "small budget keeps all five in evidence" "5" \
-	"$("$BB" grep -Ec '^\[ *[0-9]+\.[0-9]{6} out\] l[0-9]$' "$T/tart2"/R*/timeline)"
+	"$("$BB" grep -Ec '^\[[0-9]+\.[0-9]{1,6} out\] l[0-9]$' "$T/tart2"/R*/timeline)"
 "$BB" run -t -B 8 -F json -- "$BB" sh -c 'for i in 1 2 3; do echo l$i; done' > "$T/t5j" 2>/dev/null
 ck "json small budget keeps one record" "1" "$("$BB" grep -c '"timeline_shown":1' "$T/t5j")"
 ck "json small budget flags truncation" "1" "$("$BB" grep -c '"timeline_truncated":true' "$T/t5j")"
