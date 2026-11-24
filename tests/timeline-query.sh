@@ -70,6 +70,13 @@ ck "idle.output_kept"    "1" "$("$BB" grep -c '^start$' idle.out)"
 ck "idle.active_completes" "0" "$?"
 ck "idle.bad_value"      "2" "$("$BB" run --idle-timeout 0 -- true >/dev/null 2>&1; echo $?)"
 
+sec "Q6b. compact stamps"
+"$BB" run -t -- "$BB" sh -c 'echo a; sleep 1.2; echo b; sleep 11; echo c' > cs.txt 2>/dev/null
+ck "stamp.sub1_short"   "1" "$("$BB" grep -cE '^\[0\.[0-9]{6} out\] a$' cs.txt)"
+ck "stamp.no_leading_zeros" "0" "$("$BB" grep -c '^\[0[0-9]' cs.txt)"
+ck "stamp.seconds_3dp"  "1" "$("$BB" grep -cE '^\[1\.[0-9]{3} out\] b$' cs.txt)"
+ck "stamp.ten_plus_2dp" "1" "$("$BB" grep -cE '^\[1[0-9]\.[0-9]{2} out\] c$' cs.txt)"
+
 sec "Q7. --jsonl streams one object per line, flushed"
 "$BB" run --jsonl -- "$BB" sh -c 'echo one; echo bad >&2; sleep 0.1; echo two' > jl.out 2>/dev/null
 ck "jsonl.line_count"      "3" "$("$BB" grep -c '^{"t":' jl.out)"

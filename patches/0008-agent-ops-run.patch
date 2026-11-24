@@ -1,9 +1,9 @@
 diff --git a/coreutils/run.c b/coreutils/run.c
 new file mode 100644
-index 0000000..31092ce
+index 0000000..195a16c
 --- /dev/null
 +++ b/coreutils/run.c
-@@ -0,0 +1,2914 @@
+@@ -0,0 +1,3387 @@
 +/* vi: set sw=4 ts=4: */
 +/*
 + * run - captured execution with retrievable evidence.
@@ -52,6 +52,8 @@ index 0000000..31092ce
 +//usage:     "\n	-q, --quiet		Print the captured streams only, no summary"
 +//usage:     "\n	-j, --brief-json	Emit brief's JSON (schema 1) as the body"
 +//usage:     "\n	-n, --stamp-ns	Stamp with 9 digits instead of 6 (the clock is ns)"
++//usage:     "\n	-x, --effects		Report files created, changed or removed"
++//usage:     "\n			under the run's cwd (bounded)"
 +//usage:     "\n	-t, --timestamps	Prefix every line with its time and stream,"
 +//usage:     "\n			in one interleaved stream (dmesg style)"
 +//usage:     "\n	-Y, --pty		Give the child a new pty as its controlling"
@@ -92,6 +94,9 @@ index 0000000..31092ce
 +
 +#include <termios.h>
 +#include <sys/ioctl.h>
++#if defined(__APPLE__)
++# include <mach-o/dyld.h>
++#endif
 +#include "libbb.h"
 +
 +enum {
@@ -116,6 +121,7 @@ index 0000000..31092ce
 +static int pty_req_rows;
 +
 +struct meta {
++	unsigned long long dropped_bytes;
 +	char *cmd;
 +	char *cwd;
 +	long duration_ms;
@@ -239,6 +245,294 @@ index 0000000..31092ce
 +	free(path);
 +}
 +
++/* ---------- metadata helpers ---------- */
++
++/* ---------- effects: what the run changed under its cwd ---------- */
++struct effent {
++	char *path;
++	long long mtime;
++	long long size;
++};
++
++struct efflist {
++	struct effent *v;
++	unsigned n, cap;
++	int truncated;
++	unsigned scanned;
++};
++
++static int eff_cmp(const void *a, const void *b)
++{
++	const struct effent *x = a, *y = b;
++
++	return strcmp(x->path, y->path);
++}
++
++/* tiny growable string, local to this file */
++struct sbuf_ {
++	char *p;
++	size_t len, cap;
++};
++
++static void sb_add_(struct sbuf_ *b, const char *s, size_t n)
++{
++	if (b->len + n + 1 > b->cap) {
++		b->cap = (b->len + n + 1) * 2;
++		b->p = xrealloc(b->p, b->cap);
++	}
++	if (n)
++		memcpy(b->p + b->len, s, n);
++	b->len += n;
++	b->p[b->len] = '\0';
++}
++
++static void sb_addstr_(struct sbuf_ *b, const char *s)
++{
++	sb_add_(b, s, strlen(s));
++}
++
++static void sb_addch_(struct sbuf_ *b, char c)
++{
++	sb_add_(b, &c, 1);
++}
++
++/* POSIX single-quote an argument for the replay line. */
++static void replay_quote(struct sbuf_ *b, const char *s)
++{
++	sb_addch_(b, '\'');
++	for (; *s; s++) {
++		if (*s == '\'')
++			sb_addstr_(b, "'\\''");
++		else
++			sb_addch_(b, *s);
++	}
++	sb_addch_(b, '\'');
++}
++
++static char *run_make_replay(const char *cwd, char **argv)
++{
++	struct sbuf_ b = { 0 };
++	int i;
++
++	sb_addstr_(&b, "cd ");
++	replay_quote(&b, cwd ? cwd : ".");
++	sb_addstr_(&b, " && ");
++	for (i = 0; argv[i]; i++) {
++		if (i)
++			sb_addch_(&b, ' ');
++		replay_quote(&b, argv[i]);
++	}
++	return b.p;
++}
++
++/* sha256 over the argv (NUL-separated) and the start cwd, so two runs that
++ * differ only in arguments or directory hash differently. */
++static void run_inputs_hash(char **argv, const char *cwd, char *out65)
++{
++	sha256_ctx_t ctx;
++	unsigned char dig[32];
++	int i, k;
++
++	sha256_begin(&ctx);
++	for (i = 0; argv[i]; i++) {
++		sha256_hash(&ctx, argv[i], strlen(argv[i]));
++		sha256_hash(&ctx, "", 1);
++	}
++	sha256_hash(&ctx, cwd ? cwd : "", cwd ? strlen(cwd) : 0);
++	sha256_end(&ctx, (char *)dig);
++	for (k = 0; k < 32; k++)
++		sprintf(out65 + k * 2, "%02x", dig[k]);
++	out65[64] = '\0';
++}
++
++static void run_emit_effects_json(struct efflist *before, struct efflist *after)
++{
++	unsigned i = 0, j = 0, emitted = 0;
++	int first = 1;
++
++	printf(",\"effects_scanned\":%u,\"effects_truncated\":%s,\"effects\":[",
++			after->scanned + before->scanned,
++			(before->truncated || after->truncated) ? "true" : "false");
++	while (i < before->n || j < after->n) {
++		int cmp;
++
++		if (i >= before->n)
++			cmp = 1;
++		else if (j >= after->n)
++			cmp = -1;
++		else
++			cmp = strcmp(before->v[i].path, after->v[j].path);
++
++		if (emitted < 200) {
++			if (cmp < 0) {
++				printf("%s{\"op\":\"removed\",\"path\":", first ? "" : ",");
++				json_write_str(before->v[i].path);
++				putchar('}');
++				first = 0;
++				emitted++;
++			} else if (cmp > 0) {
++				printf("%s{\"op\":\"added\",\"path\":", first ? "" : ",");
++				json_write_str(after->v[j].path);
++				printf(",\"size\":%lld}", after->v[j].size);
++				first = 0;
++				emitted++;
++			} else {
++				if (before->v[i].mtime != after->v[j].mtime
++				 || before->v[i].size != after->v[j].size) {
++					printf("%s{\"op\":\"changed\",\"path\":", first ? "" : ",");
++					json_write_str(after->v[j].path);
++					printf(",\"size\":%lld}", after->v[j].size);
++					first = 0;
++					emitted++;
++				}
++			}
++		}
++		if (cmp < 0)
++			i++;
++		else if (cmp > 0)
++			j++;
++		else {
++			i++;
++			j++;
++		}
++	}
++	putchar(']');
++}
++
++/* Count lines, notice NULs and a missing final newline in one pass. */
++static void run_scan_stream(const char *path, unsigned long long *lines,
++		int *is_binary, int *final_nl)
++{
++	int fd = open(path, O_RDONLY);
++	char buf[8192];
++	ssize_t n;
++	unsigned long long count = 0;
++	int last = -1, seen = 0, bin = 0;
++
++	*lines = 0;
++	*is_binary = 0;
++	*final_nl = 0;
++	if (fd < 0)
++		return;
++	while ((n = safe_read(fd, buf, sizeof(buf))) > 0) {
++		ssize_t i;
++
++		if (seen < 8192 && memchr(buf, 0, (size_t)n))
++			bin = 1;
++		for (i = 0; i < n; i++)
++			if (buf[i] == '\n')
++				count++;
++		last = (unsigned char)buf[n - 1];
++		seen += (int)n;
++	}
++	close(fd);
++	*is_binary = bin;
++	if (last >= 0) {
++		*final_nl = (last == '\n');
++		if (!*final_nl)
++			count++;      /* a trailing partial line still counts */
++	}
++	*lines = count;
++}
++
++/* A shell command that reproduces this run exactly. */
++static void run_emit_argv_json(char **argv)
++{
++	int i;
++
++	putchar('[');
++	for (i = 0; argv[i]; i++) {
++		if (i)
++			putchar(',');
++		json_write_str(argv[i]);
++	}
++	putchar(']');
++}
++
++/* Bounded recursive walk: depth 8, 20000 entries. */
++static void eff_walk(struct efflist *l, const char *root, const char *rel, int depth)
++{
++	char *dirpath;
++	DIR *d;
++	struct dirent *de;
++
++	dirpath = rel[0] ? xasprintf("%s/%s", root, rel) : xstrdup(root);
++	d = opendir(dirpath);
++	if (!d) {
++		free(dirpath);
++		return;
++	}
++	while ((de = readdir(d)) != NULL) {
++		char *child, *full;
++		struct stat st;
++
++		if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
++			continue;
++		if (l->scanned >= 20000) {
++			l->truncated = 1;
++			break;
++		}
++		child = rel[0] ? xasprintf("%s/%s", rel, de->d_name) : xstrdup(de->d_name);
++		full = xasprintf("%s/%s", root, child);
++		if (lstat(full, &st) == 0) {
++			l->scanned++;
++			if (S_ISDIR(st.st_mode)) {
++				if (depth < 8)
++					eff_walk(l, root, child, depth + 1);
++			} else {
++				if (l->n == l->cap) {
++					l->cap = l->cap ? l->cap * 2 : 256;
++					l->v = xrealloc(l->v, l->cap * sizeof(l->v[0]));
++				}
++				l->v[l->n].path = xstrdup(child);
++				l->v[l->n].mtime = (long long)st.st_mtime;
++				l->v[l->n].size = (long long)st.st_size;
++				l->n++;
++			}
++		}
++		free(full);
++		free(child);
++	}
++	closedir(d);
++	free(dirpath);
++}
++
++static void run_effects_snapshot(const char *root, struct efflist *l)
++{
++	memset(l, 0, sizeof(*l));
++	if (!root || !root[0])
++		return;
++	eff_walk(l, root, "", 0);
++	if (l->n > 1)
++		qsort(l->v, l->n, sizeof(l->v[0]), eff_cmp);
++}
++
++/* The binary's own absolute path: CONFIG_BUSYBOX_EXEC_PATH is /proc/self/exe
++ * even on Darwin, where dyld has to be asked. */
++static char *run_self_exe(void)
++{
++#if defined(__APPLE__)
++	uint32_t size = 0;
++	char *buf;
++
++	_NSGetExecutablePath(NULL, &size);
++	buf = xmalloc(size + 1);
++	if (_NSGetExecutablePath(buf, &size) == 0 && buf[0]) {
++		char *real = realpath(buf, NULL);
++
++		if (real) {
++			free(buf);
++			return real;
++		}
++		return buf;
++	}
++	free(buf);
++	return NULL;
++#else
++	return realpath("/proc/self/exe", NULL);
++#endif
++}
++
 +/* ---------- run: capture ---------- */
 +
 +/* ---------- timeline: one line, one timestamp, both streams ---------- */
@@ -340,6 +634,12 @@ index 0000000..31092ce
 +}
 +
 +/* ns mode: [   0.015623417 out]   us mode: [   0.015623 out] */
++/*
++ * Compact stamps: no leading zeros, and fraction digits that shrink as the
++ * seconds grow — 0.019841, 1.234, 13.67. Ordering survives within a run because
++ * consecutive records at the same magnitude keep the same width; the JSON
++ * timeline carries full microseconds when exact values matter.
++ */
 +static void tl_stamp(char *out, unsigned long long ns)
 +{
 +	unsigned long long s = ns / 1000000000ULL;
@@ -349,11 +649,23 @@ index 0000000..31092ce
 +
 +	if (!tl.nanosec)
 +		frac /= 1000ULL;             /* microseconds */
++	if (s >= 10 && !tl.nanosec)
++		digits = 2;                  /* 13.67 rather than 13.675780 */
++	else if (s >= 1 && !tl.nanosec)
++		digits = 3;                  /* 1.234 */
++	if (digits == 2)
++		frac /= 10000ULL;
++	else if (digits == 3)
++		frac /= 1000ULL;
++	else if (digits == 6)
++		frac /= 1ULL;
++	else if (digits == 9)
++		frac /= 1ULL;
++
 +	out[n++] = '[';
 +	k = 0;
 +	do { t[k++] = (char)('0' + (int)(s % 10)); s /= 10; } while (s);
-+	while (k < 5) t[k++] = '0';          /* five columns, dmesg-ish */
-+	while (k) out[n++] = t[--k];
++	while (k) out[n++] = t[--k];         /* no padding: 0, 1, 13 */
 +	out[n++] = '.';
 +	k = digits;
 +	while (k) { t[k - 1] = (char)('0' + (int)(frac % 10)); frac /= 10; k--; }
@@ -887,8 +1199,10 @@ index 0000000..31092ce
 +					w = 0;
 +				quota_used[i] += w;
 +			}
-+			if (quota_used[i] >= capture_limit && (size_t)r > (size_t)w)
++			if (quota_used[i] >= capture_limit && (size_t)r > (size_t)w) {
 +				m->capture_complete = 0;
++				m->dropped_bytes += (unsigned long long)((size_t)r - (size_t)w);
++			}
 +			tl_feed(i, buf, (size_t)r);
 +			if (jsonl_on)
 +				jsonl_feed((unsigned)i, buf, (size_t)r);
@@ -1292,6 +1606,17 @@ index 0000000..31092ce
 +	int quiet = 0, brief_json = 0;
 +	unsigned opts;
 +	long deadline_ms = 0, budget = DEFAULT_VIEW, capture_limit = DEFAULT_CAPTURE;
++	char *cwd_start = NULL, *cwd_final = NULL, *self_exe = NULL;
++	char *argv0_resolved = NULL;
++	const char *exit_kind = "exited";
++	unsigned long long out_lines = 0, err_lines = 0, dropped_bytes = 0;
++	int out_binary = 0, err_binary = 0, out_final_nl = 0, err_final_nl = 0;
++	struct efflist eff_before, eff_after;
++	int want_effects = 0;
++	unsigned long long started_unix_us = 0;
++	struct rusage ru;
++
++	int cwd_final_known = 0;
 +	int kill_after = 2000, json = 0, use_shell = 0;
 +	const char *root, *dir;
 +	unsigned id;
@@ -1325,6 +1650,7 @@ index 0000000..31092ce
 +		"brief-json\0"    No_argument       "j"
 +	"timestamps\0"    No_argument       "t"
 +	"stamp-ns\0"      No_argument       "n"
++	"effects\0"       No_argument       "x"
 +		"brief\0"         Required_argument "b"
 +		"pty\0"           No_argument       "Y"
 +		;
@@ -1388,7 +1714,7 @@ index 0000000..31092ce
 +		}
 +		argv[j] = NULL;
 +	}
-+	opts = getopt32long(argv, "T:k:B:C:D:d:sF:i:Pr:b:qjtYnW:J", run_longopts,
++	opts = getopt32long(argv, "T:k:B:C:D:d:sF:i:Pr:b:qjtYnW:Jx", run_longopts,
 +			&opt_timeout, &opt_kill, &opt_bytes, &opt_capture,
 +			&opt_dir, &opt_cwd, &opt_fmt, &opt_stdin, &opt_prune, &opt_brief,
 +			&opt_idle);
@@ -1581,11 +1907,33 @@ index 0000000..31092ce
 +	 * never reached its documented exit 3. */
 +	bb_signals((1 << SIGINT) | (1 << SIGTERM), on_sig);
 +
++	want_effects = (opts & (1 << 19)) != 0;   /* x: 20th letter */
++	{
++		struct timeval tv;
++
++		cwd_start = getcwd(NULL, 0);
++		if (gettimeofday(&tv, NULL) == 0)
++			started_unix_us = (unsigned long long)tv.tv_sec * 1000000
++					+ (unsigned long long)tv.tv_usec;
++		self_exe = run_self_exe();
++	}
++
 +	if (tl.on) {
 +		/* hold everything the capture holds, but never more than 8 MiB */
 +		tl.budget = (size_t)8 * 1024 * 1024;
 +		tl.out_budget = (size_t)budget;
 +	}
++	if (argv[0]) {
++		if (strchr(argv[0], '/'))
++			argv0_resolved = realpath(argv[0], NULL);
++		else {
++			const char *path = getenv("PATH");
++
++			argv0_resolved = find_executable(argv[0], &path);
++		}
++	}
++	if (want_effects)
++		run_effects_snapshot(cwd_start, &eff_before);
 +	started = now_ms();
 +	pid = fork();
 +	if (pid < 0)
@@ -1637,6 +1985,8 @@ index 0000000..31092ce
 +
 +			putenv(idbuf);
 +			setenv("BUSYBOX_RUN_DIR", dir, 1);
++			/* the shell writes its final cwd here on exit */
++			putenv(xasprintf("BUSYBOX_RUN_CWD=%s", art_path(dir, "cwd")));
 +		}
 +		for (i = 0; i < n_child_env; i++) {
 +			char *eq = strchr(child_env[i], '=');
@@ -1651,9 +2001,17 @@ index 0000000..31092ce
 +			shv[1] = (char *)"-c";
 +			shv[2] = argv[0];
 +			shv[3] = NULL;
++			/* this binary is the shell of record: bb_busybox_exec_path is
++			 * /proc/self/exe even on Darwin, so resolve the real path first */
++			if (self_exe)
++				execv(self_exe, shv);
 +			execv(bb_busybox_exec_path, shv);
 +			execvp("sh", shv);
 +		} else {
++			/* `sh -c CMD` (how the sh applet forwards) must run this
++			 * binary's shell, not whichever /bin/sh PATH finds */
++			if (self_exe && strcmp(argv[0], "sh") == 0)
++				execv(self_exe, argv);
 +			execvp(argv[0], argv);
 +		}
 +		bb_perror_msg("can't execute '%s'", argv[0]);
@@ -1761,9 +2119,10 @@ index 0000000..31092ce
 +	{
 +		int killed = 0;
 +		unsigned long long reap_start = now_ms();
++		memset(&ru, 0, sizeof(ru));
 +
 +		for (;;) {
-+			pid_t w = waitpid(pid, &status, WNOHANG);
++			pid_t w = wait4(pid, &status, WNOHANG, &ru);
 +
 +			if (w == pid || w < 0)
 +				break;
@@ -1788,7 +2147,15 @@ index 0000000..31092ce
 +		m.term_sig = WTERMSIG(status);
 +	} else
 +		m.exit_code = -1;
++	{
++		const char *kind;
 +
++		if (m.timed_out)        kind = "timed_out";
++		else if (m.cancelled)   kind = "cancelled";
++		else if (WIFSIGNALED(status)) kind = "signalled";
++		else                    kind = "exited";
++		exit_kind = kind;
++	}
 +	{
 +		char *p1 = art_path(dir, "stdout");
 +		char *p2 = art_path(dir, "stderr");
@@ -1800,6 +2167,33 @@ index 0000000..31092ce
 +			m.err_bytes = (unsigned long long)st.st_size;
 +		close(art_out);
 +		close(art_err);
++		{
++			char *p = art_path(dir, "cwd");
++
++			cwd_final = xmalloc_open_read_close(p, NULL);
++			free(p);
++			if (cwd_final) {
++				/* one line, no trailing newline */
++				char *nl = strchr(cwd_final, '\n');
++
++				if (nl)
++					*nl = '\0';
++				if (cwd_final[0])
++					cwd_final_known = 1;
++			}
++		}
++		{
++			char *p = art_path(dir, "stdout");
++
++			run_scan_stream(p, &out_lines, &out_binary, &out_final_nl);
++			free(p);
++			p = art_path(dir, "stderr");
++			run_scan_stream(p, &err_lines, &err_binary, &err_final_nl);
++			free(p);
++		}
++		if (want_effects)
++			run_effects_snapshot(cwd_start, &eff_after);
++		dropped_bytes = m.dropped_bytes;
 +		if (tl.on)
 +			tl_write_file(dir);
 +		write_meta(dir, &m);
@@ -1814,6 +2208,85 @@ index 0000000..31092ce
 +			}
 +			fputs(",\"dir\":", stdout);
 +			json_write_str(dir);
++			fputs(",\"cwd\":", stdout);
++			json_write_str(cwd_final_known ? cwd_final : (cwd_start ? cwd_start : ""));
++			printf(",\"cwd_final_known\":%s", cwd_final_known ? "true" : "false");
++			fputs(",\"cwd_start\":", stdout);
++			json_write_str(cwd_start ? cwd_start : "");
++			fputs(",\"busybox\":", stdout);
++			json_write_str(self_exe ? self_exe : "");
++			printf(",\"started_unix_us\":%llu", started_unix_us);
++			printf(",\"duration_ns\":%llu", (unsigned long long)m.duration_ms * 1000000ULL);
++			printf(",\"exit_kind\":\"%s\"", exit_kind);
++			if (m.term_sig) {
++				const char *sn = get_signame(m.term_sig);
++
++				printf(",\"signal\":%d,\"signal_name\":\"%s\"",
++						m.term_sig, sn ? sn : "?");
++			}
++			fputs(",\"argv\":", stdout);
++			run_emit_argv_json(argv);
++			fputs(",\"argv0_resolved\":", stdout);
++			json_write_str(argv0_resolved ? argv0_resolved : "");
++			printf(",\"cpu_user_ms\":%lu,\"cpu_sys_ms\":%lu,\"max_rss_kb\":%ld",
++					(unsigned long)(ru.ru_utime.tv_sec * 1000
++						+ ru.ru_utime.tv_usec / 1000),
++					(unsigned long)(ru.ru_stime.tv_sec * 1000
++						+ ru.ru_stime.tv_usec / 1000),
++#if defined(__APPLE__)
++					(long)(ru.ru_maxrss / 1024)   /* Darwin reports bytes */
++#else
++					(long)ru.ru_maxrss            /* Linux reports KiB */
++#endif
++					);
++			printf(",\"stdout_lines\":%llu,\"stderr_lines\":%llu", out_lines, err_lines);
++			printf(",\"binary\":%s,\"final_newline\":%s",
++					out_binary ? "true" : "false",
++					out_final_nl ? "true" : "false");
++			printf(",\"dropped_bytes\":%llu", dropped_bytes);
++			{
++				char *replay = run_make_replay(cwd_start, argv);
++
++				fputs(",\"replay\":", stdout);
++				json_write_str(replay);
++				free(replay);
++			}
++			{
++				char hex[65];
++
++				run_inputs_hash(argv, cwd_start, hex);
++				printf(",\"inputs_hash\":\"%s\"", hex);
++			}
++			{
++				const char *v = bb_banner;
++				const char *sp;
++
++				/* "BusyBox v1.39.0.git (...) multi-call binary" -> the version */
++				if (strncmp(v, "BusyBox v", 9) == 0)
++					v += 9;
++				sp = strchr(v, ' ');
++				fputs(",\"busybox_version\":", stdout);
++				if (sp) {
++					char *ver = xstrndup(v, (size_t)(sp - v));
++
++					json_write_str(ver);
++					free(ver);
++				} else {
++					json_write_str(v);
++				}
++			}
++			if ((m.out_bytes + m.err_bytes) > (unsigned long long)budget) {
++				/* how to read past the view budget */
++				char *nx = xasprintf("log -D %s R%u -B %ld",
++						dir, id, (long)budget * 2);
++
++				fputs(",\"view_next\":", stdout);
++				json_write_str(nx);
++				free(nx);
++			}
++			if (want_effects) {
++				run_emit_effects_json(&eff_before, &eff_after);
++			}
 +			printf(",\"pgid\":%ld", child_pgid);
 +			printf(",\"pty\":%s", pty_mode ? "true" : "false");
 +			if (pty_mode) {
